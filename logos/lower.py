@@ -146,10 +146,13 @@ address it no longer controls, and a freed buffer would look live. Growth also
 checks that the new capacity is larger than the old one, so a wrapped value can
 never pass as a bigger buffer.
 
-The mutating forms — ``vec-push``, ``vec-set``, ``vec-free`` — name a
-``letmut`` binding, because they write the descriptor back into its slot;
-``vec-get`` and ``vec-len`` read any vector value, so a vector may be passed to
-a function and read there. ``vec-free`` releases the buffer and stores a
+The mutating forms — ``vec-push``, ``vec-set``, ``vec-free`` — name a place
+whose slot holds the descriptor: a ``letmut`` binding or a parameter, both of
+which have an alloca this function can write back into. ``vec-get`` and
+``vec-len`` read any vector value, so a vector may be passed to a function and
+read there, and a parameter is a place for the three mutating forms because
+the callee owns what the caller moved into it — it is the one that has to be
+able to release the buffer. ``vec-free`` releases the buffer and stores a
 zeroed descriptor, which makes a second free release NULL and a later length
 read zero.
 
@@ -1217,7 +1220,7 @@ class _Fn:
         The descriptor does not change, so only the element is written.
         """
         items = node.items
-        shape = "vec-set takes a mutable name, an index and a value"
+        shape = "vec-set takes a vector name, an index and a value"
         ty, slot = self.vec_binding(node, 4, shape)
         self.lowering.use_type(ty.elem, node.path)
         whole = self.temp()
@@ -1238,7 +1241,7 @@ class _Fn:
         ``rt_free`` treats NULL as free(NULL), and a later ``vec-len`` reads
         zero rather than a count of elements that no longer exist.
         """
-        ty, slot = self.vec_binding(node, 2, "vec-free takes a mutable name")
+        ty, slot = self.vec_binding(node, 2, "vec-free takes a vector name")
         self.lowering.use_type(ty.elem, node.path)
         whole = self.temp()
         self.emit(("load", whole, ty, slot))
@@ -1250,7 +1253,7 @@ class _Fn:
         self.emit(("store", ty, "zeroinitializer", slot))
 
     def vec_binding(self, node: Node, arity: int, shape: str) -> tuple[Vec, str]:
-        """The mutable vector binding a mutating form writes through."""
+        """The vector place a mutating form writes through: binding or parameter."""
         items = node.items
         if len(items) != arity:
             raise diag(WRONG_ARITY, node.path, shape)
@@ -1286,7 +1289,7 @@ class _Fn:
         """
         items = node.items
         ty, slot = self.vec_binding(
-            node, 3, "vec-push takes a mutable name and a value"
+            node, 3, "vec-push takes a vector name and a value"
         )
         self.lowering.use_type(ty.elem, node.path)
         value = self.value(items[2], node.path)

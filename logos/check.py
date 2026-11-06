@@ -22,14 +22,18 @@ of ``[start, end)``, and ``(str-eq a b)`` is byte equality — the same answer
 ``=`` gives, because ``=`` accepts ``:str`` too. ``(vec T)`` is a growable
 array: it starts empty at ``(make (vec T))``, grows with ``(vec-push v x)``,
 reads with ``(vec-len v)`` and ``(vec-get v i)``, and releases its buffer with
-``(vec-free v)``. The mutating forms — push, set, free — take a ``letmut``
-binding, because they rewrite the three-word descriptor that lives in it,
-exactly as ``arr-set`` rewrites the array in its own slot. An index that is not
-an integer is E0400 and a string operand that is not a ``:str`` is E0401.
+``(vec-free v)``. The mutating forms — push, set, free — take a name, because
+they rewrite the three-word descriptor that lives in its slot, exactly as
+``arr-set`` rewrites the array in its own slot: a ``letmut`` binding, or a
+parameter, which the callee owns outright. A parameter is a place for these
+three forms and not for ``set``, which still needs ``letmut``. An index that
+is not an integer is E0400 and a string operand that is not a ``:str`` is
+E0401.
 
 A ``(vec T)`` owns the buffer its descriptor names, so a value that contains one
-is never copied: binding it to a second name, setting one, or passing it as an
-argument moves it, and the source is empty afterwards (a later read is E0300). A
+is never copied: binding it to a second name, setting one, passing it as an
+argument, or pushing it into another vector moves it, and the source is empty
+afterwards (a later read is E0300). A
 second transfer of the same value is **E0402** — there is one buffer and no rule
 that would let two names share it. For the same reason a vector may not be a
 struct field or a fixed-array element yet: releasing it needs a place expression,
@@ -1466,13 +1470,19 @@ class _Checker:
     def _vec_target(
         self, node: Node, env: _Env, *, arity: int, shape: str, verb: str
     ) -> tuple[_Var, Vec]:
-        """The mutable vector binding a mutating vector form writes through.
+        """The mutable vector place a mutating vector form writes through.
 
         A push may reallocate, so it changes the descriptor; a set writes
-        through the buffer but the descriptor stays. Either way the target is
-        a binding rather than a temporary — a temporary has no storage the new
-        descriptor could be written back to — and it needs ``letmut``, exactly
-        like ``arr-set``.
+        through the buffer but the descriptor stays; a free zeroes it. Either
+        way the target is a binding or a parameter rather than a temporary —
+        a temporary has no storage the new descriptor could be written back to
+        — and it needs ``letmut`` unless it is a parameter, which the callee
+        owns outright: the caller gave up the descriptor at the call, so the
+        callee is the one that has to be able to release the buffer.
+
+        ``set`` is deliberately not in that list (it refuses parameters with
+        E0104): a parameter's assignment promises something the caller never
+        sees, and a vector hand-off is a move, not a shared place.
         """
         items = node.items
         if len(items) != arity:
@@ -1488,7 +1498,7 @@ class _Checker:
             # nothing: writing through this name would touch a buffer another
             # binding owns now.
             raise diag(USE_AFTER_MOVE, node.path, f"use after move of '{name}'")
-        if not var.mutable:
+        if not var.mutable and not var.param:
             raise diag(
                 NOT_MUTABLE, node.path, f"cannot {verb} immutable binding '{name}'"
             )
@@ -1506,7 +1516,7 @@ class _Checker:
             node,
             env,
             arity=3,
-            shape="vec-push takes a mutable name and a value",
+            shape="vec-push takes a vector name and a value",
             verb="push to",
         )
         got = self._value(node.items[2], env, ty.elem, node.path)
@@ -1516,7 +1526,12 @@ class _Checker:
                 _at(node.items[2], node),
                 f"cannot push {got} into {ty}",
             )
-        if isinstance(ty.elem, Own):
+        if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
+            # The element is a place this language cannot name afterwards —
+            # ``vec-free`` takes a binding or a parameter, not an element — so
+            # the value moved into the buffer can never be released, but it
+            # must still be moved: a second descriptor for one buffer would
+            # make the source a second owner.
             self._consume(node.items[2], env, node.path)
         return Prim("void")
 
@@ -1543,7 +1558,7 @@ class _Checker:
             node,
             env,
             arity=4,
-            shape="vec-set takes a mutable name, an index and a value",
+            shape="vec-set takes a vector name, an index and a value",
             verb="set",
         )
         self._index(node.items[2], env, node, "vector index")
@@ -1552,7 +1567,9 @@ class _Checker:
             raise diag(
                 TYPE_MISMATCH, _at(node.items[3], node), f"cannot store {got} in {ty}"
             )
-        if isinstance(ty.elem, Own):
+        if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
+            # Same move as ``vec-push``: storing a descriptor in an element
+            # would otherwise leave the source naming the same buffer.
             self._consume(node.items[3], env, node.path)
         return Prim("void")
 
@@ -1567,7 +1584,7 @@ class _Checker:
             node,
             env,
             arity=2,
-            shape="vec-free takes a mutable name",
+            shape="vec-free takes a vector name",
             verb="free",
         )
         return Prim("void")
@@ -1686,7 +1703,10 @@ class _Checker:
                 _at(items[2], node),
                 f"cannot store {got} through {ty}",
             )
-        if isinstance(elem, Own):
+        if isinstance(elem, Own) or holds_vector(elem, self._structs):
+            # A stored descriptor must be the only one: the memory behind a
+            # raw pointer is not a place a ``vec-free`` can name either, so
+            # the value is moved, not copied.
             self._consume(items[2], env, node.path)
         return Prim("void")
 

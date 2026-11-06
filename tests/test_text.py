@@ -211,12 +211,39 @@ class VecCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0400")
         self.assertEqual(error.message, "vector index must be an integer, found :str")
 
-    def test_push_needs_a_mutable_binding(self):
+    def test_push_still_needs_letmut_on_an_ordinary_binding(self):
+        # A parameter is a place for push/set/free (R4), but a plain ``let``
+        # still promises to hold its value, so pushing through it is E0104.
         error = fail_on(
-            "(mod m)(fn f :void ((v (vec :i64))) (vec-push v 1))"
+            "(mod m)(fn f :void ()"
+            " (let v (vec :i64) (make (vec :i64))) (vec-push v 1))"
         )
         self.assertEqual(error.code, "E0104")
         self.assertEqual(error.message, "cannot push to immutable binding 'v'")
+
+    def test_a_vector_parameter_can_be_pushed_to(self):
+        # The caller moved the vector in, so the callee owns the buffer and
+        # must be able to grow it — otherwise there is no way to fill a vector
+        # on behalf of a caller.
+        checked("(mod m)(fn f :void ((v (vec :i64))) (vec-push v 1))")
+
+    def test_a_vector_parameter_can_be_set(self):
+        checked("(mod m)(fn f :void ((v (vec :i64))) (vec-set v 0 1))")
+
+    def test_a_vector_parameter_can_be_freed(self):
+        # The callee owns what it was handed (R1), so it is the one that has
+        # to be able to release the buffer.
+        checked("(mod m)(fn f :void ((v (vec :i64))) (vec-free v))")
+
+    def test_set_still_refuses_a_vector_parameter(self):
+        # R4 names push, set and free as the three vector forms; ``set`` is
+        # not one that may target a parameter.
+        error = fail_on(
+            "(mod m)(fn f :void ((v (vec :i64)))"
+            " (set v (make (vec :i64))))"
+        )
+        self.assertEqual(error.code, "E0104")
+        self.assertEqual(error.message, "cannot set immutable binding 'v'")
 
     def test_push_checks_the_element(self):
         error = fail_on(
@@ -244,22 +271,23 @@ class VecCheckTest(unittest.TestCase):
     def test_each_vector_form_checks_its_arity_before_its_target(self):
         for source, message in (
             ("(mod m)(fn f :void ((v (vec :i64))) (vec-free))",
-             "vec-free takes a mutable name"),
+             "vec-free takes a vector name"),
             ("(mod m)(fn f :void ((v (vec :i64))) (vec-push v))",
-             "vec-push takes a mutable name and a value"),
+             "vec-push takes a vector name and a value"),
             ("(mod m)(fn f :void ((v (vec :i64))) (vec-get v))",
              "'vec-get' takes a vector and an index"),
             ("(mod m)(fn f :void ((v (vec :i64))) (vec-set v 0))",
-             "vec-set takes a mutable name, an index and a value"),
+             "vec-set takes a vector name, an index and a value"),
         ):
             with self.subTest(source=source):
                 error = fail_on(source)
                 self.assertEqual(error.code, "E0102")
                 self.assertEqual(error.message, message)
 
-    def test_free_needs_a_mutable_binding(self):
+    def test_free_still_needs_letmut_on_an_ordinary_binding(self):
         error = fail_on(
-            "(mod m)(fn f :void ((v (vec :i64))) (vec-free v))"
+            "(mod m)(fn f :void ()"
+            " (let v (vec :i64) (make (vec :i64))) (vec-free v))"
         )
         self.assertEqual(error.code, "E0104")
         self.assertEqual(error.message, "cannot free immutable binding 'v'")
@@ -402,6 +430,99 @@ class VectorMoveTest(unittest.TestCase):
             " (vec-push v 1))"
         )
         self.assertEqual(error.code, "E0300")
+
+
+class VectorOwnershipTest(unittest.TestCase):
+    """R4 and R5: the callee may release, and a pushed vector moves.
+
+    A vector argument is a transfer, so after the call the caller's binding is
+    empty (E0300). That leaves exactly one owner, which is why the callee has
+    to be able to release the buffer: a parameter is a place for push, set and
+    free. Storing a descriptor in an element moves the argument too — an
+    element is not a place, so it can never be released, but two live
+    descriptors for one buffer must not exist.
+    """
+
+    def test_the_callee_can_free_the_vector_it_was_given(self):
+        checked(
+            "(mod m)(fn release :void ((v (vec :i64)))"
+            " (vec-push v 1) (vec-free v))"
+            "(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (release v))"
+        )
+
+    def test_the_caller_cannot_read_a_vector_it_passed(self):
+        error = fail_on(
+            "(mod m)(fn release :void ((v (vec :i64))) (vec-free v))"
+            "(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (release v)"
+            " (println (vec-len v)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'v'")
+
+    def test_the_caller_cannot_free_a_vector_it_passed(self):
+        # The callee owns it and may already have released it: a second free
+        # at the call site would be a double free.
+        error = fail_on(
+            "(mod m)(fn release :void ((v (vec :i64))) (vec-free v))"
+            "(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (release v)"
+            " (vec-free v))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'v'")
+
+    def test_pushing_a_vector_moves_the_source(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut inner (vec :i64) (make (vec :i64)))"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (vec-push outer inner)"
+            " (println (vec-len inner)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'inner'")
+
+    def test_a_pushed_vector_cannot_be_freed_afterwards(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut inner (vec :i64) (make (vec :i64)))"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (vec-push outer inner)"
+            " (vec-free inner))"
+        )
+        self.assertEqual(error.code, "E0300")
+
+    def test_the_container_stays_usable_after_the_push(self):
+        # Only the pushed value moved; the container is still the one owner of
+        # its own buffer.
+        checked(
+            "(mod m)(fn f :void ()"
+            " (letmut inner (vec :i64) (make (vec :i64)))"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (vec-push outer inner)"
+            " (println (vec-len outer))"
+            " (vec-free outer))"
+        )
+
+    def test_setting_a_vector_element_moves_the_source_too(self):
+        # ``vec-set`` stores the same descriptor a push would, so it is the
+        # same move; a copy here would be the aliasing R5 removes.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut inner (vec :i64) (make (vec :i64)))"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (vec-push outer inner)"
+            " (letmut second (vec :i64) (make (vec :i64)))"
+            " (vec-set outer 0 second)"
+            " (println (vec-len second)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'second'")
 
 
 class PrinterCheckTest(unittest.TestCase):
@@ -654,6 +775,18 @@ class VecLoweringTest(unittest.TestCase):
         self.assertIn("bitcast i64* %t", text)
         self.assertIn("call void @rt_free(", text)
 
+    def test_a_parameter_is_a_place_for_the_mutating_forms(self):
+        # A parameter has its own alloca and the callee owns the value, so the
+        # descriptor is written back into it and the buffer is released there.
+        m = lowered(
+            "(mod m)(fn f :void ((v (vec :i64))) (vec-push v 1) (vec-free v))"
+        )
+        fn = m.functions[0]
+        self.assertIn("rt_free", callees(fn))
+        text = llvm.emit(m)
+        self.assertIn("alloca { i64*, i64, i64 }", text)
+        self.assertIn("store { i64*, i64, i64 } zeroinitializer", text)
+
     def test_a_vector_of_a_struct_collects_the_struct(self):
         text = emitted(
             "(mod m)(type p (struct (x :i64)))"
@@ -787,10 +920,11 @@ class VecExecTest(unittest.TestCase):
         "free": ("ok\n", 0),
         "free-an-empty-vector": ("ok\n", 0),
         "read-across-a-call": ("10\n4\n", 0),
+        "free-a-parameter": ("3\n", 0),
         "move-then-free-in-both-branches": ("ok\n", 0),
         "small-elements": ("true\n3\n", 0),
         "struct-elements": ("4\n", 0),
-        "nested": ("7\n", 0),
+        "nested": ("0\n", 0),
         "get-out-of-bounds": ("", 2),
         "set-out-of-bounds": ("", 2),
     }
@@ -820,6 +954,19 @@ class VecExecTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0)
         self.assertIn(
             "LEAK 32 bytes at vec/test/growth-leak-is-reported/", done.stderr
+        )
+
+    def test_a_pushed_vector_is_moved_and_its_buffer_is_stranded(self):
+        # R5: the descriptor moved into the element, so the source is empty and
+        # the element is the one descriptor. An element is not a place
+        # ``vec-free`` can name, so the inner buffer is still live at exit and
+        # the tracker reports it — that is the remaining hole, and this case
+        # pins its shape rather than hiding it.
+        done = self.run_case("nested-buffer-is-stranded", "-O0")
+        self.assertEqual(done.stdout, "7\n", done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(
+            "LEAK 32 bytes at vec/test/nested-buffer-is-stranded/", done.stderr
         )
 
     def test_a_vector_index_out_of_bounds_names_its_node(self):
