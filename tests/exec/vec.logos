@@ -205,6 +205,33 @@
     (make (vec :i64)))
   (release v))
 
+(fn relay :void ((v (vec :i64)))
+  (release v))
+
+(test name-argument-through-a-relay
+  (expect (out "3\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (relay v))
+
+(fn drop :void ((v (vec :i64)))
+  (vec-free v))
+
+(test loop-move-panics-on-second-iteration
+  (expect (code 2)
+    (err-contains "R0002"))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (letmut i :i64 0)
+  (while (< i 2)
+    (drop v)
+    (set i (+ i 1))))
+
 (test nested-buffer-is-stranded
   (expect (out "7\n")
     (code 0)

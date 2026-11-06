@@ -1005,6 +1005,16 @@ class _Checker:
                 _at(args[2], node),
                 f"if branches do not match: {then} and {otherwise}",
             )
+        if holds_vector(then, self._structs):
+            # R7: the result would be a second descriptor for a buffer one of
+            # the arms still owns, so freeing it would free it twice. Form
+            # moves are what would make the arms give the value up; until then
+            # the choice is refused.
+            raise diag(
+                VEC_MOVE,
+                node.path,
+                "a vector cannot be selected by if or match",
+            )
         return then
 
     def _while(self, node: Node, env: _Env) -> Ty:
@@ -1110,6 +1120,14 @@ class _Checker:
                     f"match arms do not agree: {result} and {arm}",
                 )
         # ``arms`` is non-empty: ``match_shape`` refuses a match without one.
+        if result is not None and holds_vector(result, self._structs):
+            # R7, the same rule as ``if``: an arm still owns the buffer the
+            # result descriptor names, so the result would be a second owner.
+            raise diag(
+                VEC_MOVE,
+                node.path,
+                "a vector cannot be selected by if or match",
+            )
         return result  # type: ignore[return-value]
 
     def _pattern(self, pattern: Node | Token, ty: Ty, owner: Node) -> None:
@@ -1848,6 +1866,17 @@ class _Checker:
             )
         for index, (arg, param) in enumerate(zip(args, sig.params), start=1):
             if holds_vector(param, self._structs):
+                # R6: the callee owns and may free what it receives, so the
+                # argument must be a whole binding the caller can give up. A
+                # descriptor copied out of an element, out of a call result or
+                # out of a branch would leave the caller's container pointing
+                # at memory the callee released.
+                if not (isinstance(arg, Token) and arg.kind == ATOM):
+                    raise diag(
+                        VEC_MOVE,
+                        _at(arg, node),
+                        "a vector argument must be a name",
+                    )
                 # A vector argument is a transfer, not a copy: the same
                 # argument twice is E0402 at the second one.
                 self._transfer(arg, env, node.path)

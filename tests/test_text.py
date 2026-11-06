@@ -524,6 +524,64 @@ class VectorOwnershipTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'second'")
 
+    def test_a_vector_element_cannot_be_passed_as_a_vector(self):
+        # R6: the callee may free what it is handed, so a descriptor copied
+        # out of the caller's container would leave it pointing at released
+        # memory. The argument has to be a name.
+        error = fail_on(
+            "(mod m)(fn drain :void ((v (vec :i64))) (vec-free v))"
+            "(fn f :void ()"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (drain (vec-get outer 0)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "a vector argument must be a name")
+
+    def test_a_call_result_cannot_be_passed_as_a_vector(self):
+        error = fail_on(
+            "(mod m)(fn make-one :(vec :i64) () (ret (make (vec :i64))))"
+            "(fn drain :void ((v (vec :i64))) (vec-free v))"
+            "(fn f :void () (drain (make-one)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "a vector argument must be a name")
+
+    def test_an_array_element_cannot_be_passed_as_a_vector(self):
+        # A vector may not be an array element (E0002, above), so an
+        # ``arr-get`` cannot produce one; the form is still refused as a
+        # vector argument before its element type is considered, which is
+        # what keeps the rule syntactic and unreachable-by-accident.
+        error = fail_on(
+            "(mod m)(fn drain :void ((v (vec :i64))) (vec-free v))"
+            "(fn f :void ((a (arr :i64 2))) (drain (arr-get a 0)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "a vector argument must be a name")
+
+    def test_a_vector_cannot_be_selected_by_if(self):
+        # R7: both arms still own the buffer, so the result would be a second
+        # descriptor for it and freeing it would double-free.
+        error = fail_on(
+            "(mod m)(fn f :void ((c :bool))"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) (if c v v)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message, "a vector cannot be selected by if or match"
+        )
+
+    def test_a_vector_cannot_be_selected_by_match(self):
+        error = fail_on(
+            "(mod m)(fn f :void ((n :i64))"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) (match n (0 v) (_ v))))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message, "a vector cannot be selected by if or match"
+        )
+
 
 class PrinterCheckTest(unittest.TestCase):
     """Every scalar the runtime formats, and nothing that needs a cast."""
@@ -921,6 +979,8 @@ class VecExecTest(unittest.TestCase):
         "free-an-empty-vector": ("ok\n", 0),
         "read-across-a-call": ("10\n4\n", 0),
         "free-a-parameter": ("3\n", 0),
+        "name-argument-through-a-relay": ("3\n", 0),
+        "loop-move-panics-on-second-iteration": ("", 2),
         "move-then-free-in-both-branches": ("ok\n", 0),
         "small-elements": ("true\n3\n", 0),
         "struct-elements": ("4\n", 0),
