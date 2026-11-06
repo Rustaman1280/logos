@@ -113,6 +113,8 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   node path. `INT_MIN / -1` wraps to `INT_MIN`.
 - Shift counts are masked to the operand width. `%` takes the sign of the
   dividend.
+- Integer literals never promote to a float. `(+ 1 a)` with `a :f64` is a
+  type error, exactly like `(+ 1.0 a)` with `a :i64`. Write `1.0`.
 - Float to int out of range panics. It never yields a silent value.
 - Float arithmetic follows IEEE 754 double precision, without fast-math.
 
