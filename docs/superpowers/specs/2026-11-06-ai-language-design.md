@@ -183,7 +183,8 @@ threads and formatting all arrive this way.
 Every node has a path built only from names and child indexes:
 `module/fn-name/<index>/<index>`. A named definition inserts its own name
 (`math`, `math/add`); every other node appends its position among its
-parent's children, counting the head. So the third child of `add` is
+parent's items, numbered from zero after the head (and after the name, for
+a named definition). So the third child of `add` is
 `math/add/2`, and its first child is `math/add/2/0`. Paths depend on
 position alone, never on a node's shape, so editing one child never moves
 another. A test node inserts `test/<name>`, so a test and a function may
