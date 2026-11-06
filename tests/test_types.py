@@ -110,6 +110,7 @@ class TypeSyntaxTest(unittest.TestCase):
             (Shared(Prim("i64")), "(shared :i64)"),
             (FnTy((Prim("i64"), Prim("bool")), Prim("i64")), "(fn (:i64 :bool) :i64)"),
             (FnTy((), Prim("void")), "(fn () :void)"),
+            (FnTy((Prim("i64"),), Prim("i64"), True), "(fn* (:i64) :i64)"),
             (StructRef("point"), "point"),
             (EnumRef("parse-error"), "parse-error"),
             (TypeVar("T"), "T"),
@@ -153,6 +154,7 @@ class TypeSyntaxTest(unittest.TestCase):
             ),
             ("(fn (:i64 :bool) :i64)", FnTy((Prim("i64"), Prim("bool")), Prim("i64"))),
             ("(fn () :void)", FnTy((), Prim("void"))),
+            ("(fn* (:i64) :i64)", FnTy((Prim("i64"),), Prim("i64"), True)),
             ("(vec (arr :i64 4))", Vec(Arr(Prim("i64"), 4))),
             # A composite parameter is wrapped once more: the list beside the
             # arrow always holds one entry per parameter.
@@ -166,7 +168,13 @@ class TypeSyntaxTest(unittest.TestCase):
                 self.assertEqual(parse_type(type_syntax(text)), expected)
 
     def test_a_parsed_type_prints_itself_back(self):
-        for text in ("(vec :i64)", "(arr :u8 16)", "(fn (:i64) :bool)", "point"):
+        for text in (
+            "(vec :i64)",
+            "(arr :u8 16)",
+            "(fn (:i64) :bool)",
+            "(fn* (:i64) :bool)",
+            "point",
+        ):
             with self.subTest(text=text):
                 self.assertEqual(str(parse_type(type_syntax(text))), text)
 
@@ -226,6 +234,16 @@ class CompatibleTest(unittest.TestCase):
         self.assertFalse(compatible(fn, FnTy((Prim("i64"), Prim("i64")), Prim("bool"))))
         self.assertFalse(compatible(fn, FnTy((Prim("i64"),), Prim("i64"))))
         self.assertFalse(compatible(fn, Prim("i64")))
+
+    def test_a_capturing_function_type_is_not_a_plain_one(self):
+        # R12: the two spellings are different types, which is what keeps a
+        # capturing closure out of a plain function-typed parameter.
+        plain = FnTy((Prim("i64"),), Prim("i64"))
+        capture = FnTy((Prim("i64"),), Prim("i64"), True)
+        self.assertFalse(compatible(plain, capture))
+        self.assertFalse(compatible(capture, plain))
+        self.assertTrue(compatible(capture, FnTy((Prim("i64"),), Prim("i64"), True)))
+        self.assertNotEqual(plain, capture)
 
     def test_a_type_variable_is_not_a_wildcard(self):
         self.assertTrue(compatible(TypeVar("T"), TypeVar("T")))

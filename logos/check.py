@@ -174,9 +174,14 @@ A captured value is copied into the frame that created the closure, not onto
 the heap: the language allocates nothing the source did not spell. That frame
 is therefore the closure's lifetime, and the checker enforces it where a value
 could leave: returning a capturing closure, storing it in a struct field or an
-array element, pushing it into a vector, or keeping it past the loop iteration
-that made it is E0502. A closure that captures nothing is an ordinary function
-pointer and may escape freely.
+array element, pushing it into a vector, passing it to another function, or
+keeping it past the loop iteration that made it is E0502. The function type
+records which kind it is — ``(fn (T) R)`` is an ordinary function pointer,
+``(fn* (T) R)`` a closure that captured — and the two are not compatible, so a
+plain function-typed parameter can never receive one. Binding a capturing
+closure to a local name and calling it in the frame that made it is what is
+left, and what a capture is for. A closure that captures nothing is a plain
+function pointer and may escape freely.
 """
 
 from __future__ import annotations
@@ -380,7 +385,8 @@ def mangle_type(ty: Ty, where: str = "") -> str:
         return f"res({mangle_type(ty.ok, where)},{mangle_type(ty.err, where)})"
     if isinstance(ty, FnTy):
         params = ",".join(mangle_type(param, where) for param in ty.params)
-        return f"fn({params}){mangle_type(ty.ret, where)}"
+        head = "fn*" if ty.captures else "fn"
+        return f"{head}({params}){mangle_type(ty.ret, where)}"
     if isinstance(ty, TypeVar):
         raise diag(
             UNBOUND_TYPE_VAR,
@@ -820,7 +826,7 @@ _INT_RANGE = {
     "u64": (0, 2**64 - 1),
 }
 
-_TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "res", "opt", "shared")
+_TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared")
 _LET_SHAPE = "takes a name, an optional type and a value"
 
 
@@ -1295,7 +1301,7 @@ class _Checker:
         name, declared, init = let_shape(node, self._types, env.tvars)
         self._transfer(init, env, node.path)
         ty = self._value(init, env, declared, node.path)
-        if declared is not None and not compatible(declared, ty):
+        if declared is not None and not _fits(declared, ty):
             raise diag(
                 TYPE_MISMATCH,
                 _at(init, node),
@@ -1316,11 +1322,12 @@ class _Checker:
             # value moves here, and the old name is empty.
             self._consume(init, env, node.path)
         bound = declared if declared is not None else ty
-        if isinstance(declared, FnTy) and isinstance(ty, FnTy) and ty.captures:
-            # The annotation cannot say whether the value captures, so the
-            # initialiser's flag is what the binding keeps: dropping it here
-            # would let `(ret f)` read as an ordinary function pointer.
-            bound = FnTy(declared.params, declared.ret, True)
+        if isinstance(declared, FnTy) and isinstance(ty, FnTy):
+            # An annotation spells the signature, never the capture flag:
+            # whether the value captures is a property of the value, and the
+            # binding keeps it. Dropping it here would let `(ret f)` read as
+            # an ordinary function pointer.
+            bound = FnTy(declared.params, declared.ret, ty.captures)
         # The binding's type, after substitution: a generic body's annotation
         # names a type variable, and the lowerer must not read the variable.
         self._record.declared[node.path] = bound
@@ -1346,7 +1353,7 @@ class _Checker:
             raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
         self._transfer(items[2], env, node.path)
         value = self._value(items[2], env, var.ty, node.path)
-        if not compatible(var.ty, value):
+        if not _fits(var.ty, value):
             raise diag(
                 TYPE_MISMATCH,
                 _at(items[2], node),
@@ -1422,7 +1429,7 @@ class _Checker:
                 return self._value(args[2], env, expected, node.path)
 
         then, otherwise = self._branches(env, [then_branch, else_branch])
-        if not compatible(then, otherwise):
+        if not _fits(then, otherwise):
             raise diag(
                 TYPE_MISMATCH,
                 _at(args[2], node),
@@ -1537,7 +1544,7 @@ class _Checker:
         for arm in self._branches(env, branches):
             if result is None:
                 result = arm
-            elif not compatible(result, arm):
+            elif not _fits(result, arm):
                 raise diag(
                     TYPE_MISMATCH,
                     node.path,
@@ -1604,16 +1611,16 @@ class _Checker:
                 )
             return Prim("void")
         value = self._value(args[0], env, env.ret, node.path)
+        if _escapes(value):
+            # The environment lives in this frame. Returning the closure hands
+            # a caller a pointer to a slot that dies when this frame does.
+            raise diag(CLOSURE_ESCAPE, _at(args[0], node), _CLOSURE_ESCAPE)
         if not compatible(env.ret, value):
             raise diag(
                 TYPE_MISMATCH,
                 node.path,
                 f"{env.label} returns {env.ret}, found {value}",
             )
-        if _escapes(value):
-            # The environment lives in this frame. Returning the closure hands
-            # a caller a pointer to a slot that dies when this frame does.
-            raise diag(CLOSURE_ESCAPE, _at(args[0], node), _CLOSURE_ESCAPE)
         if isinstance(env.ret, Own):
             # Returning an owning pointer hands it to the caller.
             self._consume(args[0], env, node.path)
@@ -1663,16 +1670,16 @@ class _Checker:
                 )
             for item, (field, fty) in zip(values, fields):
                 got = self._value(item, env, fty, node.path)
+                if _escapes(got):
+                    # A field outlives the expression, so a capturing closure
+                    # stored here would be called after its frame is gone.
+                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if not compatible(fty, got):
                     raise diag(
                         FIELD_TYPE_MISMATCH,
                         _at(item, node),
                         f"field '{field}' of '{ty.name}' expects {fty}, found {got}",
                     )
-                if _escapes(got):
-                    # A field outlives the expression, so a capturing closure
-                    # stored here would be called after its frame is gone.
-                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if isinstance(fty, Own):
                     self._consume(item, env, node.path)
             return ty
@@ -1686,16 +1693,16 @@ class _Checker:
                 )
             for item in values:
                 got = self._value(item, env, ty.elem, node.path)
+                if _escapes(got):
+                    # An array element is storage the frame keeps: the value
+                    # would be callable after the closure's frame is gone.
+                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if not compatible(ty.elem, got):
                     raise diag(
                         TYPE_MISMATCH,
                         _at(item, node),
                         f"cannot store {got} in {ty}",
                     )
-                if _escapes(got):
-                    # An array element is storage the frame keeps: the value
-                    # would be callable after the closure's frame is gone.
-                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if isinstance(ty.elem, Own):
                     self._consume(item, env, node.path)
             return ty
@@ -1763,15 +1770,15 @@ class _Checker:
             if fname != field:
                 continue
             got = self._value(items[3], env, fty, node.path)
+            if _escapes(got):
+                raise diag(
+                    CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE
+                )
             if not compatible(fty, got):
                 raise diag(
                     FIELD_TYPE_MISMATCH,
                     _at(items[3], node),
                     f"field '{field}' of '{var.ty.name}' expects {fty}, found {got}",
-                )
-            if _escapes(got):
-                raise diag(
-                    CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE
                 )
             if isinstance(fty, Own):
                 self._consume(items[3], env, node.path)
@@ -1836,14 +1843,14 @@ class _Checker:
                 f"array index must be an integer, found {index}",
             )
         got = self._value(items[3], env, var.ty.elem, node.path)
+        if _escapes(got):
+            raise diag(CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE)
         if not compatible(var.ty.elem, got):
             raise diag(
                 TYPE_MISMATCH,
                 _at(items[3], node),
                 f"cannot store {got} in {var.ty}",
             )
-        if _escapes(got):
-            raise diag(CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE)
         if isinstance(var.ty.elem, Own):
             self._consume(items[3], env, node.path)
         return Prim("void")
@@ -1982,17 +1989,17 @@ class _Checker:
             verb="push to",
         )
         got = self._value(node.items[2], env, ty.elem, node.path)
+        if _escapes(got):
+            # The buffer outlives the frame that holds the environment, so a
+            # capturing closure pushed here would be called through a dead
+            # pointer after its creator returns.
+            raise diag(CLOSURE_ESCAPE, _at(node.items[2], node), _CLOSURE_ESCAPE)
         if not compatible(ty.elem, got):
             raise diag(
                 TYPE_MISMATCH,
                 _at(node.items[2], node),
                 f"cannot push {got} into {ty}",
             )
-        if _escapes(got):
-            # The buffer outlives the frame that holds the environment, so a
-            # capturing closure pushed here would be called through a dead
-            # pointer after its creator returns.
-            raise diag(CLOSURE_ESCAPE, _at(node.items[2], node), _CLOSURE_ESCAPE)
         if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
             # The element is a place this language cannot name afterwards —
             # ``vec-free`` takes a binding or a parameter, not an element — so
@@ -2030,12 +2037,12 @@ class _Checker:
         )
         self._index(node.items[2], env, node, "vector index")
         got = self._value(node.items[3], env, ty.elem, node.path)
+        if _escapes(got):
+            raise diag(CLOSURE_ESCAPE, _at(node.items[3], node), _CLOSURE_ESCAPE)
         if not compatible(ty.elem, got):
             raise diag(
                 TYPE_MISMATCH, _at(node.items[3], node), f"cannot store {got} in {ty}"
             )
-        if _escapes(got):
-            raise diag(CLOSURE_ESCAPE, _at(node.items[3], node), _CLOSURE_ESCAPE)
         if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
             # Same move as ``vec-push``: storing a descriptor in an element
             # would otherwise leave the source naming the same buffer.
@@ -2166,16 +2173,16 @@ class _Checker:
                 f"deref needs a pointer, found {ty}",
             )
         got = self._value(items[2], env, elem, node.path)
+        if _escapes(got):
+            # The pointee outlives this frame; a capturing closure written
+            # through a pointer is the clearest way to call it after return.
+            raise diag(CLOSURE_ESCAPE, _at(items[2], node), _CLOSURE_ESCAPE)
         if not compatible(elem, got):
             raise diag(
                 TYPE_MISMATCH,
                 _at(items[2], node),
                 f"cannot store {got} through {ty}",
             )
-        if _escapes(got):
-            # The pointee outlives this frame; a capturing closure written
-            # through a pointer is the clearest way to call it after return.
-            raise diag(CLOSURE_ESCAPE, _at(items[2], node), _CLOSURE_ESCAPE)
         if isinstance(elem, Own) or holds_vector(elem, self._structs):
             # A stored descriptor must be the only one: the memory behind a
             # raw pointer is not a place a ``vec-free`` can name either, so
@@ -2379,6 +2386,14 @@ class _Checker:
                 # argument twice is E0402 at the second one.
                 self._transfer(arg, env, node.path)
             ty = self._value(arg, env, param, node.path)
+            if _escapes(ty):
+                # R12: a capturing closure's environment is a slot in this
+                # frame. A callee may keep what it is handed — in a field, a
+                # vector, or by returning it — and nothing in the type of a
+                # parameter can say it will not, so the value never crosses a
+                # call boundary at all. (A plain `(fn ...)` parameter is also
+                # incompatible with it, but E0502 says why.)
+                raise diag(CLOSURE_ESCAPE, _at(arg, node), _CLOSURE_ESCAPE)
             if not compatible(param, ty):
                 raise diag(
                     TYPE_MISMATCH,
@@ -2425,6 +2440,11 @@ class _Checker:
                 self._transfer(arg, env, node.path)
             hint = None if has_typevar(param) else param
             ty = self._value(arg, env, hint, node.path)
+            if _escapes(ty):
+                # R12, as in `_arguments`: no call may receive a capturing
+                # closure, and that includes one whose type argument would
+                # have been inferred from it.
+                raise diag(CLOSURE_ESCAPE, _at(arg, node), _CLOSURE_ESCAPE)
             trial = dict(bindings)
             if _is_void(ty) or not _unify(param, ty, trial):
                 raise diag(
@@ -2684,7 +2704,11 @@ def _unify(param: Ty, actual: Ty, bindings: dict[str, Ty]) -> bool:
             and _unify(param.err, actual.err, bindings)
         )
     if isinstance(param, FnTy):
-        if not isinstance(actual, FnTy) or len(param.params) != len(actual.params):
+        if (
+            not isinstance(actual, FnTy)
+            or param.captures != actual.captures
+            or len(param.params) != len(actual.params)
+        ):
             return False
         if not all(
             _unify(one, other, bindings)
@@ -2807,7 +2831,11 @@ def resolve_type(
         params = tuple(
             resolve_type(param, types, path, bindings) for param in ty.params
         )
-        return FnTy(params, resolve_type(ty.ret, types, path, bindings))
+        return FnTy(
+            params,
+            resolve_type(ty.ret, types, path, bindings),
+            ty.captures,
+        )
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
     elem = resolve_type(ty.elem, types, path, bindings)
@@ -2971,6 +2999,25 @@ def _is_void(ty: Ty) -> bool:
 def _escapes(ty: Ty) -> bool:
     """Whether ``ty`` is a closure that captured its way into this frame."""
     return isinstance(ty, FnTy) and ty.captures
+
+
+def _fits(expected: Ty, actual: Ty) -> bool:
+    """``compatible`` where ``expected`` is an annotation or a sibling arm.
+
+    An annotation spells a function's signature, not whether the value
+    captures: ``(fn (:i64) :i64)`` names both a plain function pointer and a
+    capturing closure. The flag follows the value instead — a binding records
+    it, and every place the value could leave is E0502 — so ignoring it here
+    keeps ``(let f :(fn (:i64) :i64) (fn ...))`` and an ``if`` with one
+    capturing arm meaning what they always meant. A call argument is *not*
+    compared this way: there the two spellings are different types (E0502).
+    """
+    if isinstance(expected, FnTy) and isinstance(actual, FnTy):
+        return compatible(
+            FnTy(expected.params, expected.ret),
+            FnTy(actual.params, actual.ret),
+        )
+    return compatible(expected, actual)
 
 
 def _merge_functions(a: Ty, b: Ty) -> Ty:

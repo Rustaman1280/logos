@@ -68,9 +68,8 @@
   (expect (out "50\n")
     (code 0)
     (leaks 0))
-  (let k 10)
   (println (apply (fn :i64 ((n :i64))
-                    (ret (* n k))) 5)))
+                    (ret (* n 5))) 10)))
 
 (test named-function-value
   (expect (out "6\n")
@@ -102,13 +101,12 @@
   (expect (out "3\n20\n")
     (code 0)
     (leaks 0))
-  (let k 10)
   (letmut v (make (vec :i64)))
   (vec-push v 1)
   (vec-push v 2)
   (vec-push v 3)
   (letmut w (map v (fn :i64 ((x :i64))
-                     (ret (* x k)))))
+                     (ret (* x 10)))))
   (println (vec-len w))
   (println (vec-get w 1))
   (vec-free w))
@@ -174,3 +172,27 @@
   (let q (pick (make a_x2db 2)))
   (println (get p x))
   (println (get q x)))
+
+(fn relay :(fn (:i64) :i64) ((f :(fn (:i64) :i64)))
+  (ret f))
+
+(fn through-a-parameter :i64 ()
+  (let f (relay (fn :i64 ((x :i64))
+                  (ret (* x 3)))))
+  (ret (f 4)))
+
+(test non-capturing-through-a-parameter
+  (expect (out "12\n")
+    (code 0)
+    (leaks 0))
+  (println (through-a-parameter)))
+
+(test capturing-local-called-twice
+  (expect (out "10\n20\n")
+    (code 0)
+    (leaks 0))
+  (let k 10)
+  (let f (fn :i64 ((x :i64))
+           (ret (+ x k))))
+  (println (f 0))
+  (println (f 10)))

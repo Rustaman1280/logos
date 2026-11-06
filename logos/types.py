@@ -27,7 +27,7 @@ can still locate the error at the form that owns the token.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from logos.diag import UNKNOWN_TYPE, diag
 from logos.lexer import ATOM, NUMBER, Token
@@ -55,7 +55,7 @@ FLOATS = ("f32", "f64")
 NUMBERS = INTEGERS + FLOATS
 
 #: The composite type forms, by head name.
-FORMS = ("arr", "vec", "ptr", "own", "fn", "res", "opt", "shared")
+FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared")
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,24 +132,25 @@ class Opt:
 
 @dataclass(frozen=True, slots=True)
 class FnTy:
-    """A function type, ``(fn (T...) R)``.
+    """A function type, ``(fn (T...) R)``, or ``(fn* (T...) R)``.
 
-    ``captures`` marks a value that is a closure which copied names out of its
-    creating frame. It is not part of the type's identity: any two functions of
-    one signature are interchangeable where a value is called, and the flag is
-    deliberately excluded from equality and hashing. The checker reads it to
-    enforce the lifetime rule — a capturing closure may not leave the function
-    that made it (E0502) — while the lowerer never sees a type with the flag
-    set, because every value that could carry one out has been refused.
+    ``captures`` is part of the type, not a side note: ``(fn ...)`` is a plain
+    function pointer that may be called from anywhere, while ``(fn* ...)`` is a
+    closure whose environment is a stack slot in the frame that made it. The two
+    spellings are not compatible, which is what stops a capturing closure from
+    being handed to a callee that could keep it past its frame. A closure
+    expression that captured nothing has the plain type and still escapes
+    freely; the lowerer spells both as the same two-word value.
     """
 
     params: tuple["Ty", ...]
     ret: "Ty"
-    captures: bool = field(default=False, compare=False)
+    captures: bool = False
 
     def __str__(self) -> str:
         params = " ".join(str(param) for param in self.params)
-        return f"(fn ({params}) {self.ret})"
+        head = "fn*" if self.captures else "fn"
+        return f"({head} ({params}) {self.ret})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,9 +236,13 @@ def parse_type(node: "Node | Token", *, path: str = "") -> Ty:
             parse_type(node.items[1], path=where),
             parse_type(node.items[2], path=where),
         )
-    if kind == "fn":
-        _count(node, 3, where, "fn takes a parameter list and a return type")
-        return FnTy(_type_list(node.items[1], where), parse_type(node.items[2], path=where))
+    if kind in ("fn", "fn*"):
+        _count(node, 3, where, f"{kind} takes a parameter list and a return type")
+        return FnTy(
+            _type_list(node.items[1], where),
+            parse_type(node.items[2], path=where),
+            captures=kind == "fn*",
+        )
     raise diag(UNKNOWN_TYPE, where, f"unknown type form '{kind}'")
 
 
@@ -277,7 +282,11 @@ def compatible(a: Ty, b: Ty) -> bool:
             and compatible(a.err, b.err)
         )
     if isinstance(a, FnTy):
-        if not isinstance(b, FnTy) or len(a.params) != len(b.params):
+        if (
+            not isinstance(b, FnTy)
+            or a.captures != b.captures
+            or len(a.params) != len(b.params)
+        ):
             return False
         if not all(compatible(x, y) for x, y in zip(a.params, b.params)):
             return False

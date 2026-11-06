@@ -475,9 +475,10 @@ class ClosureCheckTest(unittest.TestCase):
             "(mod m)(fn f :i64 ((a :i64))"
             " (let g (fn :i64 ((x :i64)) (ret (+ x a)))) (ret (g 1)))"
         )
-        self.assertEqual(
-            cm.expr_types["m/f/2/1"], FnTy((Prim("i64"),), Prim("i64"))
-        )
+        ty = cm.expr_types["m/f/2/1"]
+        # It captured ``a``, so it is a closure type, not a plain pointer.
+        self.assertEqual(ty, FnTy((Prim("i64"),), Prim("i64"), True))
+        self.assertEqual(str(ty), "(fn* (:i64) :i64)")
 
     def test_the_captures_are_the_outer_names_the_body_read(self):
         cm = checked(
@@ -586,6 +587,85 @@ class ClosureCheckTest(unittest.TestCase):
             " (vec-push v (fn :i64 ((x :i64)) (ret (+ x n)))))"
         )
         self.assertEqual(error.code, "E0502")
+
+    def test_a_capturing_closure_cannot_be_passed_to_a_plain_function_parameter(self):
+        # R12: the environment is a slot in this frame, and a callee with a
+        # plain function-typed parameter could return or store the value. The
+        # capturing and plain spellings are different types, so the argument
+        # is refused where it is written.
+        error = fail_on(
+            "(mod m)(fn use :i64 ((f :(fn (:i64) :i64))) (ret (f 1)))"
+            "(fn f :i64 ((n :i64))"
+            " (ret (use (fn :i64 ((x :i64)) (ret (+ x n))))))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_a_capturing_closure_cannot_escape_through_a_callee(self):
+        # The relay hole: both the parameter and the return type are plain, so
+        # without the argument rule the callee would hand back a caller's
+        # environment typed as an ordinary function pointer.
+        error = fail_on(
+            "(mod m)(fn relay :(fn (:i64) :i64) ((f :(fn (:i64) :i64))) (ret f))"
+            "(fn f :i64 ((n :i64))"
+            " (let g (relay (fn :i64 ((x :i64)) (ret (+ x n)))))"
+            " (ret (g 1)))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_a_capturing_closure_cannot_be_passed_to_a_generic(self):
+        # The same rule applies before unification: inferring the type
+        # argument from a capturing closure would hand it to the copy.
+        error = fail_on(
+            "(mod m)(fn apply :U ((f :(fn (:T) :U)) (x :T)) (ret (f x)))"
+            "(fn f :i64 ((n :i64))"
+            " (ret (apply (fn :i64 ((x :i64)) (ret (+ x n))) 1)))"
+        )
+        self.assertEqual(error.code, "E0502")
+
+    def test_a_non_capturing_closure_passes_through_a_plain_parameter(self):
+        cm = checked(
+            "(mod m)(fn relay :(fn (:i64) :i64) ((f :(fn (:i64) :i64))) (ret f))"
+            "(fn f :i64 ()"
+            " (let g (relay (fn :i64 ((x :i64)) (ret (* x 3)))))"
+            " (ret (g 4)))"
+        )
+        # It captured nothing, so it kept the plain type through the parameter
+        # and the return: callable after `relay`'s frame is gone.
+        self.assertEqual(
+            cm.declared["m/f/2"], FnTy((Prim("i64"),), Prim("i64"), False)
+        )
+
+    def test_a_capturing_closure_may_be_bound_and_called_twice(self):
+        cm = checked(
+            "(mod m)(fn f :i64 ((k :i64))"
+            " (let g (fn :i64 ((x :i64)) (ret (+ x k))))"
+            " (ret (+ (g 0) (g 1))))"
+        )
+        self.assertEqual(
+            cm.declared["m/f/2"], FnTy((Prim("i64"),), Prim("i64"), True)
+        )
+
+    def test_a_capturing_parameter_type_refuses_every_argument(self):
+        # `(fn* ...)` is a real annotation, not just a printed type: a plain
+        # closure is a different type (E0100), and a capturing one may not
+        # cross a call at all (E0502). Nothing can inhabit such a parameter.
+        plain = fail_on(
+            "(mod m)(fn use :void ((f :(fn* (:i64) :i64))) (f 1))"
+            "(fn f :void () (use (fn :i64 ((x :i64)) (ret x))))"
+        )
+        self.assertEqual(plain.code, "E0100")
+        capture = fail_on(
+            "(mod m)(fn use :void ((f :(fn* (:i64) :i64))) (f 1))"
+            "(fn f :void ((n :i64))"
+            " (use (fn :i64 ((x :i64)) (ret (+ x n)))))"
+        )
+        self.assertEqual(capture.code, "E0502")
 
     def test_a_capturing_closure_cannot_outlive_its_loop_iteration(self):
         error = fail_on(
@@ -706,6 +786,8 @@ class ClosuresExecTest(unittest.TestCase):
         "closure-inside-a-generic": ("12\n", 0),
         "non-capturing-closure-returns": ("14\n", 0),
         "distinct-type-arguments": ("1\n2\n", 0),
+        "non-capturing-through-a-parameter": ("12\n", 0),
+        "capturing-local-called-twice": ("10\n20\n", 0),
     }
 
     def run_case(self, name: str, opt: str) -> subprocess.CompletedProcess:
