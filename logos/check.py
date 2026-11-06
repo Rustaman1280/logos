@@ -4,14 +4,26 @@ Scope
 -----
 This pass checks what the language has so far: primitives, arithmetic,
 comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
-``while``, ``match``, ``break``/``continue``, ``ret`` and calls. A form from a
-later task (``deref``, ``alloc``, ``make``) is not special yet, so it reaches
-the call path and is reported as an unknown function: the vocabulary grows one
-task at a time, and a name is only a built-in once this module has a rule for
-it. ``print`` and ``println`` are the built-ins so far: each takes one ``:str``,
-writes it unchanged and returns ``:void``. Formatting a number as text is a job
-for the runtime, not for the checker, so an integer argument is a type mismatch
-rather than a conversion.
+``while``, ``match``, ``break``/``continue``, ``ret``, calls, struct field
+access and fixed arrays. A form from a later task (``deref``, ``alloc``,
+``vec-push``) is not special yet, so it reaches the call path and is reported
+as an unknown function: the vocabulary grows one task at a time, and a name is
+only a built-in once this module has a rule for it. ``print`` and ``println``
+are the built-ins so far: each takes one ``:str``, writes it unchanged and
+returns ``:void``. Formatting a number as text is a job for the runtime, not
+for the checker, so an integer argument is a type mismatch rather than a
+conversion.
+
+Structs and fixed arrays
+------------------------
+``(type point (struct (x :i64) (y :i64)))`` introduces a struct whose fields
+are read once, in declaration order, by :func:`struct_shape`. ``(make T v...)``
+builds a struct or an array and checks one value per field or element;
+``(get e f)`` reads a field at its own type; ``(set-field name f v)`` and
+``(arr-set name i v)`` mutate a binding and therefore need a ``letmut``.
+``(arr-get a i)`` reads an element; its index must be an integer and its bounds
+are checked at run time. An unknown field is E0200 and a value that does not
+fit its field is E0201.
 
 Control flow
 ------------
@@ -80,17 +92,19 @@ is invisible outside it.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 from logos.diag import (
     CIRCULAR,
     DUPLICATE,
+    FIELD_TYPE_MISMATCH,
     LITERAL_RANGE,
     MISSING_RETURN,
     NOT_FOUND,
     NOT_MUTABLE,
     TYPE_MISMATCH,
+    UNKNOWN_FIELD,
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
     UNKNOWN_TYPE,
@@ -130,13 +144,16 @@ class CheckedModule:
     definitions and those of the modules it imports, which the resolver refused
     to duplicate. ``expr_types`` is keyed by node path, one entry per node the
     checker visited, so a later pass can type an expression without repeating
-    scope analysis.
+    scope analysis. ``structs`` holds each visible struct's fields in
+    declaration order, the layout the backend needs and that the checker has
+    already validated.
     """
 
     module: Module
     types: dict[str, Ty]
     fn_sigs: dict[str, FnTy]
     expr_types: dict[str, Ty]
+    structs: dict[str, tuple[tuple[str, Ty], ...]] = field(default_factory=dict)
 
 
 def check_module(m: Module) -> CheckedModule:
@@ -275,6 +292,38 @@ def is_wildcard(pattern: Node | Token) -> bool:
     return isinstance(pattern, Token) and pattern.kind == ATOM and pattern.value == "_"
 
 
+def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]:
+    """The fields of a ``(struct ...)`` body, in declaration order.
+
+    One reader because two would drift: the checker validates every struct with
+    it and the lowerer reads the same list to build the aggregate, so field
+    order — which is the whole of the C layout — cannot disagree between them.
+
+    A field is ``(name type)``. A repeated name is E0003, a malformed field is
+    E0002, and an unresolvable type is E0101, each at the field's own path.
+    """
+    fields: list[tuple[str, Ty]] = []
+    names: set[str] = set()
+    for field in node.items[1:]:
+        if not isinstance(field, Node):
+            raise diag(UNKNOWN_NODE, node.path, "a struct field must be (name type)")
+        items = field.items
+        if len(items) == 2:
+            name_item, type_item = items
+        elif len(items) == 3 and _marker(items[1]):
+            name_item, type_item = items[0], items[2]
+        else:
+            raise diag(
+                UNKNOWN_NODE, field.path, "a struct field must be (name type)"
+            )
+        name = _name(name_item, field.path, "a field")
+        if name in names:
+            raise diag(DUPLICATE, field.path, f"duplicate field '{name}'")
+        names.add(name)
+        fields.append((name, _read_type(type_item, types, field.path)))
+    return tuple(fields)
+
+
 @dataclass(slots=True)
 class _Var:
     ty: Ty
@@ -330,15 +379,17 @@ class _Env:
 class _Visible:
     """The names one module can see.
 
-    ``own_*`` are this module's definitions; ``types`` and ``fns`` add the own
-    definitions of each direct import, and nothing deeper, because an import
-    is not transitive.
+    ``own_*`` are this module's definitions; ``types``, ``fns`` and ``structs``
+    add the own definitions of each direct import, and nothing deeper, because
+    an import is not transitive.
     """
 
     own_types: dict[str, Ty]
     own_fns: dict[str, FnTy]
+    own_structs: dict[str, tuple[tuple[str, Ty], ...]]
     types: dict[str, Ty]
     fns: dict[str, FnTy]
+    structs: dict[str, tuple[tuple[str, Ty], ...]]
 
 
 #: ``expect`` and ``expect-leak`` are harness directives, not expressions. The
@@ -389,18 +440,24 @@ class _Checker:
         self.module = module
         self.expr_types: dict[str, Ty] = {}
         self._types: dict[str, Ty] = {}
+        self._structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
         self._seen: dict[str, _Visible] = {}
         self._active: list[str] = []
 
     def run(self) -> CheckedModule:
         visible = self._visible(self.module)
         self._types = visible.types
+        self._structs = visible.structs
         for node in self.module.fns.values():
             self._check_fn(node, visible.fns)
         for node in self.module.tests.values():
             self._check_test(node, visible.fns)
         return CheckedModule(
-            self.module, dict(visible.types), dict(visible.fns), self.expr_types
+            self.module,
+            dict(visible.types),
+            dict(visible.fns),
+            self.expr_types,
+            dict(visible.structs),
         )
 
     # -- namespaces ------------------------------------------------------
@@ -420,17 +477,29 @@ class _Checker:
         try:
             inherited: dict[str, Ty] = {}
             inherited_fns: dict[str, FnTy] = {}
+            inherited_structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
             for imported in module.imports.values():
                 # Only the import's own names cross the boundary: a module
                 # never inherits its imports' imports.
                 visible = self._visible(imported)
                 inherited.update(visible.own_types)
                 inherited_fns.update(visible.own_fns)
+                inherited_structs.update(visible.own_structs)
             own_types = {
                 name: _declared(name, node) for name, node in module.types.items()
             }
             types = dict(inherited)
             types.update(own_types)
+            # Field types resolve against the complete namespace, so a struct
+            # may name a type declared after it. The fields themselves are read
+            # second, once every name they might mention exists.
+            own_structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+            for name, node in module.types.items():
+                body = node.items[2] if len(node.items) > 2 else None
+                if isinstance(body, Node) and body.kind == "struct":
+                    own_structs[name] = struct_shape(body, types)
+            structs = dict(inherited_structs)
+            structs.update(own_structs)
             own_fns: dict[str, FnTy] = {}
             for name, node in module.fns.items():
                 if name.startswith("rt_"):
@@ -442,7 +511,7 @@ class _Checker:
                 own_fns[name] = self._signature(node, types)
             fns = dict(inherited_fns)
             fns.update(own_fns)
-            visible = _Visible(own_types, own_fns, types, fns)
+            visible = _Visible(own_types, own_fns, own_structs, types, fns, structs)
         finally:
             self._active.pop()
         self._seen[module.name] = visible
@@ -551,6 +620,16 @@ class _Checker:
             return self._loop_jump(node, env)
         if kind == "ret":
             return self._ret(node, env)
+        if kind == "make":
+            return self._make(node, env)
+        if kind == "get":
+            return self._get(node, env)
+        if kind == "set-field":
+            return self._set_field(node, env)
+        if kind == "arr-get":
+            return self._arr_get(node, env)
+        if kind == "arr-set":
+            return self._arr_set(node, env)
         head = node.items[0] if node.items else None
         if isinstance(head, Token) and head.kind == ATOM:
             return self._call(node, env)
@@ -882,6 +961,202 @@ class _Checker:
                 TYPE_MISMATCH,
                 node.path,
                 f"{env.label} returns {env.ret}, found {value}",
+            )
+        return Prim("void")
+
+    # -- structs and fixed arrays ----------------------------------------
+
+    def _fields(self, ty: StructRef, where: str) -> tuple[tuple[str, Ty], ...]:
+        """The fields of a struct the namespace declares, or E0101."""
+        fields = self._structs.get(ty.name)
+        if fields is None:
+            raise diag(UNKNOWN_TYPE, where, f"unknown type '{ty.name}'")
+        return fields
+
+    def _make(self, node: Node, env: _Env) -> Ty:
+        """``(make T v...)``: an aggregate with one value per field or element.
+
+        ``T`` is read the same way an annotation is, so ``(make point 1 2)`` and
+        ``(make (arr :i64 3) 1 2 3)`` both name their type. Every argument takes
+        the field's or element's type, which is what lets an integer literal sit
+        in a ``:u8`` field without inventing a width.
+        """
+        items = node.items
+        if len(items) < 2:
+            raise diag(WRONG_ARITY, node.path, "make takes a type and its fields")
+        ty, index = _read_type_at(items, 1, self._types, node.path)
+        values = items[index:]
+        if isinstance(ty, StructRef):
+            fields = self._fields(ty, node.path)
+            if len(values) != len(fields):
+                raise diag(
+                    WRONG_ARITY,
+                    node.path,
+                    f"struct '{ty.name}' takes {_count(len(fields), 'field')}, "
+                    f"got {len(values)}",
+                )
+            for item, (field, fty) in zip(values, fields):
+                got = self._value(item, env, fty, node.path)
+                if not compatible(fty, got):
+                    raise diag(
+                        FIELD_TYPE_MISMATCH,
+                        _at(item, node),
+                        f"field '{field}' of '{ty.name}' expects {fty}, found {got}",
+                    )
+            return ty
+        if isinstance(ty, Arr):
+            if len(values) != ty.n:
+                raise diag(
+                    WRONG_ARITY,
+                    node.path,
+                    f"array '{ty}' takes {_count(ty.n, 'element')}, "
+                    f"got {len(values)}",
+                )
+            for item in values:
+                got = self._value(item, env, ty.elem, node.path)
+                if not compatible(ty.elem, got):
+                    raise diag(
+                        TYPE_MISMATCH,
+                        _at(item, node),
+                        f"cannot store {got} in {ty}",
+                    )
+            return ty
+        if isinstance(ty, EnumRef):
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'make' of enum '{ty.name}' is not lowered yet",
+            )
+        raise diag(
+            UNKNOWN_TYPE, node.path, f"make needs a struct or array type, found {ty}"
+        )
+
+    def _get(self, node: Node, env: _Env) -> Ty:
+        """``(get e field)``: one field of a struct value, at its own type."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'get' takes a struct and a field")
+        ty = self._value(items[1], env, None, node.path)
+        if not isinstance(ty, StructRef):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"'get' needs a struct, found {ty}",
+            )
+        name = _name(items[2], node.path, "get")
+        for field, fty in self._fields(ty, node.path):
+            if field == name:
+                return fty
+        raise diag(UNKNOWN_FIELD, node.path, f"struct '{ty.name}' has no field '{name}'")
+
+    def _set_field(self, node: Node, env: _Env) -> Ty:
+        """``(set-field name field value)``: mutate one field in place.
+
+        The target is a binding, not an arbitrary expression: a temporary
+        aggregate has no storage to write through, and pretending it did would
+        silently discard the write. Mutability is the binding's, so a ``let``
+        cannot be field-assigned while a ``letmut`` can.
+        """
+        items = node.items
+        if (
+            len(items) != 4
+            or not isinstance(items[1], Token)
+            or items[1].kind != ATOM
+        ):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                "set-field takes a mutable name, a field and a value",
+            )
+        name = _name(items[1], node.path, "set-field")
+        var = env.lookup(name)
+        if var is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
+        if not var.mutable:
+            raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
+        if not isinstance(var.ty, StructRef):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"'set-field' needs a struct, found {var.ty}",
+            )
+        field = _name(items[2], node.path, "set-field")
+        for fname, fty in self._fields(var.ty, node.path):
+            if fname != field:
+                continue
+            got = self._value(items[3], env, fty, node.path)
+            if not compatible(fty, got):
+                raise diag(
+                    FIELD_TYPE_MISMATCH,
+                    _at(items[3], node),
+                    f"field '{field}' of '{var.ty.name}' expects {fty}, found {got}",
+                )
+            return Prim("void")
+        raise diag(
+            UNKNOWN_FIELD,
+            node.path,
+            f"struct '{var.ty.name}' has no field '{field}'",
+        )
+
+    def _arr_get(self, node: Node, env: _Env) -> Ty:
+        """``(arr-get a i)``: the element type, indexed at run time."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'arr-get' takes an array and an index")
+        ty = self._value(items[1], env, None, node.path)
+        if not isinstance(ty, Arr):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"'arr-get' needs a fixed array, found {ty}",
+            )
+        index = self._value(items[2], env, None, node.path)
+        if not _integer(index):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"array index must be an integer, found {index}",
+            )
+        return ty.elem
+
+    def _arr_set(self, node: Node, env: _Env) -> Ty:
+        """``(arr-set name i v)``: mutate one element of a binding's array."""
+        items = node.items
+        if (
+            len(items) != 4
+            or not isinstance(items[1], Token)
+            or items[1].kind != ATOM
+        ):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                "arr-set takes a mutable name, an index and a value",
+            )
+        name = _name(items[1], node.path, "arr-set")
+        var = env.lookup(name)
+        if var is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
+        if not var.mutable:
+            raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
+        if not isinstance(var.ty, Arr):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"'arr-set' needs a fixed array, found {var.ty}",
+            )
+        index = self._value(items[2], env, None, node.path)
+        if not _integer(index):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"array index must be an integer, found {index}",
+            )
+        got = self._value(items[3], env, var.ty.elem, node.path)
+        if not compatible(var.ty.elem, got):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[3], node),
+                f"cannot store {got} in {var.ty}",
             )
         return Prim("void")
 

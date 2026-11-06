@@ -5,10 +5,29 @@ Scope
 This pass lowers what the check accepts: integer literals, ``let``/``letmut``
 and ``set``, ``ret``, calls, ``if``, ``while``, ``match``, ``break``/
 ``continue``, comparisons, ``and``/``or``/``not``, ``print``/``println`` over
-any ``:str`` value, and checked integer division. A construct the checker
-accepts but this pass does not lower yet is reported as a diagnostic at its own
-path — never a ``KeyError`` or a ``ValueError``, and never silently
-miscompiled.
+any ``:str`` value, checked integer division, structs (``make``, ``get``,
+``set-field``) and fixed arrays (``make``, ``arr-get``, ``arr-set``). A
+construct the checker accepts but this pass does not lower yet is reported as
+a diagnostic at its own path — never a ``KeyError`` or a ``ValueError``, and
+never silently miscompiled.
+
+Structs and arrays
+------------------
+A struct is an LLVM identified type whose fields are printed in declaration
+order, ``%struct.point = type { i64, i64 }``, which is C's layout: LLVM pads
+and aligns an identified struct exactly as C does for the same field list. A
+``make`` builds the aggregate as a value with one ``insertvalue`` per field;
+``get`` reads one field with ``extractvalue``, so a struct can be nested,
+passed, returned and stored without ever taking its address. ``set-field`` and
+``arr-set`` mutate a binding in place: they take the binding's slot and store
+through a ``getelementptr``. A fixed array is ``[n x T]``; ``arr-get`` spills a
+non-binding operand into a slot (LLVM cannot index a value with a run-time
+index), bounds-checks the index with one unsigned ``icmp`` and panics
+``R0003`` before the ``gep`` and ``load``.
+
+Only structs a function materialises are emitted, in dependency-first order,
+so a declaration nothing uses cannot fail a build over a field type this
+backend cannot spell.
 
 Values and slots
 ----------------
@@ -30,10 +49,11 @@ the entry block, but the name is known only inside the block that declared it
 binding table on entry and restores it on exit, so a branch's ``let`` cannot
 retarget a later read of the same outer name.
 
-A declared type with no LLVM layout — ``(vec T)``, ``(arr T n)``, ``(own T)``,
-``(res T E)`` and the rest — is E0002 at the node that materialises it, never a
+A declared type with no LLVM layout — ``(vec T)``, ``(own T)``, ``(res T E)``
+and the rest — is E0002 at the node that materialises it, never a
 ``ValueError`` from the printer: the type vocabulary is larger than this
-backend, and the refusal must carry a path.
+backend, and the refusal must carry a path. A struct or an array is lowerable
+when every type inside it is; an enum is not, until results arrive.
 
 Control flow
 ------------
@@ -109,20 +129,31 @@ from logos.check import (
     match_shape,
 )
 from logos.diag import (
+    ARRAY_BOUNDS,
     DIVISION_BY_ZERO,
     MATCH_NO_ARM,
     MISSING_RETURN,
     NOT_FOUND,
     TYPE_MISMATCH,
+    UNKNOWN_FIELD,
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
     WRONG_ARITY,
     diag,
 )
-from logos.ir import NEWLINE, TRIPLE, IrBlock, IrDecl, IrFn, IrGlobal, IrModule
+from logos.ir import (
+    NEWLINE,
+    TRIPLE,
+    IrBlock,
+    IrDecl,
+    IrFn,
+    IrGlobal,
+    IrModule,
+    IrStruct,
+)
 from logos.lexer import ATOM, NUMBER, STRING, Token
 from logos.nodes import Node
-from logos.types import INTEGERS, Prim, Ptr, Ty
+from logos.types import INTEGERS, Arr, Prim, Ptr, StructRef, Ty
 
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
@@ -142,7 +173,17 @@ _LOGICAL = ("and", "or")
 
 #: Forms that are statements: a value position for one of these is a mistake,
 #: because it produces nothing (or, for ``while``, no result a caller can use).
-_STATEMENTS = ("let", "letmut", "set", "ret", "while", "break", "continue")
+_STATEMENTS = (
+    "let",
+    "letmut",
+    "set",
+    "ret",
+    "while",
+    "break",
+    "continue",
+    "set-field",
+    "arr-set",
+)
 
 #: The one aggregate this backend builds by hand: the ``:str`` the spec fixes.
 _STR = Prim("str")
@@ -177,21 +218,59 @@ _ENTRY_RET = Prim("i32")
 _STDOUT = "1"
 
 
-def lowered_type(ty: Ty, path: str) -> Ty:
+def lowered_type(
+    ty: Ty, path: str, structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None
+) -> Ty:
     """Return ``ty`` if the printer has a layout for it, else raise E0002.
 
     The checker's type vocabulary is larger than this backend's: a parameter,
-    binding or result may name ``(vec :i64)``, ``(arr :i64 4)``, ``(own T)`` or
-    ``(res T E)`` and still type-check. Materialising one would reach
+    binding or result may name ``(vec :i64)``, ``(own T)`` or ``(res T E)`` and
+    still type-check. Materialising one would reach
     :func:`logos.llvm.type_text` and escape as a bare ``ValueError`` with no
     node path, so every place that materialises a type passes through here and
     the refusal is a diagnostic at the node that named it.
+
+    A struct or an array is lowerable only when every type inside it is, so
+    ``structs`` supplies the field lists and the walk descends. An enum has no
+    layout yet: it reaches ``type_text`` as an unsupported type and is refused
+    the same way. A struct that contains itself by value is refused too, because
+    no finite LLVM type spells an infinite one.
     """
+    bad, cycle = _unlowered(ty, structs or {}, ())
+    if cycle is not None:
+        raise diag(UNKNOWN_NODE, path, f"struct '{cycle}' contains itself by value")
+    if bad is not None:
+        raise diag(UNKNOWN_NODE, path, f"{bad} is not lowered yet")
+    return ty
+
+
+def _unlowered(
+    ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]], stack: tuple[str, ...]
+) -> tuple[Ty | None, str | None]:
+    """The first type in ``ty`` with no layout, and any value cycle found."""
     try:
         llvm.type_text(ty)
     except ValueError:
-        raise diag(UNKNOWN_NODE, path, f"{ty} is not lowered yet") from None
-    return ty
+        return ty, None
+    if isinstance(ty, StructRef):
+        if ty.name in stack:
+            return None, ty.name
+        fields = structs.get(ty.name)
+        if fields is None:
+            return ty, None
+        for _, field in fields:
+            if _is_void(field):
+                # A field is a storage location, and no ``void`` value exists
+                # to put in it.
+                return field, None
+            bad, cycle = _unlowered(field, structs, stack + (ty.name,))
+            if bad is not None or cycle is not None:
+                return bad, cycle
+    elif isinstance(ty, Arr):
+        if _is_void(ty.elem):
+            return ty.elem, None
+        return _unlowered(ty.elem, structs, stack)
+    return None, None
 
 
 def lower_module(cm: CheckedModule) -> IrModule:
@@ -253,6 +332,11 @@ class _Lower:
         self.strings: dict[bytes, str] = {}
         self.declares: list[IrDecl] = []
         self.newline = False
+        #: Structs a function materialises, in dependency-first order. A
+        #: declaration nothing uses is not emitted: its layout may name a type
+        #: this backend cannot spell, and a module should not fail to build
+        #: over a struct it never touched.
+        self.structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
         #: Every source function this module can call, mapped to its symbol.
         #: Built before any body is lowered, so source order is irrelevant and
         #: a call to a name that is not here is E0103 in the lowerer.
@@ -288,12 +372,37 @@ class _Lower:
         if decl not in self.declares:
             self.declares.append(decl)
 
+    def use_type(self, ty: Ty, path: str) -> None:
+        """Refuse a type with no layout, and record the structs it needs.
+
+        Validation is the public :func:`lowered_type`, which descends into
+        struct fields and array elements. Collection is separate and post-order,
+        so ``%struct.line`` is printed after ``%struct.pair``, the type it
+        contains: a definition may then be read top to bottom.
+        """
+        lowered_type(ty, path, self.cm.structs)
+        self._collect(ty)
+
+    def _collect(self, ty: Ty) -> None:
+        if isinstance(ty, StructRef):
+            if ty.name in self.structs:
+                return
+            fields = self.cm.structs.get(ty.name)
+            if fields is None:
+                return
+            for _, field in fields:
+                self._collect(field)
+            self.structs[ty.name] = fields
+            llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
+        elif isinstance(ty, Arr):
+            self._collect(ty.elem)
+
     def fn(self, name: str, node: Node) -> None:
         ret, params, start = fn_shape(node, self.cm.types)
         # The signature is the first place a declared type is materialised:
         # refusing it here keeps the function's ``define`` line from reaching
         # the printer with a type it cannot spell.
-        lowered_type(ret, node.path)
+        self.use_type(ret, node.path)
         param_paths = [param.path for param in fn_param_nodes(node)]
         is_main = name == "main"
         if is_main:
@@ -322,7 +431,11 @@ class _Lower:
         self.ir.functions.append(fn)
 
     def close(self) -> IrModule:
-        """Finish the module: the shared newline last, then the declarations."""
+        """Finish the module: structs, then the shared newline and declarations."""
+        self.ir.structs = [
+            IrStruct(name, tuple(fty for _, fty in fields))
+            for name, fields in self.structs.items()
+        ]
         if self.newline:
             self.ir.globals.append(IrGlobal(NEWLINE, b"\n"))
         self.ir.declares = list(self.declares)
@@ -395,7 +508,9 @@ class _Fn:
         :meth:`finish`), so a form inside a loop allocates once. ``path`` is
         the node that named the type, so a type with no layout is E0002 there.
         """
-        lowered_type(ty, path)
+        # Record the struct definitions the slot's type needs, and refuse a
+        # field type with no layout, at the node that named the slot.
+        self.lowering.use_type(ty, path)
         name = owner if owner is not None else self.binding()
         address = f"{name}.addr"
         self.allocas.append(("alloca", address, ty))
@@ -454,6 +569,10 @@ class _Fn:
             self.bind(node)
         elif kind == "set":
             self.assign(node)
+        elif kind == "set-field":
+            self.set_field(node)
+        elif kind == "arr-set":
+            self.arr_set(node)
         elif kind == "ret":
             self.ret_stmt(node)
         elif kind == "while":
@@ -561,6 +680,199 @@ class _Fn:
         self.emit(("trunc", dest, Prim("i64"), _ENTRY_RET, value))
         return dest
 
+    # -- structs and fixed arrays ----------------------------------------
+
+    def make(self, node: Node) -> str:
+        """``(make T v...)``: one ``insertvalue`` per field or element.
+
+        The aggregate is built as a value, not written into storage: a struct
+        returned by a function, passed as an argument or nested inside another
+        ``make`` is the same chain. Fields are inserted at their declaration
+        index, which is what keeps the value's layout the C layout.
+        """
+        ty = self.type_of(node)
+        self.lowering.use_type(ty, node.path)
+        items = node.items
+        if len(items) < 2:
+            raise diag(WRONG_ARITY, node.path, "make takes a type and its fields")
+        # A composite type may be written behind the ``:`` marker,
+        # ``(make :(arr :i64 3) 1 2 3)``, which occupies its own item.
+        start = 3 if _is_marker(items[1]) else 2
+        values = [self.value(item, node.path) for item in items[start:]]
+        if isinstance(ty, StructRef):
+            fields = self.cm.structs.get(ty.name, ())
+            parts = [(value, fty) for value, (_, fty) in zip(values, fields)]
+        elif isinstance(ty, Arr):
+            parts = [(value, ty.elem) for value in values]
+        else:
+            raise diag(
+                UNKNOWN_NODE, node.path, f"'make' of {ty} is not lowered yet"
+            )
+        aggregate = "undef"
+        for index, (value, field_ty) in enumerate(parts):
+            dest = self.temp()
+            self.emit(("insertvalue", dest, ty, aggregate, field_ty, value, index))
+            aggregate = dest
+        return aggregate
+
+    def get_field(self, node: Node) -> str:
+        """``(get e field)``: ``extractvalue`` at the field's declaration index."""
+        items = node.items
+        if len(items) != 3 or not isinstance(items[2], Token):
+            raise diag(WRONG_ARITY, node.path, "'get' takes a struct and a field")
+        ty = self.type_of_item(items[1], node.path)
+        if not isinstance(ty, StructRef):
+            raise diag(
+                TYPE_MISMATCH, node.path, f"'get' needs a struct, found {ty}"
+            )
+        index, field_ty = self.field(ty, items[2].value, node.path)
+        self.lowering.use_type(field_ty, node.path)
+        whole = self.value(items[1], node.path)
+        dest = self.temp()
+        self.emit(("extractvalue", dest, ty, field_ty, whole, index))
+        return dest
+
+    def set_field(self, node: Node) -> None:
+        """``(set-field name field value)``: store through a field pointer."""
+        items = node.items
+        if (
+            len(items) != 4
+            or not isinstance(items[1], Token)
+            or not isinstance(items[2], Token)
+        ):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                "set-field takes a mutable name, a field and a value",
+            )
+        binding = self.vars.get(items[1].value)
+        if binding is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{items[1].value}'")
+        ty, slot = binding
+        if not isinstance(ty, StructRef):
+            raise diag(
+                TYPE_MISMATCH, node.path, f"'set-field' needs a struct, found {ty}"
+            )
+        index, field_ty = self.field(ty, items[2].value, node.path)
+        value = self.value(items[3], node.path)
+        address = self.temp()
+        self.emit(("gep", address, ty, slot, (("i32", "0"), ("i32", str(index)))))
+        self.emit(("store", field_ty, value, address))
+
+    def arr_get(self, node: Node) -> str:
+        """``(arr-get a i)``: bounds check, ``gep``, ``load``."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "'arr-get' takes an array and an index"
+            )
+        ty = self.type_of_item(items[1], node.path)
+        if not isinstance(ty, Arr):
+            raise diag(
+                TYPE_MISMATCH, node.path, f"'arr-get' needs a fixed array, found {ty}"
+            )
+        self.lowering.use_type(ty, node.path)
+        place = self.place(items[1], ty, node.path)
+        index = self.index64(items[2], node.path)
+        checked = self.bounds(ty.n, index, node.path)
+        address = self.temp()
+        self.emit(("gep", address, ty, place, (("i64", "0"), ("i64", checked))))
+        dest = self.temp()
+        self.emit(("load", dest, ty.elem, address))
+        return dest
+
+    def arr_set(self, node: Node) -> None:
+        """``(arr-set name i v)``: bounds check, ``gep``, ``store``."""
+        items = node.items
+        if len(items) != 4 or not isinstance(items[1], Token):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                "arr-set takes a mutable name, an index and a value",
+            )
+        binding = self.vars.get(items[1].value)
+        if binding is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{items[1].value}'")
+        ty, slot = binding
+        if not isinstance(ty, Arr):
+            raise diag(
+                TYPE_MISMATCH, node.path, f"'arr-set' needs a fixed array, found {ty}"
+            )
+        self.lowering.use_type(ty, node.path)
+        index = self.index64(items[2], node.path)
+        checked = self.bounds(ty.n, index, node.path)
+        value = self.value(items[3], node.path)
+        address = self.temp()
+        self.emit(("gep", address, ty, slot, (("i64", "0"), ("i64", checked))))
+        self.emit(("store", ty.elem, value, address))
+
+    def field(self, ty: StructRef, name: str, where: str) -> tuple[int, Ty]:
+        """The declaration index and type of one field."""
+        fields = self.cm.structs.get(ty.name)
+        if fields is None:
+            raise diag(UNKNOWN_NODE, where, f"struct '{ty.name}' is not lowered yet")
+        for index, (field, field_ty) in enumerate(fields):
+            if field == name:
+                return index, field_ty
+        raise diag(UNKNOWN_FIELD, where, f"struct '{ty.name}' has no field '{name}'")
+
+    def place(self, item: Node | Token, ty: Ty, where: str) -> str:
+        """A pointer to the aggregate ``item`` names, for indexing through it.
+
+        A binding already has a slot, so its own is the place. Any other
+        expression is a value without storage, which is spilled into one fresh
+        slot: LLVM cannot index a value with a run-time index, and allocating
+        the slot in ``entry`` keeps a loop from growing the frame.
+        """
+        if isinstance(item, Token) and item.kind == ATOM:
+            binding = self.vars.get(item.value)
+            if binding is not None:
+                return binding[1]
+        slot = self.slot(ty, path=where)
+        self.emit(("store", ty, self.value(item, where), slot))
+        return slot
+
+    def index64(self, item: Node | Token, where: str) -> str:
+        """An array index widened to ``i64`` for one unsigned bounds test.
+
+        A narrow or signed index is extended, never truncated: a negative index
+        then reads as a huge unsigned number and fails the same test a too-large
+        one does, instead of wrapping into range.
+        """
+        value = self.value(item, where)
+        ty = self.type_of_item(item, where)
+        if not (isinstance(ty, Prim) and ty.name in INTEGERS):
+            raise diag(
+                TYPE_MISMATCH,
+                where,
+                f"array index must be an integer, found {ty}",
+            )
+        if ty.name in ("i64", "u64"):
+            return value
+        dest = self.temp()
+        op = "zext" if ty.name.startswith("u") else "sext"
+        self.emit((op, dest, ty, Prim("i64"), value))
+        return dest
+
+    def bounds(self, length: int, index: str, where: str) -> str:
+        """Branch to ``rt_panic`` unless ``0 <= index < length``.
+
+        One unsigned compare covers both ends: ``i64`` is the index's widened
+        type, and a negative value is above ``length`` once read unsigned. The
+        panic names the indexing node, so a program that dies here says which
+        ``arr-get`` was out of range.
+        """
+        self.labels += 1
+        tag = f"arr{self.labels}"
+        ok, bad = f"{tag}.ok", f"{tag}.bad"
+        test = self.temp()
+        self.emit(("icmp", test, "ult", Prim("i64"), index, str(length)))
+        self.block.term = ("cbr", test, ok, bad)
+        self.new_block(bad)
+        self.panic(where, ARRAY_BOUNDS, "array index out of bounds")
+        self.new_block(ok)
+        return index
+
     # -- values ----------------------------------------------------------
 
     def value(self, item: Node | Token, where: str) -> str:
@@ -580,6 +892,12 @@ class _Fn:
             return self.if_expr(item)
         if kind == "match":
             return self.match_expr(item)
+        if kind == "make":
+            return self.make(item)
+        if kind == "get":
+            return self.get_field(item)
+        if kind == "arr-get":
+            return self.arr_get(item)
         if kind in _STATEMENTS:
             raise diag(UNKNOWN_NODE, item.path, f"'{kind}' is a statement, not a value")
         # A module-level ``fn`` shadows a builtin: the checker resolves
@@ -1057,6 +1375,11 @@ class _Fn:
 
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
+
+
+def _is_marker(item: Node | Token) -> bool:
+    """Whether ``item`` is the ``:`` in front of a composite type."""
+    return isinstance(item, Token) and item.kind == ATOM and item.value == ":"
 
 
 def _is_true(item: Node | Token) -> bool:

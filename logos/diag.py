@@ -18,9 +18,10 @@ quote it.
 * ``R0003`` no match arm matched — emitted by the lowerer for a ``match`` on
   an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
   (E0600) once exhaustiveness is checked, and until then the unmatched path
-  panics instead of returning a fabricated value. The code is reserved for the
-  other runtime checks that cannot be proven at compile time (arr bounds,
-  channel state).
+  panics instead of returning a fabricated value. The same code is emitted for
+  an array index outside ``0..n``: both are runtime checks that cannot be
+  proven at compile time, and both panic with the node path of the operation.
+  It is reserved for checks of that kind (channel state and the rest).
 
 R0002 and R0003 are runtime names only: nothing in the compiler emits R0002.
 """
@@ -43,6 +44,8 @@ CODES = {
     "E0104": "not mutable",
     "E0105": "missing return",
     "E0106": "integer literal out of range",
+    "E0200": "unknown field",
+    "E0201": "field type mismatch",
 }
 
 UNBALANCED = "E0001"
@@ -58,6 +61,8 @@ UNKNOWN_FUNCTION = "E0103"
 NOT_MUTABLE = "E0104"
 MISSING_RETURN = "E0105"
 LITERAL_RANGE = "E0106"
+UNKNOWN_FIELD = "E0200"
+FIELD_TYPE_MISMATCH = "E0201"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is
@@ -67,6 +72,10 @@ DIVISION_BY_ZERO = "R0001"
 #: The runtime check a ``match`` with no ``_`` arm reaches when no literal
 #: matches. Task 11 turns this into the static E0600 non-exhaustive match.
 MATCH_NO_ARM = "R0003"
+
+#: The runtime check an array index outside ``0..n`` reaches. The same code as
+#: an unmatched ``match``: both are bounds that only the running program knows.
+ARRAY_BOUNDS = "R0003"
 
 
 class LogosError(Exception):

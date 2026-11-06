@@ -21,8 +21,10 @@ and the type checker. Task 5 adds the first backend: IR, the LLVM text emitter
 and the driver, so `build` produces a real ELF. Task 6 adds control flow —
 `if`, `while`, `match`, `break`/`continue` — comparisons and boolean logic, and
 lowers `:str` as the 16-byte `{ i8*, i64 }` value the spec defines, so
-`print`/`println` take any string value and not only a literal. Everything else
-reports a diagnostic at the construct.
+`print`/`println` take any string value and not only a literal. Task 7 adds
+structs with C layout (`make`, `get`, `set-field`) and fixed arrays
+(`make (arr T n)`, `arr-get`, `arr-set`) whose indices are bounds-checked at run
+time. Everything else reports a diagnostic at the construct.
 
 ## Requirements
 

@@ -26,6 +26,8 @@ Opcode                     Tuple
 ``icmp``                   ``(dest, pred, ty, left, right)``
 ``insertvalue``            ``(dest, agg_ty, agg, elem_ty, value, index)``
 ``extractvalue``           ``(dest, agg_ty, elem_ty, agg, index)``
+``gep``                    ``(dest, base_ty, base, ((ty, index), ...))``
+``sext zext``              ``(dest, from_ty, to_ty, value)``
 ``phi``                    ``(dest, ty, ((value, label), ...))``
 ``trunc``                  ``(dest, from_ty, to_ty, value)``
 ``call``                   ``(dest, callee, (arg, ...))``
@@ -90,6 +92,20 @@ class IrDecl:
     ret: Ty
 
 
+@dataclass(frozen=True, slots=True)
+class IrStruct:
+    """One named struct type: its fields in declaration order.
+
+    The printer spells it ``%struct.<name> = type { ... }``; the field list is
+    what gives it C layout, so the order must never be sorted or grouped. Only
+    structs a function actually materialises are listed, and every dependency
+    is listed before the struct that names it.
+    """
+
+    name: str
+    fields: tuple[Ty, ...]
+
+
 @dataclass(slots=True)
 class IrBlock:
     """One basic block: a label, its instructions and its terminator."""
@@ -123,12 +139,13 @@ class IrFn:
 class IrModule:
     """A whole translation unit.
 
-    ``declares`` is the only field beyond the three the plan names, and it has
-    a default, so ``IrModule(triple, globals, functions)`` still constructs a
-    module with nothing to declare.
+    ``declares`` and ``structs`` are the fields beyond the three the plan
+    names, and both have defaults, so ``IrModule(triple, globals, functions)``
+    still constructs a module with nothing to declare and no named types.
     """
 
     triple: str
     globals: list[IrGlobal]
     functions: list[IrFn]
     declares: list[IrDecl] = field(default_factory=list)
+    structs: list[IrStruct] = field(default_factory=list)

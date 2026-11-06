@@ -1,0 +1,63 @@
+(mod structs)
+
+(type point (struct (x :i64) (y :i64)))
+
+(type cell (struct (label :str) (pos point)))
+
+(type bag (struct (items (arr :i64 3)) (tag :str)))
+
+(fn name :str ((n :i64))
+  (ret (match n (0 "zero") (1 "one") (2 "two") (3 "three") (9 "nine") (_ "many"))))
+
+(test make-and-get
+  (expect (out "one\ntwo\n")
+    (code 0))
+  (let p point (make point 1 2))
+  (println (name (get p x)))
+  (println (name (get p y))))
+
+(test nested-struct
+  (expect (out "cell\none\n")
+    (code 0))
+  (let c cell (make cell "cell" (make point 1 2)))
+  (println (get c label))
+  (println (name (get (get c pos) x))))
+
+(test set-field
+  (expect (out "two\n")
+    (code 0))
+  (letmut p point (make point 1 2))
+  (set-field p x 2)
+  (println (name (get p x))))
+
+(test array-get-and-set
+  (expect (out "two\nnine\n")
+    (code 0))
+  (letmut a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (name (arr-get a 1)))
+  (arr-set a 1 9)
+  (println (name (arr-get a 1))))
+
+(test array-in-struct
+  (expect (out "three\n")
+    (code 0))
+  (let b bag (make bag (make (arr :i64 3) 1 2 3) "bag"))
+  (println (name (arr-get (get b items) 2))))
+
+(test array-bounds-panic
+  (expect (code 2)
+    (err-contains "R0003: array index out of bounds"))
+  (let a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (name (arr-get a 3))))
+
+(test negative-index-panics
+  (expect (code 2)
+    (err-contains "R0003: array index out of bounds"))
+  (let a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (name (arr-get a -1))))
