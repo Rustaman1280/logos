@@ -78,6 +78,11 @@ Rules:
 
 - Every `fn` names its return type and every parameter names its type.
 - Bindings are immutable unless declared `letmut`.
+- A binding is visible only inside the block that declares it: a function
+  body, an `if` branch, a `while` body, or a `match` arm. There is no
+  conditional initialisation, so no read can reach an undefined slot.
+- The compiler refuses any form it cannot lower. A checker that accepts a
+  construct the backend cannot emit is a bug, not a gap.
 - No implicit numeric conversion. `(+ 1 2.0)` is a type error.
 - No statement without a node name. Nothing is implicit.
 - There is one name per integer width and no alias. `:int` does not exist;
