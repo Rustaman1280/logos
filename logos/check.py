@@ -39,8 +39,16 @@ Literals
 A numeric literal has no intrinsic width: it takes the type it is checked
 against when that type is a matching primitive (an integer literal against an
 integer type, a float literal against a float type) and falls back to ``:i64``
-or ``:f64`` otherwise. This is not a conversion: nothing is cast at run time,
-and a value that already has a type never changes under ``compatible``.
+or ``:f64`` otherwise. A literal beside a non-literal operand looks ahead to
+that operand's type, in arithmetic and in comparisons, so ``(< 1 a)`` with
+``a :u8`` checks as ``:u8``. This is not a conversion: nothing is cast at run
+time, and a value that already has a type never changes under ``compatible``.
+
+Returning
+---------
+A function whose declared return type is not ``:void`` must contain a ``ret``
+somewhere in its body; otherwise it is E0105. A test is ``:void`` by
+construction and needs none.
 
 Tests
 -----
@@ -57,6 +65,7 @@ from dataclasses import dataclass
 from logos.diag import (
     CIRCULAR,
     DUPLICATE,
+    MISSING_RETURN,
     NOT_FOUND,
     NOT_MUTABLE,
     TYPE_MISMATCH,
@@ -155,9 +164,11 @@ class _Visible:
 #: ``expect`` and ``expect-leak`` are harness directives, not expressions.
 _DIRECTIVES = ("expect", "expect-leak")
 
-_ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide"}
+_ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "modulo"}
 _ORDERED = ("<", "<=", ">", ">=")
 _EQUALITY = ("=", "!=")
+#: The only types ``=`` and ``!=`` accept: scalars, never :void or a function.
+_SCALARS = INTEGERS + FLOATS + ("bool", "str")
 _TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "res", "opt", "shared")
 _LET_SHAPE = "takes a name, an optional type and a value"
 
@@ -222,7 +233,7 @@ class _Checker:
         return visible
 
     def _signature(self, node: Node, types: dict[str, Ty]) -> FnTy:
-        if node.name is None:
+        if node.name is None or node.name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
         if len(node.items) < 3:
             raise diag(
@@ -269,7 +280,7 @@ class _Checker:
 
     def _check_fn(self, node: Node, fns: dict[str, FnTy]) -> None:
         name = node.name
-        if name is None:
+        if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
         sig = fns.get(name)
         if sig is None:
@@ -284,7 +295,7 @@ class _Checker:
 
     def _check_test(self, node: Node, fns: dict[str, FnTy]) -> None:
         name = node.name
-        if name is None:
+        if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "test needs a name")
         env = _Env(fns, ret=Prim("void"), label=f"test '{name}'")
         for item in node.items[2:]:
@@ -300,7 +311,7 @@ class _Checker:
     def _check_helper(self, node: Node, env: _Env) -> None:
         """A ``fn`` private to one test: same rules, test-local visibility."""
         name = node.name
-        if name is None:
+        if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
         if name in env.fns:
             raise diag(DUPLICATE, node.path, f"duplicate definition '{name}'")
@@ -315,10 +326,17 @@ class _Checker:
         self._body(node, _body_start(node), inner)
 
     def _body(self, node: Node, start: int, env: _Env) -> None:
-        for item in node.items[start:]:
+        statements = node.items[start:]
+        for item in statements:
             if not isinstance(item, Node):
                 raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
             self._expr(item, env)
+        if env.ret != Prim("void") and not _contains_ret(statements):
+            raise diag(
+                MISSING_RETURN,
+                node.path,
+                f"{env.label} must return {env.ret} but has no 'ret'",
+            )
 
     # -- expressions -----------------------------------------------------
 
@@ -383,42 +401,69 @@ class _Checker:
         args = node.items[1:]
         if len(args) < 2:
             raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes at least two operands")
-        first = self._value(args[0], env, expected, node.path)
-        if not _numeric(first):
-            raise diag(
-                TYPE_MISMATCH,
-                _at(args[0], node),
-                f"'{node.kind}' needs numbers, found {first}",
-            )
-        for arg in args[1:]:
-            ty = self._value(arg, env, first, node.path)
-            if compatible(first, ty):
+        if _literal(args[0]) and not _literal(args[1]):
+            # Look ahead: a literal has no width of its own, so the operand
+            # beside it decides the type of the whole form.
+            ty = self._value(args[1], env, expected, node.path)
+            if not _numeric(ty):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(args[1], node),
+                    f"'{node.kind}' needs numbers, found {ty}",
+                )
+            self._value(args[0], env, ty, node.path)
+            rest = args[2:]
+        else:
+            ty = self._value(args[0], env, expected, node.path)
+            if not _numeric(ty):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(args[0], node),
+                    f"'{node.kind}' needs numbers, found {ty}",
+                )
+            rest = args[1:]
+        for arg in rest:
+            operand = self._value(arg, env, ty, node.path)
+            if compatible(ty, operand):
                 continue
-            verb = _ARITH.get(node.kind)
-            if verb is None:
-                message = f"cannot take the modulo of {first} by {ty}"
+            if node.kind == "%":
+                message = f"cannot take the modulo of {ty} by {operand}"
             else:
-                message = f"cannot {verb} {ty} to {first}"
+                message = f"cannot {_ARITH[node.kind]} {operand} to {ty}"
             raise diag(TYPE_MISMATCH, _at(arg, node), message)
-        return first
+        return ty
 
     def _compare(self, node: Node, env: _Env) -> Ty:
         args = node.items[1:]
         if len(args) != 2:
             raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes two operands")
-        left = self._value(args[0], env, None, node.path)
-        right = self._value(args[1], env, left, node.path)
+        left_item, right_item = args
+        if _literal(left_item) and not _literal(right_item):
+            right = self._value(right_item, env, None, node.path)
+            left = self._value(left_item, env, right, node.path)
+        elif _literal(right_item) and not _literal(left_item):
+            left = self._value(left_item, env, None, node.path)
+            right = self._value(right_item, env, left, node.path)
+        else:
+            left = self._value(left_item, env, None, node.path)
+            right = self._value(right_item, env, left, node.path)
         if not compatible(left, right):
             raise diag(
                 TYPE_MISMATCH,
-                _at(args[1], node),
+                _at(right_item, node),
                 f"cannot compare {right} with {left}",
             )
         if node.kind in _ORDERED and not _numeric(left):
             raise diag(
                 TYPE_MISMATCH,
-                _at(args[0], node),
+                _at(left_item, node),
                 f"'{node.kind}' needs numbers, found {left}",
+            )
+        if node.kind in _EQUALITY and not _scalar(left):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(left_item, node),
+                f"'{node.kind}' needs scalar operands, found {left}",
             )
         return Prim("bool")
 
@@ -534,7 +579,9 @@ class _Checker:
         var = env.lookup(name)
         if var is not None:
             if not isinstance(var.ty, FnTy):
-                raise diag(UNKNOWN_FUNCTION, node.path, f"'{name}' is not a function")
+                raise diag(
+                    TYPE_MISMATCH, node.path, f"'{name}' is not a function: found {var.ty}"
+                )
             sig = var.ty
         else:
             found = env.fns.get(name)
@@ -579,7 +626,13 @@ def _resolve(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
     ``EnumRef`` when the name is an enum. An undeclared name is E0101. The
     lookup is total: an absent name is a diagnostic, never a ``KeyError``.
     """
-    if isinstance(ty, (Prim, TypeVar)):
+    if isinstance(ty, TypeVar):
+        raise diag(
+            UNKNOWN_TYPE,
+            path,
+            f"type variable {ty.name} is not available yet",
+        )
+    if isinstance(ty, Prim):
         return ty
     if isinstance(ty, (StructRef, EnumRef)):
         declared = types.get(ty.name)
@@ -694,6 +747,26 @@ def _number(token: Token, expected: Ty | None) -> Ty:
     if isinstance(expected, Prim) and expected.name in INTEGERS:
         return expected
     return Prim("i64")
+
+
+def _literal(item: Node | Token) -> bool:
+    """Whether ``item`` is a number literal, the one value with no width yet."""
+    return isinstance(item, Token) and item.kind == NUMBER
+
+
+def _scalar(ty: Ty) -> bool:
+    """Whether ``ty`` is a scalar — the only operand kind ``=``/``!=`` accept."""
+    return isinstance(ty, Prim) and ty.name in _SCALARS
+
+
+def _contains_ret(items: tuple[Node | Token, ...]) -> bool:
+    """Whether any statement in ``items`` is or contains a ``ret``."""
+    for item in items:
+        if isinstance(item, Node):
+            for node in item.walk():
+                if node.kind == "ret":
+                    return True
+    return False
 
 
 def _numeric(ty: Ty) -> bool:

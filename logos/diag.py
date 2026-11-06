@@ -22,6 +22,7 @@ CODES = {
     "E0102": "wrong arity",
     "E0103": "unknown function",
     "E0104": "not mutable",
+    "E0105": "missing return",
 }
 
 UNBALANCED = "E0001"
@@ -35,6 +36,7 @@ UNKNOWN_TYPE = "E0101"
 WRONG_ARITY = "E0102"
 UNKNOWN_FUNCTION = "E0103"
 NOT_MUTABLE = "E0104"
+MISSING_RETURN = "E0105"
 
 
 class LogosError(Exception):

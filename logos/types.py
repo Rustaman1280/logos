@@ -4,8 +4,9 @@ A type is a frozen value. Equality is structural for the composites and
 nominal for ``StructRef``/``EnumRef``, which compare by name. There is no
 subtyping and no conversion: :func:`compatible` answers "is this the same
 type", never "can this become that", so a width or a signedness never changes
-under it. A ``TypeVar`` is the one exception: it stands for any type, which is
-what makes a generic signature match a concrete call.
+under it. A ``TypeVar`` is not a wildcard: it compares by name like any other
+type, and the checker rejects it outright until substitution exists, because a
+wildcard would silently convert a value from one kind to another.
 
 Named types are written bare and primitives are written with a colon, matching
 ``(res :i64 parse-error)``: the colon marks the closed built-in vocabulary, so
@@ -229,12 +230,14 @@ def parse_type(node: "Node | Token", *, path: str = "") -> Ty:
 def compatible(a: Ty, b: Ty) -> bool:
     """Whether ``a`` and ``b`` are the same type, with no widening.
 
-    A ``TypeVar`` on either side matches anything, which is how a generic
-    signature accepts a concrete call. Everything else must match exactly,
-    including integer width, array length and the name of a named type.
+    A ``TypeVar`` compares by name and nothing else. It is deliberately not a
+    wildcard: generics have no substitution yet, so matching a type variable
+    against any type would let a value of one kind stand in for another.
+    Everything else must match exactly, including integer width, array length
+    and the name of a named type.
     """
-    if isinstance(a, TypeVar) or isinstance(b, TypeVar):
-        return True
+    if isinstance(a, TypeVar):
+        return isinstance(b, TypeVar) and a.name == b.name
     if isinstance(a, Prim):
         return isinstance(b, Prim) and a.name == b.name
     if isinstance(a, StructRef):

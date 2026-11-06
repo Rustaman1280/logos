@@ -227,11 +227,12 @@ class CompatibleTest(unittest.TestCase):
         self.assertFalse(compatible(fn, FnTy((Prim("i64"),), Prim("i64"))))
         self.assertFalse(compatible(fn, Prim("i64")))
 
-    def test_a_type_variable_matches_anything(self):
-        self.assertTrue(compatible(TypeVar("T"), Prim("i64")))
-        self.assertTrue(compatible(Prim("i64"), TypeVar("T")))
-        self.assertTrue(compatible(TypeVar("T"), Vec(Prim("i64"))))
-        self.assertTrue(compatible(TypeVar("T"), TypeVar("U")))
+    def test_a_type_variable_is_not_a_wildcard(self):
+        self.assertTrue(compatible(TypeVar("T"), TypeVar("T")))
+        self.assertFalse(compatible(TypeVar("T"), Prim("i64")))
+        self.assertFalse(compatible(Prim("i64"), TypeVar("T")))
+        self.assertFalse(compatible(TypeVar("T"), Vec(Prim("i64"))))
+        self.assertFalse(compatible(TypeVar("T"), TypeVar("U")))
 
 
 class ModuleCheckTest(unittest.TestCase):
@@ -358,6 +359,29 @@ class SignatureTest(unittest.TestCase):
         error = expect_error("(mod m)(fn f :i64 (ret 0))", "E0002")
         self.assertEqual(error.path, "m/f")
 
+    def test_a_type_variable_is_rejected_for_now(self):
+        error = expect_error(
+            '(mod m)(fn id :i64 ((a T)) (ret a))(fn f :i64 () (ret (id "s")))',
+            "E0101",
+        )
+        self.assertEqual(error.path, "m/id/1/0")
+        self.assertIn("type variable T", error.message)
+
+    def test_a_type_variable_in_a_body_is_rejected_too(self):
+        error = expect_error(
+            "(mod m)(fn f :i64 ((a :i64)) (let b T a) (ret b))", "E0101"
+        )
+        self.assertIn("type variable T", error.message)
+
+    def test_a_definition_name_may_not_start_with_a_colon(self):
+        for src in (
+            "(mod m)(fn :f :i64 () (ret 0))",
+            "(mod m)(test :t)",
+            "(mod m)(test t (fn :h :i64 () (ret 0)))",
+        ):
+            with self.subTest(src=src):
+                expect_error(src, "E0002")
+
 
 class CallTest(unittest.TestCase):
     def test_a_call_takes_exactly_its_parameters(self):
@@ -380,10 +404,11 @@ class CallTest(unittest.TestCase):
         self.assertEqual(error.path, "m/f/2/0")
         self.assertIn("'nope'", error.message)
 
-    def test_calling_a_value_is_E0103(self):
-        error = expect_error("(mod m)(fn f :i64 () (let x 1) (ret (x 2)))", "E0103")
+    def test_calling_a_value_is_E0100(self):
+        error = expect_error("(mod m)(fn f :i64 () (let x 1) (ret (x 2)))", "E0100")
         self.assertEqual(error.path, "m/f/3/0")
         self.assertIn("not a function", error.message)
+        self.assertIn(":i64", error.message)
 
     def test_no_implicit_widening(self):
         error = expect_error(WIDENING, "E0100")
@@ -417,6 +442,26 @@ class ArithmeticTest(unittest.TestCase):
         self.assertEqual(error.message, "cannot add :i64 to :i32")
         self.assertEqual(error.path, "m/f/2/0")
 
+    def test_modulo_is_arithmetic(self):
+        checked = check_src("(mod m)(fn f :i64 () (ret (% 7 3)))")
+        self.assertEqual(checked.expr_types["m/f/2/0"], Prim("i64"))
+
+    def test_modulo_refuses_mixed_widths(self):
+        error = expect_error(
+            "(mod m)(fn f :i64 ((a :i64) (b :i32)) (ret (% a b)))", "E0100"
+        )
+        self.assertEqual(error.path, "m/f/2/0")
+        self.assertIn("modulo", error.message)
+
+    def test_a_leading_literal_takes_the_variable_type(self):
+        checked = check_src("(mod m)(fn f :u8 ((a :u8)) (let b (+ 1 a)) (ret b))")
+        self.assertEqual(checked.expr_types["m/f/2/1"], Prim("u8"))
+        self.assertEqual(checked.expr_types["m/f/2"], Prim("void"))
+
+    def test_literals_alone_default_to_i64(self):
+        checked = check_src("(mod m)(fn f :i64 () (let c (+ 1 2)) (ret c))")
+        self.assertEqual(checked.expr_types["m/f/2/1"], Prim("i64"))
+
     def test_arithmetic_needs_numbers(self):
         error = expect_error("(mod m)(fn f :i64 ((a :str)) (ret (+ a a)))", "E0100")
         self.assertIn("needs numbers", error.message)
@@ -447,6 +492,28 @@ class ComparisonTest(unittest.TestCase):
         )
         self.assertEqual(error.path, "m/f/2/0")
         self.assertIn("cannot compare", error.message)
+
+    def test_a_leading_literal_takes_the_variable_type(self):
+        checked = check_src("(mod m)(fn f :bool ((a :u8)) (ret (< 1 a)))")
+        self.assertEqual(checked.expr_types["m/f/2/0"], Prim("bool"))
+
+    def test_equality_is_scalar_only(self):
+        error = expect_error(
+            "(mod m)(fn f :bool () (letmut a :i64 1)"
+            " (ret (= (set a 1) (set a 2))))",
+            "E0100",
+        )
+        self.assertEqual(error.path, "m/f/3/0/0")
+        self.assertIn("scalar", error.message)
+        self.assertIn(":void", error.message)
+
+    def test_equality_rejects_named_types(self):
+        error = expect_error(
+            "(mod m)(type p (struct))"
+            "(fn f :bool ((a p) (b p)) (ret (= a b)))",
+            "E0100",
+        )
+        self.assertIn("scalar", error.message)
 
     def test_ordering_needs_numbers(self):
         error = expect_error(
@@ -558,6 +625,17 @@ class ReturnTest(unittest.TestCase):
     def test_ret_takes_at_most_one_value(self):
         error = expect_error("(mod m)(fn f :i64 () (ret 1 2))", "E0102")
         self.assertEqual(error.path, "m/f/2")
+
+    def test_a_non_void_function_must_return(self):
+        error = expect_error("(mod m)(fn f :i64 ())", "E0105")
+        self.assertEqual(error.path, "m/f")
+        self.assertIn(":i64", error.message)
+
+    def test_a_void_function_needs_no_return(self):
+        check_src("(mod m)(fn f :void ())")
+
+    def test_a_return_inside_a_branch_counts(self):
+        check_src("(mod m)(fn f :i64 ((a :bool)) (if a (ret 1) (ret 2)))")
 
 
 class ImportTest(unittest.TestCase):
