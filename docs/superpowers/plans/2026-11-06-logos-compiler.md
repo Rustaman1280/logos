@@ -19,7 +19,7 @@
 - `:str` is `{ptr :u8, len :u64}`, UTF-8, length in bytes, never NUL-terminated.
 - Release is manual: `free`, no compiler-inserted drops.
 - Type names have no aliases. `:int` does not exist; source writes `:i64`.
-- Every diagnostic carries a path like `math/add/body/2` and a code like `E0421`.
+- Every diagnostic carries a location (a node path, else file:line:column) and a code like `E0421`.
 - Runtime is C (`runtime/rt.c`), reached from Logos only through `extern`.
 - Tests are `(test ...)` nodes in normal grammar; `build` compiles them out.
 
@@ -87,7 +87,7 @@ python3 -m unittest tests.test_cli -v && git add -A && git commit -m "chore: sca
 - Produces: `logos.nodes.Node(kind: str, items: tuple, path: str, line: int, col: int)`; children are `Node` or `Token`; `Node.walk()` yields every node in order.
 - Produces: `logos.fmt.render(node: Node) -> str`, two-space indent, one child per line when the node has more than one, trailing newline.
 
-**Path rule:** named nodes extend the path with their name (`mod math` -> `math`, `fn add` -> `math/add`); all other nodes append their index (`math/add/body/2`). A file with `(mod math)` and two nodes has paths `math/0`, `math/1`.
+**Path rule:** a named definition inserts its name (`mod math` -> `math`, `fn add` -> `math/add`); every other node appends its position among the parent's items, numbered from zero after the head (and after the name). So `(ret (+ a b))` inside `add` is `math/add/2`, and `(+ a b)` is `math/add/2/0`. A file with `(mod math)` and two nodes has paths `math/0`, `math/1`. Test nodes insert `test/<name>`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -100,7 +100,7 @@ SRC = '(mod math)\n(fn add :i64 ((a :i64) (b :i64))\n  (ret (+ a b)))\n'
 def test_paths():
     root = parse(SRC, "math.logos")
     assert [n.path for n in root.walk() if n.kind in ("mod", "fn", "ret")] == [
-        "math", "math/add", "math/add/body/0"]
+        "math", "math/add", "math/add/2/0"]
 
 def test_fmt_is_idempotent():
     once = render(parse(SRC, "math.logos"))
@@ -123,8 +123,8 @@ The parser builds nodes without knowing any grammar: `(` starts a node whose hea
 
 - [ ] **Step 4: Prove idempotency on a real file**
 
-Run: `python3 -m logos fmt tests/parse/fixture.logos > /tmp/a && python3 -m logos fmt /tmp/a > /tmp/b && diff /tmp/a /tmp/b`
-Expected: no output, exit 0. `tests/parse/fixture.logos` holds one module with a function, a struct and a test node.
+Run: `cp tests/parse/fixture.logos /tmp/a && python3 -m logos fmt /tmp/a && cp /tmp/a /tmp/b && python3 -m logos fmt /tmp/b && diff /tmp/a /tmp/b`
+Expected: no output, exit 0, and the fixture itself stays canonical. `fmt FILE` rewrites in place. `tests/parse/fixture.logos` holds one module with a function, a struct and a test node.
 
 - [ ] **Step 5: Commit**
 
@@ -141,7 +141,7 @@ git add -A && git commit -m "feat: sexpr lexer, parser with node paths, canonica
 - Test: `tests/test_resolve.py`, `tests/parse/` (first negative cases)
 
 **Interfaces:**
-- Produces: `logos.diag.LogosError(Exception)` with `code: str`, `path: str`, `message: str`, and `render() -> str` returning `"E0421 math/add/body/0: cannot add :i64 to :f64"`.
+- Produces: `logos.diag.LogosError(Exception)` with `code: str`, `path: str`, `message: str`, and `render() -> str` returning `"E0421 math/add/2/0: cannot add :i64 to :f64"`.
 - Produces: `logos.diag.diag(code: str, path: str, message: str) -> LogosError`.
 - Produces: `logos.resolve.resolve(root: Node, loader: Callable[[str], Node]) -> Module`, where `Module(name: str, root: Node, types: dict[str, Node], fns: dict[str, Node], tests: dict[str, Node])`.
 - Produces: error codes `E0001` unbalanced parens, `E0002` unknown node, `E0003` duplicate definition, `E0004` circular import, `E0005` name not found.
