@@ -133,6 +133,13 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   `LEAK n bytes at module/fn/line` for each. `(expect-leak 0)` makes a
   leaking test fail.
 - No hidden allocation. Every allocating call is visible in the source.
+- A `(vec T)` is not copyable, and neither is a type that contains one.
+  Binding such a value moves it; reading the source afterwards is E0300.
+  Two bindings never share a buffer.
+- A `(vec T)` may not be a struct field or a fixed-array element yet,
+  because no place expression exists to release its buffer.
+- A `:str` owns nothing. Concatenation produces a process-lifetime buffer,
+  so a slice never frees and a string never appears in the leak report.
 
 ### Errors
 
