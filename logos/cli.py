@@ -89,7 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="optimisation level to run; repeat for several, e.g. --opt -O0 -O2",
     )
 
-    fmt = sub.add_parser("fmt", help="print Logos source in canonical form")
+    fmt = sub.add_parser("fmt", help="rewrite Logos source in canonical form")
     fmt.add_argument(
         "files",
         metavar="FILE",
@@ -133,15 +133,18 @@ def main(argv: list[str]) -> int:
 
 
 def _fmt(arguments: list[str]) -> int:
-    """Print the canonical form of every named source, file by file."""
+    """Rewrite each named file in place, or print stdin's canonical form.
+
+    ``-`` reads stdin once and writes the result to stdout; a repeated ``-`` is
+    an argument error (exit 2), because there is only one stdin.
+    """
+    if arguments.count("-") > 1:
+        print("logos: fmt: '-' may be given at most once", file=sys.stderr)
+        return 2
     status = 0
-    read_stdin = False
     for argument in arguments:
         if argument == "-":
-            if read_stdin:
-                continue
-            read_stdin = True
-            status |= _format("<stdin>", sys.stdin.read())
+            status |= _format_stdin()
             continue
         path = Path(argument)
         if path.is_dir():
@@ -158,14 +161,24 @@ def _format_path(path: Path) -> int:
     except OSError as error:
         print(f"logos: {path}: {error.strerror}", file=sys.stderr)
         return 1
-    return _format(str(path), text)
-
-
-def _format(name: str, text: str) -> int:
     try:
-        canonical = render(parse(text, name))
+        canonical = render(parse(text, str(path)))
     except LogosError as error:
-        print(f"{name}: {error.render()}", file=sys.stderr)
+        print(error.render(), file=sys.stderr)
+        return 1
+    try:
+        path.write_text(canonical, encoding="utf-8")
+    except OSError as error:
+        print(f"logos: {path}: {error.strerror}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _format_stdin() -> int:
+    try:
+        canonical = render(parse(sys.stdin.read(), "<stdin>"))
+    except LogosError as error:
+        print(error.render(), file=sys.stderr)
         return 1
     sys.stdout.write(canonical)
     return 0

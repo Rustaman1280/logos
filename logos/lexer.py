@@ -13,17 +13,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from logos.diag import diag
+from logos.diag import LEXICAL, diag
 
 LPAREN = "LPAREN"
 RPAREN = "RPAREN"
 ATOM = "ATOM"
 STRING = "STRING"
 NUMBER = "NUMBER"
-
-#: Unbalanced parentheses are the only diagnostic code this pass owns. Lexical
-#: errors reuse it until Task 3 fixes the full code table.
-MALFORMED = "E0001"
 
 _NUMBER = re.compile(r"[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\Z")
 
@@ -52,10 +48,10 @@ class Token:
 
 
 def tokenize(src: str, file: str) -> list[Token]:
-    """Split ``src`` into tokens, or raise ``LogosError`` with code E0001.
+    """Split ``src`` into tokens, or raise ``LogosError`` with code E0006.
 
     ``file`` names the source in lexical diagnostics, which happen before any
-    node exists to own a path.
+    node exists to own a path; ``line`` and ``col`` locate the token.
     """
     return _Lexer(src, file).run()
 
@@ -110,9 +106,12 @@ class _Lexer:
                 escape = self.src[self.index + 1]
                 if escape not in ESCAPES:
                     raise diag(
-                        MALFORMED,
-                        self.file,
-                        f"line {self.line}, column {self.col}: unknown escape \\{escape}",
+                        LEXICAL,
+                        "",
+                        f"unknown escape \\{escape}",
+                        file=self.file,
+                        line=self.line,
+                        col=self.col,
                     )
                 chars.append(ESCAPES[escape])
                 self._skip(2)
@@ -125,9 +124,12 @@ class _Lexer:
                 chars.append(ch)
                 self._skip(1)
         raise diag(
-            MALFORMED,
-            self.file,
-            f"line {line}, column {col}: unterminated string",
+            LEXICAL,
+            "",
+            "unterminated string",
+            file=self.file,
+            line=line,
+            col=col,
         )
 
     def _atom(self) -> Token:

@@ -48,7 +48,7 @@ class CliFlagParsingTest(unittest.TestCase):
 
 
 class CliFmtTest(unittest.TestCase):
-    def test_fmt_prints_the_canonical_form_of_several_files(self):
+    def test_fmt_rewrites_files_in_place_and_prints_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = pathlib.Path(tmp, "a.logos")
             second = pathlib.Path(tmp, "b.logos")
@@ -57,8 +57,10 @@ class CliFmtTest(unittest.TestCase):
             out = io.StringIO()
             with redirect_stdout(out):
                 code = main(["fmt", str(first), str(second)])
-        self.assertEqual(code, 0)
-        self.assertEqual(out.getvalue(), "(mod a)\n\n(println 1)\n(mod b)\n\n(println 2)\n")
+            self.assertEqual(code, 0)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(first.read_text(encoding="utf-8"), "(mod a)\n\n(println 1)\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "(mod b)\n\n(println 2)\n")
 
     def test_fmt_reads_stdin_for_a_dash(self):
         out = io.StringIO()
@@ -67,17 +69,26 @@ class CliFmtTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue(), CANONICAL)
 
-    def test_fmt_reports_a_diagnostic_with_the_file_name(self):
+    def test_fmt_rejects_a_repeated_dash(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["fmt", "-", "-"])
+        self.assertEqual(code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("'-' may be given at most once", err.getvalue())
+
+    def test_fmt_reports_a_diagnostic_with_a_location(self):
         with tempfile.TemporaryDirectory() as tmp:
             broken = pathlib.Path(tmp, "broken.logos")
-            broken.write_text("(mod x", encoding="utf-8")
+            broken.write_text("(mod x))", encoding="utf-8")
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 code = main(["fmt", str(broken)])
+            self.assertEqual(broken.read_text(encoding="utf-8"), "(mod x))")
         self.assertEqual(code, 1)
         self.assertEqual(out.getvalue(), "")
-        self.assertIn("broken.logos", err.getvalue())
         self.assertIn("E0001", err.getvalue())
+        self.assertIn("broken.logos:1:8", err.getvalue())
 
     def test_fmt_formats_the_good_files_after_a_bad_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,8 +99,10 @@ class CliFmtTest(unittest.TestCase):
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 code = main(["fmt", str(broken), str(good)])
-        self.assertEqual(code, 1)
-        self.assertEqual(out.getvalue(), "(mod g)\n")
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(good.read_text(encoding="utf-8"), "(mod g)\n")
+            self.assertEqual(broken.read_text(encoding="utf-8"), "(mod x")
 
 
 if __name__ == "__main__":

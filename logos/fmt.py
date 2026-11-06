@@ -74,16 +74,26 @@ def _render_form(node: Node, column: int) -> str:
         if breaks and position and _is_form(child):
             text = _render_item(child, column + INDENT)
             lines.append(" " * (column + INDENT) + text)
-            width = column + INDENT + len(text)
+            width = _end_column(text, column + INDENT)
         else:
-            text = _render_item(child, width + 1)
-            if lines[-1] == "(":
-                lines[-1] += text
-                width += len(text)
-            else:
-                lines[-1] += " " + text
-                width += 1 + len(text)
+            separator = "" if lines[-1] == "(" else " "
+            start = width + len(separator)
+            text = _render_item(child, start)
+            lines[-1] += separator + text
+            width = _end_column(text, start)
     return "\n".join(lines) + ")"
+
+
+def _end_column(text: str, start: int) -> int:
+    """Column just past the last line of ``text``, whose first char is at ``start``.
+
+    A nested form that broke across lines indents its continuation lines with
+    absolute columns, so the last line's length is already its end column.
+    Counting the whole string would drift by one line for every newline.
+    """
+    if "\n" in text:
+        return len(text.rsplit("\n", 1)[-1])
+    return start + len(text)
 
 
 def _is_form(item: Node | Token) -> bool:

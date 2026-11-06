@@ -52,6 +52,17 @@ class RenderTest(unittest.TestCase):
             '(mod m)\n\n(println "a\\tb\\"c")\n',
         )
 
+    def test_multiline_inline_child_does_not_drift_indentation(self):
+        """Continuation lines stay two spaces past their parent's parenthesis."""
+        src = "(type p (struct (a (b (c) (d))) (e (f (g) (h)))))\n"
+        expected = (
+            "(type p (struct (a (b (c)\n"
+            "                     (d))) (e (f (g)\n"
+            "                                (h)))))\n"
+        )
+        self.assertEqual(render(parse(src, "p.logos")), expected)
+        self.assertEqual(render(parse(expected, "p.logos")), expected)
+
     def test_empty_source_renders_empty(self):
         self.assertEqual(render(parse("", "empty.logos")), "")
 

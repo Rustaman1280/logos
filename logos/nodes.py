@@ -7,17 +7,22 @@ order, head included, and each child is a ``Node`` or a ``Token``.
 
 Paths
 -----
-A form that carries a name extends the path with that name: ``(mod math)`` is
-``math``, ``(fn add ...)`` inside it is ``math/add``. Every other child appends
-its index within its parent. The module form owns the module's top-level
-namespace, so the other top-level forms are numbered from zero below it:
-``math/0``, ``math/1``.
+Paths are strictly positional. A named definition inserts its own name:
+``(mod math)`` is ``math``, ``(fn add ...)`` inside it is ``math/add``, and a
+test inserts ``test/<name>`` so a test and a function may share a name
+(``math/test/add`` against ``math/add``). The module form owns the file's
+top-level namespace, so the other top-level forms are numbered from zero below
+it: ``math/0``, ``math/1``.
 
-Statements inside a ``fn`` or a ``test`` are grouped under ``body`` because the
-signature in front of them is not part of the body's sequence: the single
-``ret`` in ``(fn add :i64 (...) (ret ...))`` is ``math/add/body/0``. Items
-between the name and the body keep their position: the parameter list of that
-``fn`` is ``math/add/0``.
+Every other node appends its position among its parent's children, starting at
+zero for the first item after the head, and after the name as well for a named
+definition. No shape heuristic renumbers anything: the parameter list of
+``(fn f :i64 ((a :i64)) ...)`` is ``m/f/1`` and so is the parameter list of
+``(fn f (vec :i64) ((a :i64)) ...)``, and the single ``ret`` of
+``(fn f :i64 ((a :i64)) (ret (+ a 1)))`` is ``m/f/2``. Tokens occupy a
+position too, so a return type in front of the body pushes the body along.
+Paths never depend on the shape of a sibling, so editing one child moves no
+other path.
 
 Paths are assigned once, by ``assign_paths``, immediately after parsing. Later
 passes must treat them as read-only, even though ``Node`` itself is mutable.
@@ -78,7 +83,7 @@ def assign_paths(root: Node) -> Node:
         if item is module:
             item.path = prefix
         else:
-            item.path = _join(prefix, item.name or str(slot))
+            item.path = _join(prefix, _segment(item) or str(slot))
             slot += 1
         _assign(item)
     return root
@@ -91,35 +96,29 @@ def _module(root: Node) -> Node | None:
     return None
 
 
-def _assign(node: Node) -> None:
-    body = _body_start(node)
-    slot = 0
-    for index, item in enumerate(node.items):
-        if not isinstance(item, Node):
-            continue
-        if body is not None and index >= body:
-            item.path = f"{node.path}/body/{index - body}"
-        elif node.name is not None and index >= 2:
-            item.path = f"{node.path}/{slot}"
-            slot += 1
-        else:
-            item.path = f"{node.path}/{index}"
-        _assign(item)
-
-
-def _body_start(node: Node) -> int | None:
-    """Index in ``items`` where a definition's statement body begins."""
-    if node.name is None:
+def _segment(node: Node) -> str | None:
+    """The path segment a named definition inserts, or ``None``."""
+    name = node.name
+    if name is None:
         return None
     if node.kind == "test":
-        return 2
-    if node.kind == "fn":
-        for index in range(2, len(node.items)):
-            item = node.items[index]
-            if isinstance(item, Node) and item.kind == "":
-                return index + 1
-        return len(node.items)
-    return None
+        return f"test/{name}"
+    return name
+
+
+def _assign(node: Node) -> None:
+    """Number the children of ``node`` and recurse."""
+    if node.kind == "":
+        children = node.items
+    elif node.name is not None:
+        children = node.items[2:]
+    else:
+        children = node.items[1:]
+    for index, item in enumerate(children):
+        if not isinstance(item, Node):
+            continue
+        item.path = _join(node.path, str(index))
+        _assign(item)
 
 
 def _join(prefix: str, segment: str) -> str:

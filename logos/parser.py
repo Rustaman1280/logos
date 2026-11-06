@@ -8,17 +8,18 @@ still parses and can still be printed.
 
 from __future__ import annotations
 
-from logos.diag import diag
+from logos.diag import UNBALANCED, diag
 from logos.lexer import ATOM, LPAREN, RPAREN, Token, tokenize
 from logos.nodes import FILE, Node, assign_paths
 
-#: Unbalanced parentheses. Lexical errors reuse the code until Task 3 owns the
-#: full table.
-UNBALANCED = "E0001"
-
 
 def parse(src: str, file: str) -> Node:
-    """Parse ``src`` into a ``file`` node. Raise ``LogosError`` on E0001."""
+    """Parse ``src`` into a ``file`` node.
+
+    Raise ``LogosError`` with code E0001. A diagnostic inside a form carries
+    that form's path; one that happens before a node exists carries
+    ``file:line:column``.
+    """
     tokens = tokenize(src, file)
     forms: list[Node] = []
     stack: list[Node] = []
@@ -31,7 +32,10 @@ def parse(src: str, file: str) -> Node:
                 raise diag(
                     UNBALANCED,
                     "",
-                    f"line {token.line}, column {token.col}: unbalanced ')'",
+                    "unbalanced ')'",
+                    file=file,
+                    line=token.line,
+                    col=token.col,
                 )
             node = stack.pop()
             node.kind = _kind(node)
@@ -43,7 +47,10 @@ def parse(src: str, file: str) -> Node:
             raise diag(
                 UNBALANCED,
                 "",
-                f"line {token.line}, column {token.col}: form outside parentheses",
+                "form outside parentheses",
+                file=file,
+                line=token.line,
+                col=token.col,
             )
         else:
             stack[-1].items += (token,)
@@ -61,7 +68,10 @@ def parse(src: str, file: str) -> Node:
         raise diag(
             UNBALANCED,
             unclosed.path,
-            f"line {unclosed.line}, column {unclosed.col}: unbalanced '('",
+            "unbalanced '('",
+            file=file,
+            line=unclosed.line,
+            col=unclosed.col,
         )
 
     return assign_paths(Node(FILE, tuple(forms), "", 1, 1))
