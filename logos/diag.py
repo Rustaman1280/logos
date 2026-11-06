@@ -64,6 +64,7 @@ CODES = {
     "E0302": "move out of an immutable binding",
     "E0400": "index type mismatch",
     "E0401": "string not a str",
+    "E0402": "vector value not copyable",
 }
 
 UNBALANCED = "E0001"
@@ -86,6 +87,7 @@ FREE_NON_OWN = "E0301"
 MOVE_IMMUTABLE = "E0302"
 INDEX_TYPE = "E0400"
 NOT_A_STR = "E0401"
+VEC_MOVE = "E0402"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

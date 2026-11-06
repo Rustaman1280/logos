@@ -189,6 +189,7 @@ from logos.check import (
     BUILTINS,
     DIRECTIVES,
     CheckedModule,
+    PRINTABLE,
     fn_param_nodes,
     fn_shape,
     is_wildcard,
@@ -262,10 +263,6 @@ _STATEMENTS = (
 #: The one aggregate this backend builds by hand: the ``:str`` the spec fixes.
 _STR = Prim("str")
 _PTR_U8 = Ptr(Prim("u8"))
-
-#: What a printer accepts, and the entry point for each. ``:bool`` and ``:str``
-#: are handled separately: one has two spellings, the other is already bytes.
-_PRINTABLE = ("i64", "u64", "f64", "bool", "str")
 
 #: ``INT_MIN`` for every signed width, the dividend of the one overflowing
 #: division. ``INT_MIN / -1`` wraps to ``INT_MIN`` on x86-64; the hardware would
@@ -374,6 +371,10 @@ def _unlowered(
 
     A cycle reached *through* a pointer is finite — ``(struct (head (ptr
     node)))`` is one word — so it is not reported; the same cycle by value is.
+    A vector is a pointer and two counts, so a cycle reached through one is
+    finite too: ``(vec node)`` inside ``node`` is not an infinite type. (A
+    vector cannot be a field at all — the checker refuses that before this
+    runs — so the case is here to keep the message true, not to allow it.)
     """
     if isinstance(ty, (Ptr, Own)):
         bad, _ = _unlowered(ty.elem, structs, stack)
@@ -381,10 +382,13 @@ def _unlowered(
     if isinstance(ty, Vec):
         # A vector's element has to have a layout: ``(vec :void)`` has no
         # storage for an element, and ``(vec (res ...))`` would print a struct
-        # the backend cannot spell.
+        # the backend cannot spell. The stack still grows through the element
+        # so the walk terminates, but a cycle it finds is not reported: it is
+        # one pointer deep, not a type that contains itself by value.
         if _is_void(ty.elem):
             return ty.elem, None
-        return _unlowered(ty.elem, structs, stack)
+        bad, _ = _unlowered(ty.elem, structs, stack)
+        return bad, None
     if isinstance(ty, Arr):
         if _is_void(ty.elem):
             return ty.elem, None
@@ -1078,8 +1082,13 @@ class _Fn:
         right_pointer, right_length = self.str_parts(items[2], node.path)
         total = self.temp()
         self.emit(("add", total, Prim("i64"), left_length, right_length))
+        # Signed, not unsigned: both lengths are in [0, 2^63), so a sum that
+        # wrapped landed in [2^63, 2^64) and reads back as a negative i64.
+        # ``icmp ult total, left`` would be constant-false for two such
+        # lengths (a wrap lands *above* the left operand as unsigned), so the
+        # panic below could never run and clang deleted it at -O2.
         wrapped = self.temp()
-        self.emit(("icmp", wrapped, "ult", Prim("i64"), total, left_length))
+        self.emit(("icmp", wrapped, "slt", Prim("i64"), total, "0"))
         self.labels += 1
         tag = f"concat{self.labels}"
         bad, ok = f"{tag}.overflow", f"{tag}.ok"
@@ -2094,7 +2103,7 @@ class _Fn:
             raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes one value")
         arg = items[1]
         ty = self.type_of_item(arg, node.path)
-        if not (isinstance(ty, Prim) and ty.name in _PRINTABLE):
+        if not (isinstance(ty, Prim) and ty.name in PRINTABLE):
             raise diag(
                 TYPE_MISMATCH,
                 _path_of(arg, node.path),

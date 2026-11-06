@@ -284,6 +284,125 @@ class VecCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0400")
         self.assertEqual(error.message, "array index must be an integer, found :str")
 
+    def test_a_vector_in_a_struct_field_is_refused_at_the_field(self):
+        # A vector is released through its descriptor and a field is not a
+        # place this language can name, so the field could never be freed.
+        error = fail_on(
+            "(mod m)(type b (struct (items (vec :i64))))(fn f :void ())"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "vector fields are not supported yet")
+        self.assertEqual(error.path, "m/b/0/0")
+
+    def test_a_struct_holding_a_vector_of_itself_is_the_same_refusal(self):
+        # ``(vec node)`` is a pointer and two counts, so the type is finite;
+        # the reason it is refused is the field, not self-containment, and the
+        # message has to say so.
+        error = fail_on(
+            "(mod m)(type node (struct (kids (vec node))))(fn f :void ())"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "vector fields are not supported yet")
+        self.assertEqual(error.path, "m/node/0/0")
+
+    def test_a_vector_array_element_is_refused_where_the_array_is_spelled(self):
+        error = fail_on(
+            "(mod m)(fn f :void ((a (arr (vec :i64) 2))) (ret))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "vector array elements are not supported yet"
+        )
+
+
+class VectorMoveTest(unittest.TestCase):
+    """A ``(vec T)`` is owned, so a second name for one is a move.
+
+    Two bindings must never share a buffer: whichever released it first would
+    leave the other reading freed memory, and the second release would be a
+    double free. The source is empty after the move (E0300 on a read), and the
+    value cannot be handed over twice (E0402).
+    """
+
+    def test_binding_a_vector_moves_the_source(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (println (vec-len v)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertIn("use after move of 'v'", error.message)
+
+    def test_the_new_binding_is_the_one_that_holds_the_buffer(self):
+        checked(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (vec-free w))"
+        )
+
+    def test_an_immutable_binding_moves_too(self):
+        # A plain let cannot be moved out of (E0302) unless the value contains
+        # a vector: there is no copy to make, and refusing would leave the
+        # buffer with no owner at all.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (let v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (letmut x (vec :i64) v))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message,
+            "a value containing a vector is not copyable; 'v' moved",
+        )
+
+    def test_freeing_a_moved_vector_is_e0300(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (vec-free v))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'v'")
+
+    def test_passing_the_same_vector_twice_is_e0402(self):
+        error = fail_on(
+            "(mod m)(fn take :i64 ((a (vec :i64)) (b (vec :i64)))"
+            " (ret (+ (vec-len a) (vec-len b))))"
+            "(fn f :i64 ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (ret (take v v)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message,
+            "a value containing a vector is not copyable; 'v' moved",
+        )
+
+    def test_a_moved_vector_can_be_freed_once_in_each_branch(self):
+        # The branches are independent: each releases the one buffer, and only
+        # one of them runs, so this is not a double free.
+        checked(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (if (= (vec-len w) 1) (vec-free w) (vec-free w)))"
+        )
+
+    def test_a_plain_read_of_a_moved_vector_is_still_e0300(self):
+        # E0402 is for a second transfer; reading the empty binding is the
+        # ordinary use-after-move.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (letmut w (vec :i64) v)"
+            " (vec-push v 1))"
+        )
+        self.assertEqual(error.code, "E0300")
+
 
 class PrinterCheckTest(unittest.TestCase):
     """Every scalar the runtime formats, and nothing that needs a cast."""
@@ -388,6 +507,63 @@ class StringLoweringTest(unittest.TestCase):
         )
         # The length the runtime wrote back is what the new :str carries.
         self.assertIn("load i64, i64* %v.", text)
+
+    def test_the_concat_overflow_guard_is_a_signed_compare(self):
+        # Two lengths are in [0, 2^63), so a sum that wrapped landed in
+        # [2^63, 2^64) and reads back negative. An unsigned compare against
+        # the left length — ``icmp ult total, left`` — is false in both the
+        # wrapped and the unwrapped case, so the panic could never run.
+        text = emitted(
+            '(mod m)(fn f :str ((a :str) (b :str)) (ret (str-concat a b)))'
+        )
+        self.assertIn("icmp slt i64", text)
+        self.assertIn(", 0", text)
+        self.assertNotIn("icmp ult i64", text)
+        self.assertIn("string length overflows", text)
+
+    def test_the_overflow_guard_survives_the_optimiser(self):
+        """The panic block is still in the IR clang produces at ``-O2``.
+
+        A guard the optimiser can prove false takes its panic block, its
+        code and its message with it, so the check runs on the optimised IR,
+        not on ours. The function is exported for the test: an unused
+        ``internal`` one is deleted whole at ``-O2``, which would hide the
+        guard rather than pin it. The compare it keeps is asserted signed,
+        because that is the part a rewrite to ``ult`` would change.
+        """
+        m = lowered(
+            '(mod m)(fn f :str ((a :str) (b :str)) (ret (str-concat a b)))'
+        )
+        for fn in m.functions:
+            fn.internal = False
+        path = ROOT / "build" / "concat-overflow.ll"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(llvm.emit(m), encoding="utf-8")
+        try:
+            done = subprocess.run(
+                [
+                    "clang",
+                    "-O2",
+                    "-S",
+                    "-emit-llvm",
+                    "-target",
+                    ir.TRIPLE,
+                    str(path),
+                    "-o",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            self.skipTest("clang is not available")
+        if done.returncode != 0:
+            self.skipTest(f"clang refused the IR: {done.stderr.strip()}")
+        # ``-S`` prints the module it optimised, warnings and all.
+        text = done.stdout
+        self.assertIn("call void @rt_panic", text)
+        self.assertIn("string length overflows", text)
+        self.assertIn("icmp slt i64", text)
 
     def test_a_slice_is_a_view_and_allocates_nothing(self):
         m = lowered('(mod m)(fn f :str ((s :str)) (ret (str-slice s 1 4)))')
@@ -610,7 +786,8 @@ class VecExecTest(unittest.TestCase):
         "strings": ("b\n2\n", 0),
         "free": ("ok\n", 0),
         "free-an-empty-vector": ("ok\n", 0),
-        "read-across-a-call": ("10\n", 0),
+        "read-across-a-call": ("10\n4\n", 0),
+        "move-then-free-in-both-branches": ("ok\n", 0),
         "small-elements": ("true\n3\n", 0),
         "struct-elements": ("4\n", 0),
         "nested": ("7\n", 0),

@@ -271,6 +271,42 @@ def compatible(a: Ty, b: Ty) -> bool:
     return False
 
 
+def holds_vector(
+    ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None
+) -> bool:
+    """Whether ``ty`` is or contains a ``(vec T)`` by value.
+
+    A vector owns a buffer through its three-word descriptor, so a value that
+    contains one has no copy: two copies would name one allocation twice and
+    whichever released it first would leave the other reading freed memory.
+    A pointer to a vector is not one — the pointer is a word and copies like
+    any other address — so ``(ptr (vec T))`` and ``(own (vec T))`` answer false.
+
+    ``structs`` supplies the field lists when they are known, so a struct with
+    a vector field answers true. Since a vector may not be a struct field or an
+    array element yet (the checker refuses both), the walk only ever finds a
+    bare ``(vec T)`` in practice; it is written out for the day it can.
+    """
+    seen: set[str] = set()
+
+    def walk(node: Ty) -> bool:
+        if isinstance(node, Vec):
+            return True
+        if isinstance(node, Arr):
+            return walk(node.elem)
+        if isinstance(node, StructRef) and structs is not None:
+            if node.name in seen:
+                # A struct that contains itself by value is refused elsewhere;
+                # the walk must not recurse on it before that happens.
+                return False
+            seen.add(node.name)
+            fields = structs.get(node.name, ())
+            return any(walk(field) for _, field in fields)
+        return False
+
+    return walk(ty)
+
+
 def _atom(token: Token, where: str) -> Ty:
     if token.kind != ATOM:
         raise diag(UNKNOWN_TYPE, where, f"expected a type, found {token.kind.lower()}")

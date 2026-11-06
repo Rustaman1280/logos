@@ -27,6 +27,15 @@ binding, because they rewrite the three-word descriptor that lives in it,
 exactly as ``arr-set`` rewrites the array in its own slot. An index that is not
 an integer is E0400 and a string operand that is not a ``:str`` is E0401.
 
+A ``(vec T)`` owns the buffer its descriptor names, so a value that contains one
+is never copied: binding it to a second name, setting one, or passing it as an
+argument moves it, and the source is empty afterwards (a later read is E0300). A
+second transfer of the same value is **E0402** — there is one buffer and no rule
+that would let two names share it. For the same reason a vector may not be a
+struct field or a fixed-array element yet: releasing it needs a place expression,
+and a field is not one, so such a field would leak by construction. Both are
+**E0002** where the type is spelled.
+
 Memory and ownership
 --------------------
 ``(alloc T n)`` has type ``(own T)``: a block of n elements the program must
@@ -151,6 +160,7 @@ from logos.diag import (
     UNKNOWN_NODE,
     UNKNOWN_TYPE,
     USE_AFTER_MOVE,
+    VEC_MOVE,
     WRONG_ARITY,
     diag,
 )
@@ -175,6 +185,7 @@ from logos.types import (
     TypeVar,
     Vec,
     compatible,
+    holds_vector,
     parse_type,
 )
 
@@ -343,7 +354,10 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
     order — which is the whole of the C layout — cannot disagree between them.
 
     A field is ``(name type)``. A repeated name is E0003, a malformed field is
-    E0002, and an unresolvable type is E0101, each at the field's own path.
+    E0002, and an unresolvable type is E0101, each at the field's own path. A
+    field that is or contains a ``(vec T)`` is E0002 at the field: a vector is
+    released through its descriptor, and a field is not a place this language
+    can name, so such a field could never free its buffer.
     """
     fields: list[tuple[str, Ty]] = []
     names: set[str] = set()
@@ -363,7 +377,16 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
         if name in names:
             raise diag(DUPLICATE, field.path, f"duplicate field '{name}'")
         names.add(name)
-        fields.append((name, _read_type(type_item, types, field.path)))
+        ty = _read_type(type_item, types, field.path)
+        if holds_vector(ty):
+            # A vector's buffer is released through the descriptor, and a
+            # field is not a place this language can name: ``vec-free`` takes
+            # a binding, so a struct that held a vector could never release
+            # it. Refused here, at the field, until places exist.
+            raise diag(
+                UNKNOWN_NODE, field.path, "vector fields are not supported yet"
+            )
+        fields.append((name, ty))
     return tuple(fields)
 
 
@@ -371,9 +394,10 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
 class _Var:
     """One binding: its type, and what the checker knows about its value.
 
-    ``moved`` is the ownership state of an ``(own T)`` binding: once its value
-    has been transferred or released, the binding holds nothing and any read of
-    it is E0300. ``param`` records that the name arrived as a parameter, which
+    ``moved`` is the ownership state of an owning binding — an ``(own T)`` or a
+    value that contains a ``(vec T)``: once its value has been transferred or
+    released, the binding holds nothing and any read of it is E0300.
+    ``param`` records that the name arrived as a parameter, which
     the callee owns outright — a parameter may be moved on, while a plain
     ``let`` needs ``letmut`` before its value can be transferred (E0302).
     """
@@ -865,6 +889,7 @@ class _Checker:
 
     def _let(self, node: Node, env: _Env, *, mutable: bool) -> Ty:
         name, declared, init = let_shape(node, self._types)
+        self._transfer(init, env, node.path)
         ty = self._value(init, env, declared, node.path)
         if declared is not None and not compatible(declared, ty):
             raise diag(
@@ -881,9 +906,10 @@ class _Checker:
                 _at(init, node),
                 f"cannot bind '{name}' to a :void value",
             )
-        if isinstance(ty, Own):
-            # An owning pointer is not copied into a second binding: the
-            # initialiser's value moves here, and the old name is empty.
+        if isinstance(ty, Own) or holds_vector(ty, self._structs):
+            # An owning pointer is not copied into a second binding, and
+            # neither is a value that contains a vector: the initialiser's
+            # value moves here, and the old name is empty.
             self._consume(init, env, node.path)
         env.define(
             name,
@@ -903,6 +929,7 @@ class _Checker:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
             raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
+        self._transfer(items[2], env, node.path)
         value = self._value(items[2], env, var.ty, node.path)
         if not compatible(var.ty, value):
             raise diag(
@@ -910,7 +937,7 @@ class _Checker:
                 _at(items[2], node),
                 f"cannot set '{name}' of type {var.ty} to {value}",
             )
-        if isinstance(var.ty, Own):
+        if isinstance(var.ty, Own) or holds_vector(var.ty, self._structs):
             if var.moved:
                 # The old value may already have been released, and a write
                 # that happens to be on this path does not undo that: one
@@ -1456,6 +1483,11 @@ class _Checker:
         var = env.lookup(name)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
+        if var.moved:
+            # The value was moved or released, so the descriptor holds
+            # nothing: writing through this name would touch a buffer another
+            # binding owns now.
+            raise diag(USE_AFTER_MOVE, node.path, f"use after move of '{name}'")
         if not var.mutable:
             raise diag(
                 NOT_MUTABLE, node.path, f"cannot {verb} immutable binding '{name}'"
@@ -1696,11 +1728,24 @@ class _Checker:
         same value for its whole scope — unless the move is a release, which
         destroys the value rather than handing it on. A parameter may always be
         moved, because its value was given up by the caller already.
+
+        A value that contains a ``(vec T)`` is different: copying it would give
+        two bindings one buffer, and this language has no rule for that, so a
+        second name for such a value is always a move. It is therefore allowed
+        out of a plain ``let`` as well — the alternative is not a stable
+        binding but a second owner — and the source is empty afterwards, which
+        is what makes the ``let``'s promise true rather than broken.
         """
         if not (isinstance(item, Token) and item.kind == ATOM):
             return
         var = env.lookup(item.value)
-        if var is None or not isinstance(var.ty, Own) or var.moved:
+        if var is None or var.moved:
+            return
+        vector = holds_vector(var.ty, self._structs)
+        if not (isinstance(var.ty, Own) or vector):
+            return
+        if vector:
+            var.moved = True
             return
         if not release and not var.mutable and not var.param:
             raise diag(
@@ -1709,6 +1754,28 @@ class _Checker:
                 f"cannot move out of immutable binding '{item.value}'",
             )
         var.moved = True
+
+    def _transfer(self, item: Node | Token, env: _Env, where: str) -> None:
+        """Refuse a second transfer of a value that contains a vector.
+
+        Binding or passing such a value moves it, so the source is empty
+        afterwards. Reaching it again means the program asked for a second
+        value where there is one buffer, and the answer is neither a copy (two
+        owners of one allocation) nor a use-after-move (the value is still
+        here, it just left): it is E0402, which names the reason. A plain read
+        of the empty binding is still E0300.
+        """
+        if not (isinstance(item, Token) and item.kind == ATOM):
+            return
+        var = env.lookup(item.value)
+        if var is None or not var.moved:
+            return
+        if holds_vector(var.ty, self._structs):
+            raise diag(
+                VEC_MOVE,
+                where,
+                f"a value containing a vector is not copyable; '{item.value}' moved",
+            )
 
     def _printer(self, node: Node, env: _Env) -> Ty:
         """``print``/``println`` of one scalar the runtime formats.
@@ -1760,6 +1827,10 @@ class _Checker:
                 f"got {len(args)}",
             )
         for index, (arg, param) in enumerate(zip(args, sig.params), start=1):
+            if holds_vector(param, self._structs):
+                # A vector argument is a transfer, not a copy: the same
+                # argument twice is E0402 at the second one.
+                self._transfer(arg, env, node.path)
             ty = self._value(arg, env, param, node.path)
             if not compatible(param, ty):
                 raise diag(
@@ -1767,7 +1838,7 @@ class _Checker:
                     _at(arg, node),
                     f"argument {index} of '{name}' expects {param}, found {ty}",
                 )
-            if isinstance(param, Own):
+            if isinstance(param, Own) or holds_vector(param, self._structs):
                 # The callee owns what it is handed: the argument moves into
                 # the parameter and the caller's binding is empty afterwards.
                 self._consume(arg, env, node.path)
@@ -1862,7 +1933,13 @@ def resolve_type(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
         return FnTy(params, resolve_type(ty.ret, types, path))
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
-    return Arr(resolve_type(ty.elem, types, path), ty.n)
+    elem = resolve_type(ty.elem, types, path)
+    if holds_vector(elem):
+        # Same reason a vector field is refused: an element of a fixed array
+        # is not a place this language can name, so a vector stored there
+        # could never release its buffer. Refused where the array is spelled.
+        raise diag(UNKNOWN_NODE, path, "vector array elements are not supported yet")
+    return Arr(elem, ty.n)
 
 
 def _param_nodes(item: Node | Token, path: str) -> list[Node]:

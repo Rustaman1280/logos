@@ -89,16 +89,18 @@
   (vec-free v)
   (println "ok"))
 
-(fn total :i64 ((v (vec :i64)) (n :i64))
+(fn bounced :
+  (vec :i64) ((v (vec :i64)) (n :i64))
   (letmut i :i64 0)
   (letmut sum :i64 0)
   (while (< i n)
     (set sum (+ sum (vec-get v i)))
     (set i (+ i 1)))
-  (ret sum))
+  (println sum)
+  (ret v))
 
 (test read-across-a-call
-  (expect (out "10\n")
+  (expect (out "10\n4\n")
     (code 0)
     (leaks 0))
   (letmut v
@@ -108,8 +110,25 @@
   (vec-push v 2)
   (vec-push v 3)
   (vec-push v 4)
-  (println (total v 4))
-  (vec-free v))
+  (letmut w
+    (vec :i64)
+    (bounced v 4))
+  (println (vec-len w))
+  (vec-free w))
+
+(test move-then-free-in-both-branches
+  (expect (out "ok\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (letmut w (vec :i64) v)
+  (if (= (vec-len w) 1)
+    (vec-free w)
+    (vec-free w))
+  (println "ok"))
 
 (test get-out-of-bounds
   (expect (code 2)

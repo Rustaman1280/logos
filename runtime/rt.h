@@ -148,7 +148,15 @@ typedef struct {
 
 /* Build a new string holding a's bytes followed by b's, and store its byte
  * count in *out_len. Panics with R0003 if the two lengths do not fit a
- * size_t or the allocator cannot satisfy the request. */
+ * size_t or the allocator cannot satisfy the request.
+ *
+ * The returned buffer is malloc'ed and NEVER released: it lives for the life
+ * of the process, and it is deliberately not passed to rt_alloc, so it does
+ * not appear in the leak report. That is a recorded deviation from "every
+ * allocation is tracked", not an oversight — a `:str` owns nothing and has no
+ * `str-free`, so the alternatives are a process-lifetime buffer or garbage the
+ * tracker blames on every program that ever concatenated. Do not add a
+ * str-free: there is no owner it could be called on. */
 unsigned char *rt_str_concat(const unsigned char *a, size_t an,
                              const unsigned char *b, size_t bn,
                              size_t *out_len);
