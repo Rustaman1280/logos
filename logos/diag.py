@@ -67,6 +67,7 @@ CODES = {
     "E0402": "vector value not copyable",
     "E0500": "instantiation limit reached",
     "E0501": "unbound type variable",
+    "E0502": "closure escapes its function",
 }
 
 UNBALANCED = "E0001"
@@ -99,6 +100,12 @@ INSTANTIATION_LIMIT = "E0500"
 #: A type variable that nothing binds: a call whose arguments fix no type for
 #: it, or an annotation that names one the enclosing definition never declared.
 UNBOUND_TYPE_VAR = "E0501"
+
+#: A closure that captured something leaving the function that created it. The
+#: environment lives in the creating frame, so returning the closure, storing
+#: it in a field or an element, or keeping it past the iteration that made it
+#: would leave a call reading a dead slot.
+CLOSURE_ESCAPE = "E0502"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

@@ -172,11 +172,11 @@ the outer binding after the closure was made is invisible to it.
 
 A captured value is copied into the frame that created the closure, not onto
 the heap: the language allocates nothing the source did not spell. That frame
-is therefore the closure's lifetime, and a closure returned from the function
-that made it — or stored where a later frame can call it — reads a slot that no
-longer exists. Nothing here detects that: the language has no region or borrow
-rule that could yet, and allocating the environment behind the source's back
-would break the rule that every allocation is visible.
+is therefore the closure's lifetime, and the checker enforces it where a value
+could leave: returning a capturing closure, storing it in a struct field or an
+array element, pushing it into a vector, or keeping it past the loop iteration
+that made it is E0502. A closure that captures nothing is an ordinary function
+pointer and may escape freely.
 """
 
 from __future__ import annotations
@@ -187,6 +187,7 @@ from typing import Callable, Iterator
 
 from logos.diag import (
     CIRCULAR,
+    CLOSURE_ESCAPE,
     DUPLICATE,
     FIELD_TYPE_MISMATCH,
     FREE_NON_OWN,
@@ -330,52 +331,77 @@ class CheckedModule:
     generic: frozenset[str] = frozenset()
 
 
-def mangle_instance(name: str, args: tuple[Ty, ...]) -> str:
+def mangle_instance(name: str, args: tuple[Ty, ...], where: str = "") -> str:
     """The name of one copy: ``map$i64$i64``.
 
     Each type argument is spelled by :func:`mangle_type`, and the pieces are
-    joined with ``$`` — a character no primitive, no type form and no escaped
-    named type produces, so two different argument lists can never spell one
-    name. A copy of ``(fn id :T ...)`` at ``:i64`` is therefore ``id$i64``
-    beside the source ``id``, and the lowerer's usual ``lg.<module>.`` mangle
-    puts the two apart.
+    joined with ``$`` — a character no primitive or type form produces, so two
+    different argument lists can never spell one name. A copy of
+    ``(fn id :T ...)`` at ``:i64`` is therefore ``id$i64`` beside the source
+    ``id``, and the lowerer's usual ``lg.<module>.`` mangle puts the two apart.
+    ``where`` locates E0501 when an argument is still a type variable.
     """
-    return name + "".join("$" + mangle_type(arg) for arg in args)
+    return name + "".join("$" + mangle_type(arg, where) for arg in args)
 
 
-def mangle_type(ty: Ty) -> str:
-    """One type argument as a readable, unambiguous name fragment.
+def mangle_type(ty: Ty, where: str = "") -> str:
+    """One type argument as an unambiguous name fragment.
 
     Primitives keep their own spelling (``i64``, ``str``); named types are
-    prefixed so a struct called ``i64`` could never be mistaken for the
-    primitive; composites spell their form around their parts. A name is
-    escaped to ``_xHH`` for every byte outside ``[A-Za-z0-9_]``, which is what
-    keeps the whole fragment one LLVM identifier.
+    prefixed and length-prefixed — ``s3_i64`` for a struct called ``i64``,
+    ``s5_point`` for ``point`` — so a struct can never be mistaken for the
+    primitive, and two names that escape to the same text (``a-b`` and
+    ``a_x2db`` both contain ``a_x2db``) stay distinct because their lengths
+    differ. Composites spell their form around their parts.
+
+    A type variable has no concrete spelling: encoding one would give every
+    unbound variable the same fragment and silently merge two copies. It is
+    E0501 at ``where`` instead.
     """
     if isinstance(ty, Prim):
         return ty.name
     if isinstance(ty, StructRef):
-        return "s:" + _escape_name(ty.name)
+        return "s" + _name_fragment(ty.name)
     if isinstance(ty, EnumRef):
-        return "e:" + _escape_name(ty.name)
+        return "e" + _name_fragment(ty.name)
     if isinstance(ty, Ptr):
-        return f"ptr({mangle_type(ty.elem)})"
+        return f"ptr({mangle_type(ty.elem, where)})"
     if isinstance(ty, Own):
-        return f"own({mangle_type(ty.elem)})"
+        return f"own({mangle_type(ty.elem, where)})"
     if isinstance(ty, Vec):
-        return f"vec({mangle_type(ty.elem)})"
+        return f"vec({mangle_type(ty.elem, where)})"
     if isinstance(ty, Arr):
-        return f"arr({mangle_type(ty.elem)},{ty.n})"
+        return f"arr({mangle_type(ty.elem, where)},{ty.n})"
     if isinstance(ty, Opt):
-        return f"opt({mangle_type(ty.elem)})"
+        return f"opt({mangle_type(ty.elem, where)})"
     if isinstance(ty, Shared):
-        return f"shared({mangle_type(ty.elem)})"
+        return f"shared({mangle_type(ty.elem, where)})"
     if isinstance(ty, Res):
-        return f"res({mangle_type(ty.ok)},{mangle_type(ty.err)})"
+        return f"res({mangle_type(ty.ok, where)},{mangle_type(ty.err, where)})"
     if isinstance(ty, FnTy):
-        params = ",".join(mangle_type(param) for param in ty.params)
-        return f"fn({params}){mangle_type(ty.ret)}"
-    return "T:" + _escape_name(ty.name)
+        params = ",".join(mangle_type(param, where) for param in ty.params)
+        return f"fn({params}){mangle_type(ty.ret, where)}"
+    if isinstance(ty, TypeVar):
+        raise diag(
+            UNBOUND_TYPE_VAR,
+            where,
+            f"type variable {ty.name} cannot be a type argument",
+        )
+    raise diag(UNKNOWN_TYPE, where, f"cannot mangle {ty}")
+
+
+def _name_fragment(name: str) -> str:
+    """Spell a named type injectively: its length, then its escaped bytes.
+
+    ``_escape_name`` alone is lossy — ``a-b`` and ``a_x2db`` both become
+    ``a_x2db`` — so the character count goes in front. The decimal length and
+    the one ``_`` after it are a delimiter no escaped run can be confused with:
+    the escape output is either all safe characters (one per character) or
+    contains ``_xHH`` escapes, and either way the first ``_`` ends the digits.
+    A decoder reads the length there and knows exactly how many characters the
+    remainder must account for, which makes the pair injective.
+    """
+    return f"{len(name)}_{_escape_name(name)}"
 
 
 def _escape_name(name: str) -> str:
@@ -544,6 +570,10 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
     field that is or contains a ``(vec T)`` is E0002 at the field: a vector is
     released through its descriptor, and a field is not a place this language
     can name, so such a field could never free its buffer.
+
+    A type variable has nothing to bind it here — a struct declares no type
+    parameters — so one in a field, or in the element type of a fixed array in
+    a field, is E0501 at that field rather than a layout failure later.
     """
     fields: list[tuple[str, Ty]] = []
     names: set[str] = set()
@@ -563,7 +593,7 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
         if name in names:
             raise diag(DUPLICATE, field.path, f"duplicate field '{name}'")
         names.add(name)
-        ty = _read_type(type_item, types, field.path)
+        ty = _read_type(type_item, types, field.path, {})
         if holds_vector(ty):
             # A vector's buffer is released through the descriptor, and a
             # field is not a place this language can name: ``vec-free`` takes
@@ -576,6 +606,11 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
     return tuple(fields)
 
 
+#: The one sentence E0502 carries, wherever a capturing closure would outlive
+#: the frame that owns its environment.
+_CLOSURE_ESCAPE = "a closure that captures cannot leave its function"
+
+
 @dataclass(slots=True)
 class _Var:
     """One binding: its type, and what the checker knows about its value.
@@ -586,12 +621,20 @@ class _Var:
     ``param`` records that the name arrived as a parameter, which
     the callee owns outright — a parameter may be moved on, while a plain
     ``let`` needs ``letmut`` before its value can be transferred (E0302).
+
+    ``decl_loop`` is how many loops enclosed the declaration and
+    ``origin_loop`` how many enclosed the value now stored. They differ only
+    for a capturing closure: one made inside a loop and stored in a binding
+    declared outside it would outlive its iteration, when the environment slot
+    is overwritten by the next pass (E0502).
     """
 
     ty: Ty
     mutable: bool
     moved: bool = False
     param: bool = False
+    decl_loop: int = 0
+    origin_loop: int = 0
 
 
 class _Env:
@@ -657,7 +700,7 @@ class _Env:
         block = self.scopes[-1]
         if name in block:
             raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
-        block[name] = _Var(ty, mutable, param=param)
+        block[name] = _Var(ty, mutable, param=param, decl_loop=self.loop)
 
     def lookup(self, name: str, where: str = "") -> _Var | None:
         """The binding ``name`` stands for, capturing it if this is a closure.
@@ -689,7 +732,12 @@ class _Env:
                 f"cannot capture '{name}' of type {found.ty} in a closure: "
                 "its environment holds copies",
             )
-        copy = _Var(found.ty, mutable=False, param=True)
+        copy = _Var(
+            found.ty,
+            mutable=False,
+            param=True,
+            origin_loop=found.origin_loop,
+        )
         self.scopes[0][name] = copy
         self.captures.append((name, found.ty))
         return copy
@@ -1148,6 +1196,18 @@ class _Checker:
                         where,
                         f"{token.value} is generic: a call fixes its type variables",
                     )
+                if token.value not in self._bodies:
+                    # The lowerer emits a ``$fnvalue`` wrapper beside the
+                    # definition it wraps. An imported (or test-local) name has
+                    # no definition in this module, so there is no wrapper to
+                    # call and lowering would fail with E0103 after checking.
+                    raise diag(
+                        UNKNOWN_FUNCTION,
+                        where,
+                        f"cannot use '{token.value}' as a function value: only "
+                        "a function defined in this module can be passed across "
+                        "a module boundary",
+                    )
                 return bare
             raise diag(NOT_FOUND, where, f"unknown name '{token.value}'")
         raise diag(UNKNOWN_NODE, where, "expected a value")
@@ -1256,15 +1316,22 @@ class _Checker:
             # value moves here, and the old name is empty.
             self._consume(init, env, node.path)
         bound = declared if declared is not None else ty
+        if isinstance(declared, FnTy) and isinstance(ty, FnTy) and ty.captures:
+            # The annotation cannot say whether the value captures, so the
+            # initialiser's flag is what the binding keeps: dropping it here
+            # would let `(ret f)` read as an ordinary function pointer.
+            bound = FnTy(declared.params, declared.ret, True)
         # The binding's type, after substitution: a generic body's annotation
         # names a type variable, and the lowerer must not read the variable.
         self._record.declared[node.path] = bound
+        origin = self._origin_loop(init, env, ty)
         env.define(
             name,
             bound,
             mutable=mutable,
             path=node.path,
         )
+        env.scopes[-1][name].origin_loop = origin
         return Prim("void")
 
     def _set(self, node: Node, env: _Env) -> Ty:
@@ -1296,6 +1363,18 @@ class _Checker:
             # Assigning to an owning binding moves the new value in. The old
             # value is gone, which is why this needs no ``letmut`` check on it.
             self._consume(items[2], env, node.path)
+        if isinstance(var.ty, FnTy) and isinstance(value, FnTy):
+            # The flag follows the value, not the annotation: an assignment
+            # of a non-capturing function makes the binding ordinary again.
+            var.ty = FnTy(var.ty.params, var.ty.ret, value.captures)
+        origin = self._origin_loop(items[2], env, value)
+        if _escapes(value) and origin > var.decl_loop:
+            # The closure was made inside a loop and stored in a binding
+            # declared outside it. Its environment slot is rewritten on the
+            # next pass, so the stored value would read another iteration's
+            # copies.
+            raise diag(CLOSURE_ESCAPE, node.path, _CLOSURE_ESCAPE)
+        var.origin_loop = origin
         return Prim("void")
 
     def _branches(self, env: _Env, branches: list[Callable[[], Ty]]) -> list[Ty]:
@@ -1349,6 +1428,7 @@ class _Checker:
                 _at(args[2], node),
                 f"if branches do not match: {then} and {otherwise}",
             )
+        then = _merge_functions(then, otherwise)
         if holds_vector(then, self._structs):
             # R7: the result would be a second descriptor for a buffer one of
             # the arms still owns, so freeing it would free it twice. Form
@@ -1463,6 +1543,8 @@ class _Checker:
                     node.path,
                     f"match arms do not agree: {result} and {arm}",
                 )
+            else:
+                result = _merge_functions(result, arm)
         # ``arms`` is non-empty: ``match_shape`` refuses a match without one.
         if result is not None and holds_vector(result, self._structs):
             # R7, the same rule as ``if``: an arm still owns the buffer the
@@ -1528,6 +1610,10 @@ class _Checker:
                 node.path,
                 f"{env.label} returns {env.ret}, found {value}",
             )
+        if _escapes(value):
+            # The environment lives in this frame. Returning the closure hands
+            # a caller a pointer to a slot that dies when this frame does.
+            raise diag(CLOSURE_ESCAPE, _at(args[0], node), _CLOSURE_ESCAPE)
         if isinstance(env.ret, Own):
             # Returning an owning pointer hands it to the caller.
             self._consume(args[0], env, node.path)
@@ -1583,6 +1669,10 @@ class _Checker:
                         _at(item, node),
                         f"field '{field}' of '{ty.name}' expects {fty}, found {got}",
                     )
+                if _escapes(got):
+                    # A field outlives the expression, so a capturing closure
+                    # stored here would be called after its frame is gone.
+                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if isinstance(fty, Own):
                     self._consume(item, env, node.path)
             return ty
@@ -1602,6 +1692,10 @@ class _Checker:
                         _at(item, node),
                         f"cannot store {got} in {ty}",
                     )
+                if _escapes(got):
+                    # An array element is storage the frame keeps: the value
+                    # would be callable after the closure's frame is gone.
+                    raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
                 if isinstance(ty.elem, Own):
                     self._consume(item, env, node.path)
             return ty
@@ -1675,6 +1769,10 @@ class _Checker:
                     _at(items[3], node),
                     f"field '{field}' of '{var.ty.name}' expects {fty}, found {got}",
                 )
+            if _escapes(got):
+                raise diag(
+                    CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE
+                )
             if isinstance(fty, Own):
                 self._consume(items[3], env, node.path)
             return Prim("void")
@@ -1744,6 +1842,8 @@ class _Checker:
                 _at(items[3], node),
                 f"cannot store {got} in {var.ty}",
             )
+        if _escapes(got):
+            raise diag(CLOSURE_ESCAPE, _at(items[3], node), _CLOSURE_ESCAPE)
         if isinstance(var.ty.elem, Own):
             self._consume(items[3], env, node.path)
         return Prim("void")
@@ -1888,6 +1988,11 @@ class _Checker:
                 _at(node.items[2], node),
                 f"cannot push {got} into {ty}",
             )
+        if _escapes(got):
+            # The buffer outlives the frame that holds the environment, so a
+            # capturing closure pushed here would be called through a dead
+            # pointer after its creator returns.
+            raise diag(CLOSURE_ESCAPE, _at(node.items[2], node), _CLOSURE_ESCAPE)
         if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
             # The element is a place this language cannot name afterwards —
             # ``vec-free`` takes a binding or a parameter, not an element — so
@@ -1929,6 +2034,8 @@ class _Checker:
             raise diag(
                 TYPE_MISMATCH, _at(node.items[3], node), f"cannot store {got} in {ty}"
             )
+        if _escapes(got):
+            raise diag(CLOSURE_ESCAPE, _at(node.items[3], node), _CLOSURE_ESCAPE)
         if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
             # Same move as ``vec-push``: storing a descriptor in an element
             # would otherwise leave the source naming the same buffer.
@@ -2065,6 +2172,10 @@ class _Checker:
                 _at(items[2], node),
                 f"cannot store {got} through {ty}",
             )
+        if _escapes(got):
+            # The pointee outlives this frame; a capturing closure written
+            # through a pointer is the clearest way to call it after return.
+            raise diag(CLOSURE_ESCAPE, _at(items[2], node), _CLOSURE_ESCAPE)
         if isinstance(elem, Own) or holds_vector(elem, self._structs):
             # A stored descriptor must be the only one: the memory behind a
             # raw pointer is not a place a ``vec-free`` can name either, so
@@ -2098,6 +2209,38 @@ class _Checker:
                 f"pointer offset must be an integer, found {offset}",
             )
         return Ptr(elem)
+
+    def _origin_loop(self, item: Node | Token, env: _Env, ty: Ty) -> int:
+        """How many loops enclosed the value ``item`` produced.
+
+        Only a capturing closure cares: its environment slot is one per
+        expression per frame, so a value born inside a loop cannot be kept in a
+        binding declared outside it. A name stands for the value already in the
+        binding, and a branch yields whichever arm runs, so the deepest arm is
+        the conservative answer.
+        """
+        if not _escapes(ty):
+            return env.loop
+        if isinstance(item, Token) and item.kind == ATOM:
+            found = env.lookup(item.value, "")
+            if found is not None:
+                return found.origin_loop
+            return env.loop
+        if isinstance(item, Node):
+            if item.kind == "if" and len(item.items) == 4:
+                return max(
+                    self._origin_loop(item.items[2], env, ty),
+                    self._origin_loop(item.items[3], env, ty),
+                )
+            if item.kind == "match":
+                arms = [
+                    arm.items[-1]
+                    for arm in item.items[2:]
+                    if isinstance(arm, Node) and arm.items
+                ]
+                if arms:
+                    return max(self._origin_loop(arm, env, ty) for arm in arms)
+        return env.loop
 
     def _consume(
         self, item: Node | Token, env: _Env, where: str, *, release: bool = False
@@ -2292,7 +2435,19 @@ class _Checker:
                 )
             bindings = trial
             concrete = substitute(param, bindings)
-            if isinstance(concrete, Own) or holds_vector(concrete, self._structs):
+            if holds_vector(concrete, self._structs):
+                # R8: the parameter was a bare type variable, so the vector
+                # rules could not be applied before unification. Apply them
+                # now, exactly as a non-generic call would: only a whole
+                # binding can be handed over, and the transfer empties it so a
+                # second use is E0300 rather than a double free.
+                if not (isinstance(arg, Token) and arg.kind == ATOM):
+                    raise diag(
+                        VEC_MOVE, _at(arg, node), "a vector argument must be a name"
+                    )
+                self._transfer(arg, env, node.path)
+                self._consume(arg, env, node.path)
+            elif isinstance(concrete, Own):
                 self._consume(arg, env, node.path)
         target = self._instantiate(node, name, bindings)
         self._record.call_targets[node.path] = target.name
@@ -2321,13 +2476,17 @@ class _Checker:
                 f"type variable {missing[0]} of '{name}' is not bound by this call",
             )
         args = tuple(bindings[var] for var in order)
-        target = mangle_instance(name, args)
+        target = mangle_instance(name, args, node.path)
         found = self._instances.get(target)
         if found is not None:
             return found
-        if target in self._params:
-            # A source definition that already spells this copy's name would
-            # give both the same symbol, so the copy cannot be named.
+        if target in self._visible(self.module).fns:
+            # Every definition the module can see is emitted (or imported)
+            # under ``lg.<module>.<name>``; a source name that already spells
+            # this copy's name would make two definitions of one symbol. The
+            # generic source names are not the only names that matter: a
+            # user-written ``id$i64`` collides exactly as hard as a second
+            # copy would.
             raise diag(
                 UNKNOWN_FUNCTION,
                 node.path,
@@ -2443,7 +2602,7 @@ class _Checker:
             ret,
             tuple(inner.captures),
         )
-        return FnTy(tuple(ty for _, ty in params), ret)
+        return FnTy(tuple(ty for _, ty in params), ret, bool(inner.captures))
 
 
 def closure_shape(
@@ -2807,6 +2966,24 @@ def _pointee(ty: Ty) -> Ty | None:
 
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
+
+
+def _escapes(ty: Ty) -> bool:
+    """Whether ``ty`` is a closure that captured its way into this frame."""
+    return isinstance(ty, FnTy) and ty.captures
+
+
+def _merge_functions(a: Ty, b: Ty) -> Ty:
+    """One type for two branches, keeping a capture flag either one carries.
+
+    The two types are already known compatible. The flag is not part of type
+    identity, so it has to be merged by hand: if either branch produced a
+    capturing closure, the form as a whole may produce one and the value is
+    confined no matter which branch runs.
+    """
+    if isinstance(a, FnTy) and isinstance(b, FnTy) and (a.captures or b.captures):
+        return FnTy(a.params, a.ret, True)
+    return a
 
 
 def _at(item: Node | Token, owner: Node) -> str:

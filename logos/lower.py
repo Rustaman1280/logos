@@ -204,11 +204,12 @@ copy at creation is what "capture by value" means: a later ``set`` of the outer
 binding reaches the binding, not the copy.
 
 The environment therefore lives exactly as long as the frame that created it;
-nothing here frees it, and nothing extends it. A closure that outlives its
-creating function — returned, or stored where a later frame can call it — reads
-a dead slot. Task 10 does not detect that, and the language has no region or
-borrow rule that could; the one copy per expression per frame is also why a
-closure made in a loop shares its environment with the iteration that follows.
+nothing here frees it, and nothing extends it. The checker refuses every form
+that would let a capturing closure outlive its frame (E0502): returning it,
+storing it in a field, an array or a vector, or keeping it past the loop
+iteration that made it. The one copy per expression per frame is why the
+iteration rule exists, and the backend can rely on the checker having applied
+it: no value it lowers reads a slot after the frame that owns it.
 
 Calling one is indirect: the value is loaded, its two words are extracted, the
 code pointer is ``bitcast`` to its real type — ``R (i8*, T...)``, the

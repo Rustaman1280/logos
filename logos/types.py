@@ -27,7 +27,7 @@ can still locate the error at the form that owns the token.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from logos.diag import UNKNOWN_TYPE, diag
 from logos.lexer import ATOM, NUMBER, Token
@@ -132,10 +132,20 @@ class Opt:
 
 @dataclass(frozen=True, slots=True)
 class FnTy:
-    """A function type, ``(fn (T...) R)``."""
+    """A function type, ``(fn (T...) R)``.
+
+    ``captures`` marks a value that is a closure which copied names out of its
+    creating frame. It is not part of the type's identity: any two functions of
+    one signature are interchangeable where a value is called, and the flag is
+    deliberately excluded from equality and hashing. The checker reads it to
+    enforce the lifetime rule — a capturing closure may not leave the function
+    that made it (E0502) — while the lowerer never sees a type with the flag
+    set, because every value that could carry one out has been refused.
+    """
 
     params: tuple["Ty", ...]
     ret: "Ty"
+    captures: bool = field(default=False, compare=False)
 
     def __str__(self) -> str:
         params = " ".join(str(param) for param in self.params)
@@ -300,6 +310,7 @@ def substitute(ty: Ty, bindings: dict[str, Ty]) -> Ty:
         return FnTy(
             tuple(substitute(param, bindings) for param in ty.params),
             substitute(ty.ret, bindings),
+            ty.captures,
         )
     return ty
 

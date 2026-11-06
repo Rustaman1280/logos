@@ -143,9 +143,34 @@
            (ret (f (+ y x)))))
   (ret (g x)))
 
+(fn make-doubler :(fn (:i64) :i64) ()
+  (ret (fn :i64 ((x :i64))
+         (ret (* x 2)))))
+
+(type a-b (struct (x :i64)))
+(type a_x2db (struct (x :i64)))
+
+(fn pick :T ((x :T)) (ret x))
+
 (test closure-inside-a-generic
   (expect (out "12\n")
     (code 0)
     (leaks 0))
   (println (add-with 3 (fn :i64 ((n :i64))
                          (ret (* n 2))))))
+
+(test non-capturing-closure-returns
+  (expect (out "14\n")
+    (code 0)
+    (leaks 0))
+  (let f (make-doubler))
+  (println (f 7)))
+
+(test distinct-type-arguments
+  (expect (out "1\n2\n")
+    (code 0)
+    (leaks 0))
+  (let p (pick (make a-b 1)))
+  (let q (pick (make a_x2db 2)))
+  (println (get p x))
+  (println (get q x)))

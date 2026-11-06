@@ -22,6 +22,7 @@ from logos.check import (
     CheckedModule,
     check_module,
     mangle_instance,
+    mangle_type,
 )
 from logos.diag import LogosError
 from logos.parser import parse
@@ -50,10 +51,30 @@ def checked(source: str) -> CheckedModule:
     return check_module(resolve(parse(source, "m.logos"), loader))
 
 
+def checked_with(source: str, files: dict[str, str]) -> CheckedModule:
+    """Check one inline module whose ``(use ...)`` forms come from ``files``."""
+
+    def loader(name: str):
+        if name not in files:
+            raise FileNotFoundError(name)
+        return parse(files[name], f"{name}.logos")
+
+    return check_module(resolve(parse(source, "a.logos"), loader, "a.logos"))
+
+
 def fail_on(source: str) -> LogosError:
     """The checker diagnostic ``source`` raises; fails if it checks."""
     try:
         checked(source)
+    except LogosError as error:
+        return error
+    raise AssertionError(f"expected a diagnostic, but this checked: {source}")
+
+
+def fail_with(source: str, files: dict[str, str]) -> LogosError:
+    """The checker diagnostic a module with imports raises; fails if it checks."""
+    try:
+        checked_with(source, files)
     except LogosError as error:
         return error
     raise AssertionError(f"expected a diagnostic, but this checked: {source}")
@@ -122,7 +143,22 @@ class TypeSubstitutionTest(unittest.TestCase):
         )
 
     def test_a_mangled_name_distinguishes_named_and_built_in_types(self):
-        self.assertEqual(mangle_instance("f", (StructRef("i64"),)), "f$s:i64")
+        self.assertEqual(mangle_instance("f", (StructRef("i64"),)), "f$s3_i64")
+
+    def test_a_mangled_name_is_injective_for_escaped_names(self):
+        # ``_escape_name`` maps both to ``a_x2db``; the length prefix is what
+        # keeps two distinct structs from sharing one instance.
+        left = mangle_instance("f", (StructRef("a-b"),))
+        right = mangle_instance("f", (StructRef("a_x2db"),))
+        self.assertNotEqual(left, right)
+        self.assertEqual(left, "f$s3_a_x2db")
+        self.assertEqual(right, "f$s6_a_x2db")
+
+    def test_a_type_variable_cannot_be_mangled(self):
+        with self.assertRaises(LogosError) as caught:
+            mangle_type(TypeVar("T"))
+        self.assertEqual(caught.exception.code, "E0501")
+        self.assertIn("cannot be a type argument", caught.exception.message)
 
 
 class GenericSignatureTest(unittest.TestCase):
@@ -279,6 +315,81 @@ class InstantiationTest(unittest.TestCase):
         self.assertEqual(error.code, "E0402")
         self.assertIn("'v' moved", error.message)
 
+    def test_a_parameter_that_unifies_to_a_vector_still_needs_a_name(self):
+        # R8: the parameter is a bare type variable, so unification is what
+        # reveals the vector. The rule a non-generic call enforces must be
+        # applied then, for both spellings of the variable.
+        for spelling in (":T", "T"):
+            with self.subTest(spelling=spelling):
+                source = (
+                    "(mod m)"
+                    f"(fn eat :void ((v {spelling})) (vec-free v))"
+                    "(fn f :void ()"
+                    " (letmut outer (make (vec (vec :i64))))"
+                    " (vec-push outer (make (vec :i64)))"
+                    " (eat (vec-get outer 0)))"
+                )
+                error = fail_on(source)
+                self.assertEqual(error.code, "E0402")
+                self.assertIn("a vector argument must be a name", error.message)
+
+    def test_a_call_result_cannot_fill_a_parameter_that_unifies_to_a_vector(self):
+        error = fail_on(
+            "(mod m)(fn eat :void ((v :T)) (vec-free v))"
+            "(fn mk :(vec :i64) () (ret (make (vec :i64))))"
+            "(fn f :void () (eat (mk)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertIn("a vector argument must be a name", error.message)
+
+    def test_a_generic_vector_parameter_moves_the_argument(self):
+        error = fail_on(
+            "(mod m)(fn eat :void ((v :T)) (vec-free v))"
+            "(fn f :void () (letmut v (make (vec :i64))) (eat v) (eat v))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertIn("use after move of 'v'", error.message)
+
+    def test_a_user_definition_cannot_share_a_copy_name(self):
+        # The check must consult every visible definition, not just the
+        # generic source names: ``id$i64`` beside a copy of ``id`` is two
+        # definitions of one symbol, and clang says so only after checking.
+        error = fail_on(
+            "(mod m)(fn id :T ((x :T)) (ret x))"
+            "(fn id$i64 :i64 ((x :i64)) (ret x))"
+            "(fn f :i64 () (ret (id 1)))"
+        )
+        self.assertEqual(error.code, "E0103")
+        self.assertIn("'id$i64' is already defined", error.message)
+
+    def test_names_that_escape_alike_make_two_copies(self):
+        # ``a-b`` and ``a_x2db`` both escape to ``a_x2db``; a length-prefixed
+        # encoding keeps the two structs from sharing one instance.
+        cm = checked(
+            "(mod m)(type a-b (struct (x :i64)))"
+            "(type a_x2db (struct (x :i64)))"
+            "(fn id :T ((x :T)) (ret x))"
+            "(fn f :i64 ()"
+            " (let p (make a-b 1)) (let q (id p))"
+            " (let r (make a_x2db 2)) (let s (id r))"
+            " (ret (+ (get q x) (get s x))))"
+        )
+        self.assertEqual(
+            sorted(cm.instances), ["id$s3_a_x2db", "id$s6_a_x2db"]
+        )
+
+    def test_a_type_variable_cannot_be_a_struct_field(self):
+        error = fail_on("(mod m)(type box (struct (x :T)))")
+        self.assertEqual(error.code, "E0501")
+        self.assertEqual(error.path, "m/box/0/0")
+        self.assertIn("type variable T is not bound here", error.message)
+
+    def test_a_type_variable_cannot_be_an_array_element_of_a_field(self):
+        error = fail_on("(mod m)(type box (struct (x (arr T 3))))")
+        self.assertEqual(error.code, "E0501")
+        self.assertEqual(error.path, "m/box/0/0/0")
+        self.assertIn("type variable T is not bound here", error.message)
+
     def test_a_generic_helper_of_a_test_cannot_be_instantiated(self):
         # A copy of a helper has nowhere to be emitted, so the call is refused
         # with the code the lowerer gives an unlowerable name.
@@ -300,8 +411,9 @@ class InstantiationLimitTest(unittest.TestCase):
         self.assertEqual(
             error.message, "more than 256 instantiations of generic functions"
         )
-        self.assertEqual(error.path, "m/main/258")
-        self.assertTrue(error.path, "the ceiling names the call that passed it")
+        self.assertEqual(
+            error.path, "m/main/258", "the ceiling names the call that passed it"
+        )
 
     def test_the_limit_corpus_case_matches_its_expect_file(self):
         for case in sorted(GENERICS.glob("*.logos")):
@@ -311,7 +423,11 @@ class InstantiationLimitTest(unittest.TestCase):
                     check_module(driver.load(str(case)))
                 error = caught.exception
                 self.assertEqual(error.code, expected, error.render())
-                self.assertTrue(error.path, "every generic error names a node")
+                self.assertEqual(
+                    error.path.split("/")[0],
+                    case.stem,
+                    "a generic error names a node in the module it came from",
+                )
 
 
 class GenericLoweringTest(unittest.TestCase):
@@ -340,16 +456,17 @@ class GenericLoweringTest(unittest.TestCase):
         module = lowered("(mod m)(fn id :T ((x :T)) (ret x))(fn f :i64 () (ret 1))")
         self.assertEqual([fn.symbol for fn in module.functions], ["lg.m.f"])
 
-    def test_a_copy_of_a_named_type_is_quoted_in_the_ir(self):
-        # ``s:`` marks a named type argument, and the colon is not part of an
-        # LLVM identifier: the symbol is quoted rather than mangled away, so a
-        # struct called ``i64`` cannot be mistaken for the primitive either.
+    def test_a_copy_of_a_named_type_is_prefixed_in_the_ir(self):
+        # ``s<len>_`` marks a named type argument, and its length keeps two
+        # names that escape alike apart: a struct called ``i64`` is
+        # ``id$s3_i64``, never the primitive's ``id$i64``.
         text = emitted(
             "(mod m)(type point (struct (x :i64)))"
             "(fn id :T ((x :T)) (ret x))"
             "(fn f :i64 () (let p (make point 1)) (let q (id p)) (ret (get q x)))"
         )
-        self.assertIn('@"lg.m.id$s:point"', text)
+        self.assertIn("@lg.m.id$s5_point", text)
+        self.assertIn("@lg.m.id$s5_point(%struct.point", text)
 
 
 class ClosureCheckTest(unittest.TestCase):
@@ -424,6 +541,83 @@ class ClosureCheckTest(unittest.TestCase):
         )
         inner = max(cm.closures.values(), key=lambda closure: len(closure.captures))
         self.assertEqual([name for name, _ in inner.captures], ["x", "a"])
+
+    def test_a_capturing_closure_cannot_be_returned(self):
+        error = fail_on(
+            "(mod m)(fn make-adder :(fn (:i64) :i64) ((n :i64))"
+            " (ret (fn :i64 ((x :i64)) (ret (+ n x)))))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(error.path, "m/make-adder/3/0")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_a_capturing_closure_cannot_be_returned_through_a_binding(self):
+        error = fail_on(
+            "(mod m)(fn make-adder :(fn (:i64) :i64) ((n :i64))"
+            " (let g (fn :i64 ((x :i64)) (ret (+ n x)))) (ret g))"
+        )
+        self.assertEqual(error.code, "E0502")
+
+    def test_a_non_capturing_closure_may_be_returned(self):
+        cm = checked(
+            "(mod m)(fn make :(fn (:i64) :i64) ()"
+            " (ret (fn :i64 ((x :i64)) (ret (* x 2)))))"
+        )
+        self.assertEqual(
+            cm.fn_sigs["make"], FnTy((), FnTy((Prim("i64"),), Prim("i64")))
+        )
+
+    def test_a_capturing_closure_cannot_be_stored_in_a_field(self):
+        error = fail_on(
+            "(mod m)(type box (struct (cb (fn (:i64) :i64))))"
+            "(fn f :i64 ((n :i64))"
+            " (let b (make box (fn :i64 ((x :i64)) (ret (+ x n)))))"
+            " (let c (get b cb))"
+            " (ret (c 1)))"
+        )
+        self.assertEqual(error.code, "E0502")
+
+    def test_a_capturing_closure_cannot_be_stored_in_a_vector(self):
+        error = fail_on(
+            "(mod m)(fn f :void ((n :i64))"
+            " (letmut v (make (vec (fn (:i64) :i64))))"
+            " (vec-push v (fn :i64 ((x :i64)) (ret (+ x n)))))"
+        )
+        self.assertEqual(error.code, "E0502")
+
+    def test_a_capturing_closure_cannot_outlive_its_loop_iteration(self):
+        error = fail_on(
+            "(mod m)(fn f :i64 ()"
+            " (letmut g (fn :i64 () (ret 0)))"
+            " (letmut i 0)"
+            " (while (< i 3) (let k i) (set g (fn :i64 () (ret k)))"
+            "  (set i (+ i 1)))"
+            " (ret (g)))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertIn("cannot leave its function", error.message)
+
+    def test_a_capturing_closure_used_in_its_loop_iteration_checks(self):
+        cm = checked(
+            "(mod m)(fn f :i64 () (letmut i 0) (letmut r 0)"
+            " (while (< i 3) (let k i)"
+            "  (let g (fn :i64 () (ret k))) (set r (g)) (set i (+ i 1)))"
+            " (ret r))"
+        )
+        self.assertEqual(cm.fn_sigs["f"].ret, Prim("i64"))
+
+    def test_an_imported_function_cannot_be_a_function_value(self):
+        # The wrapper is emitted beside the definition; an imported name has
+        # no definition here, so the checker refuses it with the lowerer's own
+        # code instead of checking clean and failing after.
+        error = fail_with(
+            "(mod a)(use b)(fn f :void () (let g ping) (g))",
+            {"b": "(mod b)(fn ping :void () (println 1))"},
+        )
+        self.assertEqual(error.code, "E0103")
+        self.assertIn("module boundary", error.message)
 
     def test_a_closure_body_may_name_a_type_variable_of_its_generic(self):
         cm = checked(
@@ -510,6 +704,8 @@ class ClosuresExecTest(unittest.TestCase):
         "map-over-strings": ("2\n3\n2\n", 0),
         "closure-calling-a-closure": ("7\n", 0),
         "closure-inside-a-generic": ("12\n", 0),
+        "non-capturing-closure-returns": ("14\n", 0),
+        "distinct-type-arguments": ("1\n2\n", 0),
     }
 
     def run_case(self, name: str, opt: str) -> subprocess.CompletedProcess:
