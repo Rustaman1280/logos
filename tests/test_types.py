@@ -378,6 +378,7 @@ class SignatureTest(unittest.TestCase):
             "(mod m)(fn :f :i64 () (ret 0))",
             "(mod m)(test :t)",
             "(mod m)(test t (fn :h :i64 () (ret 0)))",
+            "(mod m)(type :p (struct))",
         ):
             with self.subTest(src=src):
                 expect_error(src, "E0002")
@@ -457,6 +458,20 @@ class ArithmeticTest(unittest.TestCase):
         checked = check_src("(mod m)(fn f :u8 ((a :u8)) (let b (+ 1 a)) (ret b))")
         self.assertEqual(checked.expr_types["m/f/2/1"], Prim("u8"))
         self.assertEqual(checked.expr_types["m/f/2"], Prim("void"))
+
+    def test_a_leading_literal_takes_a_matching_integer_type(self):
+        checked = check_src("(mod m)(fn f :u8 ((a :u8)) (ret (+ 1 a)))")
+        self.assertEqual(checked.expr_types["m/f/2/0"], Prim("u8"))
+
+    def test_a_leading_float_literal_may_not_enter_integer_arithmetic(self):
+        error = expect_error("(mod m)(fn f :u8 ((a :u8)) (ret (+ 1.5 a)))", "E0100")
+        self.assertEqual(error.path, "m/f/2/0")
+        self.assertEqual(error.message, "cannot add :f64 to :u8")
+
+    def test_a_leading_integer_literal_may_not_enter_float_arithmetic(self):
+        error = expect_error("(mod m)(fn f :f64 ((a :f64)) (ret (+ 1 a)))", "E0100")
+        self.assertEqual(error.path, "m/f/2/0")
+        self.assertEqual(error.message, "cannot add :i64 to :f64")
 
     def test_literals_alone_default_to_i64(self):
         checked = check_src("(mod m)(fn f :i64 () (let c (+ 1 2)) (ret c))")

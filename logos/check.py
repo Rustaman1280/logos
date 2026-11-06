@@ -411,7 +411,16 @@ class _Checker:
                     _at(args[1], node),
                     f"'{node.kind}' needs numbers, found {ty}",
                 )
-            self._value(args[0], env, ty, node.path)
+            literal = self._value(args[0], env, ty, node.path)
+            if not compatible(ty, literal):
+                # A literal that cannot take the adopted type has not been
+                # widened by it: a float in integer arithmetic (or an integer
+                # in float arithmetic) is still a mismatch.
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(args[0], node),
+                    _operand_message(node.kind, ty, literal),
+                )
             rest = args[2:]
         else:
             ty = self._value(args[0], env, expected, node.path)
@@ -426,11 +435,11 @@ class _Checker:
             operand = self._value(arg, env, ty, node.path)
             if compatible(ty, operand):
                 continue
-            if node.kind == "%":
-                message = f"cannot take the modulo of {ty} by {operand}"
-            else:
-                message = f"cannot {_ARITH[node.kind]} {operand} to {ty}"
-            raise diag(TYPE_MISMATCH, _at(arg, node), message)
+            raise diag(
+                TYPE_MISMATCH,
+                _at(arg, node),
+                _operand_message(node.kind, ty, operand),
+            )
         return ty
 
     def _compare(self, node: Node, env: _Env) -> Ty:
@@ -607,8 +616,17 @@ class _Checker:
         return sig.ret
 
 
+def _operand_message(kind: str, ty: Ty, operand: Ty) -> str:
+    """The E0100 text for an arithmetic operand that is not ``ty``."""
+    if kind == "%":
+        return f"cannot take the modulo of {ty} by {operand}"
+    return f"cannot {_ARITH[kind]} {operand} to {ty}"
+
+
 def _declared(name: str, node: Node) -> Ty:
     """The type a ``(type name ...)`` definition introduces."""
+    if name.startswith(":"):
+        raise diag(UNKNOWN_NODE, node.path, "type needs a name")
     body = node.items[2] if len(node.items) > 2 else None
     if not isinstance(body, Node):
         raise diag(UNKNOWN_NODE, node.path, f"type '{name}' needs a struct or enum body")
