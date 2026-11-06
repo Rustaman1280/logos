@@ -25,9 +25,12 @@ non-binding operand into a slot (LLVM cannot index a value with a run-time
 index), bounds-checks the index with one unsigned ``icmp`` and panics
 ``R0003`` before the ``gep`` and ``load``.
 
-Only structs a function materialises are emitted, in dependency-first order,
-so a declaration nothing uses cannot fail a build over a field type this
-backend cannot spell.
+Only structs a function names are emitted, in dependency-first order: one it
+materialises, one named in a signature (even only behind a pointer), in a
+field, or in an array element. A declaration nothing uses is not emitted, so
+it cannot fail a build over a field type this backend cannot spell. A struct
+that points at itself is finite and gets one definition; the collection walk
+stops at a pointer back to the struct being collected.
 
 Values and slots
 ----------------
@@ -327,6 +330,10 @@ class _Lower:
     """One module's shared state: its globals, its declarations, its IR."""
 
     def __init__(self, cm: CheckedModule) -> None:
+        # The layout registry answers by name alone, so it describes exactly
+        # one module at a time: drop whatever an earlier module left there
+        # before this one registers its structs.
+        llvm.reset_structs()
         self.cm = cm
         self.ir = IrModule(TRIPLE, [], [])
         self.strings: dict[bytes, str] = {}
@@ -383,19 +390,29 @@ class _Lower:
         lowered_type(ty, path, self.cm.structs)
         self._collect(ty)
 
-    def _collect(self, ty: Ty) -> None:
+    def _collect(self, ty: Ty, stack: tuple[str, ...] = ()) -> None:
+        """Record every struct ``ty`` names, dependencies first.
+
+        A struct reached only through a pointer is collected too: a signature,
+        a field or an array element names it as ``%struct.point*``, and clang
+        refuses a use of an identified type that is never defined. ``stack``
+        holds the structs currently being collected, so a pointer back to one
+        of them stops there instead of walking forever: a struct that contains
+        a pointer to itself is finite (``%struct.node = type { %struct.node*
+        }``), unlike a struct that contains itself by value.
+        """
         if isinstance(ty, StructRef):
-            if ty.name in self.structs:
+            if ty.name in self.structs or ty.name in stack:
                 return
             fields = self.cm.structs.get(ty.name)
             if fields is None:
                 return
             for _, field in fields:
-                self._collect(field)
+                self._collect(field, stack + (ty.name,))
             self.structs[ty.name] = fields
             llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
-        elif isinstance(ty, Arr):
-            self._collect(ty.elem)
+        elif isinstance(ty, (Arr, Ptr)):
+            self._collect(ty.elem, stack)
 
     def fn(self, name: str, node: Node) -> None:
         ret, params, start = fn_shape(node, self.cm.types)

@@ -114,6 +114,35 @@ class LayoutTest(unittest.TestCase):
         lower.lower_module(checked(PAIR))
         self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i8, i64 }")
 
+    def test_struct_llty_describes_the_module_just_lowered(self):
+        """A reused struct name answers for the module processed last."""
+        first = (
+            "(mod a)(type pair (struct (a :i64)))"
+            '(fn main :void () (let p pair (make pair 1)) (println "x"))'
+        )
+        second = (
+            "(mod b)(type pair (struct (a :u8) (b :i64)))"
+            '(fn main :void () (let p pair (make pair 1 2)) (println "x"))'
+        )
+        lower.lower_module(checked(first))
+        self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i64 }")
+        lower.lower_module(checked(second))
+        self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i8, i64 }")
+
+    def test_struct_llty_describes_the_module_just_emitted(self):
+        first = (
+            "(mod a)(type pair (struct (a :i64)))"
+            '(fn main :void () (let p pair (make pair 1)) (println "x"))'
+        )
+        second = (
+            "(mod b)(type pair (struct (a :u8) (b :i64)))"
+            '(fn main :void () (let p pair (make pair 1 2)) (println "x"))'
+        )
+        emitted(first)
+        self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i64 }")
+        emitted(second)
+        self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i8, i64 }")
+
     def test_the_layout_is_the_one_clang_gives_the_c_twin(self):
         """Same fields, same order, same padding: the definitions must agree."""
         source = (
@@ -150,6 +179,51 @@ class LayoutTest(unittest.TestCase):
         )
         self.assertIn("%v.0.addr = alloca [3 x i64]", text)
         self.assertIn("insertvalue [3 x i64] undef", text)
+
+
+class StructDefinitionTest(unittest.TestCase):
+    """Every struct a signature names is defined, however the type reaches it.
+
+    A pointer, an array of pointers and a field that names an otherwise unused
+    struct all spell ``%struct.X`` somewhere; clang rejects a module that uses
+    an identified type it never defines, so collection has to descend through
+    ``Ptr`` as well as ``StructRef`` and ``Arr``.
+    """
+
+    def test_a_struct_reached_through_a_pointer_parameter_is_defined(self):
+        text = emitted(
+            "(mod m)(type point (struct (x :i64)))"
+            '(fn handle :void ((p (ptr point))) (println "h"))'
+            '(fn main :void () (println "m"))'
+        )
+        self.assertIn("%struct.point = type { i64 }", text)
+        self.assertIn("define internal void @lg.m.handle(%struct.point* %v.0)", text)
+
+    def test_a_struct_inside_an_array_of_pointers_is_defined(self):
+        text = emitted(
+            "(mod m)(type point (struct (x :i64)))"
+            "(fn f :void ((a (arr (ptr point) 2))) (ret))"
+        )
+        self.assertIn("%struct.point = type { i64 }", text)
+        self.assertIn("[2 x %struct.point*] %v.0", text)
+
+    def test_a_struct_named_only_by_an_unused_field_is_defined(self):
+        text = emitted(
+            "(mod m)(type point (struct (x :i64)))"
+            "(type wrap (struct (head (ptr point))))"
+            "(fn f :void ((w wrap)) (ret))"
+        )
+        self.assertIn("%struct.point = type { i64 }", text)
+        self.assertIn("%struct.wrap = type { %struct.point* }", text)
+
+    def test_a_struct_pointing_at_itself_is_defined_once(self):
+        """A pointer cycle is finite, and collection must not follow it."""
+        text = emitted(
+            "(mod m)(type node (struct (v :i64) (head (ptr node))))"
+            "(fn f :void ((n node)) (ret))"
+        )
+        self.assertEqual(text.count("%struct.node = type"), 1)
+        self.assertIn("%struct.node = type { i64, %struct.node* }", text)
 
 
 class StructCheckTest(unittest.TestCase):
@@ -465,6 +539,22 @@ class ArrayLoweringTest(unittest.TestCase):
         self.assertIn("= alloca [2 x i64]", text)
         self.assertIn("store [2 x i64] %t", text)
 
+    def test_a_zero_length_array_is_constructed_with_no_inserts(self):
+        text = emitted(
+            "(mod m)(fn main :void () (let a (arr :i64 0) (make (arr :i64 0))))"
+        )
+        self.assertIn("%v.0.addr = alloca [0 x i64]", text)
+        self.assertIn("store [0 x i64] undef, [0 x i64]* %v.0.addr", text)
+        self.assertNotIn("insertvalue", text)
+
+    def test_an_index_with_a_side_effect_is_lowered_once(self):
+        text = emitted(
+            "(mod m)(fn loud :i64 ((i :i64)) (println \"idx\") (ret i))"
+            "(fn f :i64 () (let a (arr :i64 3) (make (arr :i64 3) 1 2 3))"
+            " (ret (arr-get a (loud 1))))"
+        )
+        self.assertEqual(text.count("call i64 @lg.m.loud"), 1)
+
 
 class StructExecTest(unittest.TestCase):
     """Real binaries at both optimisation levels, output and status compared."""
@@ -516,6 +606,32 @@ class StructExecTest(unittest.TestCase):
                 done = subprocess.run([target], capture_output=True, text=True)
                 self.assertEqual(done.returncode, 2, done.stderr)
                 self.assertIn("R0003: array index out of bounds", done.stderr)
+
+    def panics(self, case: str, binary: str) -> None:
+        """Build ``case`` at both opts and require the R0003 panic."""
+        for opt in ("-O0", "-O2"):
+            with self.subTest(case=case, opt=opt):
+                target = f"{str(ROOT / 'build' / binary)}-{opt[1:]}"
+                driver.run_test(str(STRUCTS), case, target, opt=opt)
+                done = subprocess.run([target], capture_output=True, text=True)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(done.stdout, "")
+                self.assertIn("R0003: array index out of bounds", done.stderr)
+
+    def test_an_index_far_past_the_end_panics(self):
+        self.panics("far-index-panics", "layout-far")
+
+    def test_an_empty_array_panics_on_any_index(self):
+        self.panics("empty-array-panics", "layout-empty")
+
+    def test_an_array_of_structs(self):
+        self.check("array-of-structs", "three\n", 0)
+
+    def test_set_field_replaces_a_whole_array_field(self):
+        self.check("set-field-replaces-an-array", "four\n", 0)
+
+    def test_an_index_with_a_side_effect_runs_once(self):
+        self.check("index-is-evaluated-once", "idx\ntwo\n", 0)
 
 
 if __name__ == "__main__":

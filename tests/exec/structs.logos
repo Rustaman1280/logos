@@ -6,8 +6,13 @@
 
 (type bag (struct (items (arr :i64 3)) (tag :str)))
 
+(type leaf (struct (v :i64)))
+
+(fn carries :void ((p (ptr leaf)) (q (arr (ptr leaf) 2)))
+  (println "carried"))
+
 (fn name :str ((n :i64))
-  (ret (match n (0 "zero") (1 "one") (2 "two") (3 "three") (9 "nine") (_ "many"))))
+  (ret (match n (0 "zero") (1 "one") (2 "two") (3 "three") (4 "four") (9 "nine") (_ "many"))))
 
 (test make-and-get
   (expect (out "one\ntwo\n")
@@ -61,3 +66,48 @@
     (arr :i64 3)
     (make (arr :i64 3) 1 2 3))
   (println (name (arr-get a -1))))
+
+(test far-index-panics
+  (expect (code 2)
+    (err-contains "R0003: array index out of bounds"))
+  (let a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (name (arr-get a 99))))
+
+(test empty-array-panics
+  (expect (code 2)
+    (err-contains "R0003: array index out of bounds"))
+  (let a
+    (arr :i64 0)
+    (make (arr :i64 0)))
+  (println (name (arr-get a 0))))
+
+(test array-of-structs
+  (expect (out "three\n")
+    (code 0))
+  (let a
+    (arr point 2)
+    (make (arr point 2)
+      (make point 1 2)
+      (make point 3 4)))
+  (println (name (get (arr-get a 1) x))))
+
+(test set-field-replaces-an-array
+  (expect (out "four\n")
+    (code 0))
+  (letmut b bag (make bag (make (arr :i64 3) 1 2 3) "bag"))
+  (set-field b items (make (arr :i64 3) 4 5 6))
+  (println (name (arr-get (get b items) 0))))
+
+(fn take-index :i64 ((i :i64))
+  (println "idx")
+  (ret i))
+
+(test index-is-evaluated-once
+  (expect (out "idx\ntwo\n")
+    (code 0))
+  (let a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (name (arr-get a (take-index 1)))))

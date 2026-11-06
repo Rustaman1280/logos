@@ -73,12 +73,22 @@ _UNQUOTED = re.compile(r"[-a-zA-Z$._][-a-zA-Z$._0-9]*\Z")
 #: Struct layouts the lowerer has materialised this process, so a caller can
 #: ask for a definition line by name alone (``struct_llty("pair")``). Emitted
 #: IR never reads this table — the module carries its own struct list — so a
-#: second compilation cannot make the first one's text wrong.
+#: second compilation cannot make the first one's text wrong. The table is
+#: reset at the start of every lowering and rebuilt by :func:`emit`, so an
+#: answer always describes the module processed last.
 _STRUCTS: dict[str, tuple[Ty, ...]] = {}
 
 
 def emit(m: IrModule) -> str:
-    """Return the LLVM IR text for ``m``, trailing newline included."""
+    """Return the LLVM IR text for ``m``, trailing newline included.
+
+    The registry is rebuilt from ``m`` before the text is spelled, so
+    :func:`struct_llty` describes the module just emitted and never an earlier
+    one that happened to use the same struct name.
+    """
+    reset_structs()
+    for struct in m.structs:
+        register_struct(struct.name, struct.fields)
     return _Text(m).module()
 
 
@@ -124,6 +134,11 @@ def struct_name(name: str) -> str:
     is one valid identified-type name rather than a broken concatenation.
     """
     return _named("%", f"struct.{name}")
+
+
+def reset_structs() -> None:
+    """Forget every registered layout, so the next module starts clean."""
+    _STRUCTS.clear()
 
 
 def register_struct(name: str, fields: "tuple[Ty, ...]") -> None:
