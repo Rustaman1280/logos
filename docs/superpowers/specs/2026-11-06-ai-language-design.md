@@ -165,8 +165,12 @@ widening and no union type in v1.
 `(fn (x :T) body)` creates a function value that captures the names it
 uses by value. The environment lives in the creating frame, so a closure
 that captures anything may not leave that function: returning it, storing
-it in a struct field, or pushing it into a vector is E0502. A closure
-that captures nothing is an ordinary function pointer and may go anywhere.
+it in a struct field, pushing it into a vector, or passing it to a plain
+function type is E0502. A function type records which kind it is:
+`(fn (T...) R)` is a plain function pointer, `(fn* (T...) R)` is a
+capturing closure. A capturing closure may be bound to a local name and
+called inside its own function. A closure that captures nothing is a
+plain pointer and may go anywhere.
 
 ### Concurrency
 
