@@ -7,7 +7,7 @@ name = "logos"
 version = "0.1.0"
 description = "Logos, a prefix-form language for AI readers, and logosc, its compiler."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]

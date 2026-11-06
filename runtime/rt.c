@@ -1,8 +1,10 @@
 /* C runtime for Logos. See runtime/rt.h for the contract.
  *
- * Two rules hold for every function here: write full lengths, never treat a
+ * Three rules hold for every function here: write full lengths, never treat a
  * Logos string as NUL terminated, and retry short writes instead of dropping
- * bytes. Fatal conditions call rt_panic, which exits with status 2.
+ * bytes. A write that makes no progress is reported as an error, never
+ * swallowed as a short success. Fatal conditions call rt_panic, which exits
+ * with status 2.
  */
 
 #include "rt.h"
@@ -25,7 +27,10 @@ long rt_write(int fd, const void *buf, size_t len) {
             return -1;
         }
         if (n == 0) {
-            break;
+            /* A zero-length write would end the loop with a short count, which
+             * callers must never mistake for success. */
+            errno = EIO;
+            return -1;
         }
         done += (size_t)n;
     }
@@ -33,10 +38,14 @@ long rt_write(int fd, const void *buf, size_t len) {
     return (long)done;
 }
 
-_Noreturn void rt_panic(const char *path, const char *msg) {
+_Noreturn void rt_panic(const char *path, const char *code, const char *msg) {
     static const char prefix[] = "panic: ";
     static const char sep[] = ": ";
     static const char newline[] = "\n";
+
+    /* `code` is part of the fixed signature; rendering it into the line lands
+     * with the panic tests in a later task. */
+    (void)code;
 
     if (path != NULL) {
         (void)rt_write(STDERR_FILENO, path, strlen(path));

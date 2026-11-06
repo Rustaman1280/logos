@@ -9,6 +9,6 @@ fmt:
 	$(PYTHON) -m logos fmt .
 
 clean:
-	rm -rf build
+	rm -rf build dist *.egg-info
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
-	rm -f *.o *.ll
+	rm -f *.o *.ll *.out

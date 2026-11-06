@@ -22,7 +22,7 @@ every subcommand except `version` currently reports `not implemented`.
 ## Requirements
 
 - Ubuntu 22.04, x86_64
-- Python 3.14
+- Python 3.10 or newer (3.10.12 ships with Ubuntu 22.04; 3.14 also works)
 - clang 14 and lld: `apt-get install -y clang lld`
 - GNU make
 

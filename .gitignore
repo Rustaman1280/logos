@@ -1,8 +1,9 @@
-# Build output
+# Build output: the compiler writes binaries, IR (*.ll) and captured output
+# (*.out) under build/, which is ignored as a whole. Those suffixes are
+# deliberately not ignored globally, so a stray generated file outside build/
+# shows up in git status.
 build/
 *.o
-*.ll
-*.out
 
 # Python
 __pycache__/
