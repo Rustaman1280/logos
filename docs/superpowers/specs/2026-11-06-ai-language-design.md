@@ -104,6 +104,8 @@ never as a bare NUL-terminated pointer.
 Generics: `(fn map :(vec U) ((a :(vec T)) (f :(fn (T) U))) ...)`. Type
 variables are single capital letters. The compiler monomorphises: one
 copy per concrete instantiation, and an error when instantiations pass 256.
+After a type variable unifies, every type-dependent rule applies again:
+a generic is never a way around a rule.
 
 Structural equality for types. Named types are nominal. No implicit
 conversion anywhere, including int to int of a different width; `cast` is
@@ -157,6 +159,14 @@ The error slot names a declared enum type. Callers must handle it with
 propagates only when the caller's error type is exactly the same type;
 otherwise the caller maps it explicitly in a `match`. There is no error
 widening and no union type in v1.
+
+### Closures
+
+`(fn (x :T) body)` creates a function value that captures the names it
+uses by value. The environment lives in the creating frame, so a closure
+that captures anything may not leave that function: returning it, storing
+it in a struct field, or pushing it into a vector is E0502. A closure
+that captures nothing is an ordinary function pointer and may go anywhere.
 
 ### Concurrency
 
