@@ -287,7 +287,7 @@ and the review-focus test:
 
 ```
 (test div-by-zero-panics
-  (expect (code 2) (err-prefix "/: division by zero"))
+  (expect (code 2) (err-prefix "R0001: division by zero"))
   (println (/ 1 (deref zero))))
 ```
 
