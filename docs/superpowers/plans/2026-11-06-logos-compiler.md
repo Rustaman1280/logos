@@ -287,7 +287,7 @@ and the review-focus test:
 
 ```
 (test div-by-zero-panics
-  (expect (code 2) (err-prefix "R0001: division by zero"))
+  (expect (code 2) (err-contains "R0001: division by zero"))
   (println (/ 1 (deref zero))))
 ```
 
@@ -500,7 +500,7 @@ git add -A && git commit -m "feat: threads, mutex, channel, atomics over pthread
 
 **Interfaces:**
 - Produces: `logos.tester.run_suite(root: str, only: str | None, opts: list[str]) -> Summary` with `Summary(passed: int, failed: int, failures: list[tuple[str, str]], leaks: int)`.
-- Produces: directive nodes `(expect (out S) (code N) (leaks N) (err-prefix S))`, module-level `(expect-error E0xxx)`, and the categories `parse type exec mem thread generics regress diff`.
+- Produces: directive nodes `(expect (out S) (code N) (leaks N) (err-contains S))`, module-level `(expect-error E0xxx)`, and the categories `parse type exec mem thread generics regress diff`.
 - Produces: `tests/summary.txt` baseline, one line per case, format `<status> <category>/<case> <detail>`.
 - Produces: CLI `python3 -m logos test [--only CAT] [--opt -O0 -O2] [--update-baseline]`.
 
