@@ -7,7 +7,10 @@ comparisons, ``let``/``letmut``/``set``, ``if``, ``while``, ``ret`` and calls.
 A form from a later task (``deref``, ``alloc``, ``make``) is not special yet,
 so it reaches the call path and is reported as an unknown function: the
 vocabulary grows one task at a time, and a name is only a built-in once this
-module has a rule for it.
+module has a rule for it. ``print`` and ``println`` are the built-ins so far:
+each takes one ``:str``, writes it unchanged and returns ``:void``. Formatting a
+number as text is a job for the runtime, not for the checker, so an integer
+argument is a type mismatch rather than a conversion.
 
 Purity
 ------
@@ -122,6 +125,65 @@ def check_module(m: Module) -> CheckedModule:
     return _Checker(m).run()
 
 
+def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]], int]:
+    """A ``fn``'s return type, its parameters and the index of its first statement.
+
+    The signature has three spellings — ``(fn f :i64 ((a :i64)) ...)``,
+    ``(fn f :(vec :i64) ((a :i64)) ...)`` and a parameter list whose type is
+    marked — and the return type, the parameter list and the body are three
+    items apart, not two. One function reads that shape because two readings
+    would drift: the checker validates the signature with it and the lowerer
+    re-reads the same signature with it.
+
+    ``types`` is the module namespace a named type resolves against. The
+    duplicate-parameter check lives here too, so a second reader inherits it.
+    """
+    if len(node.items) < 3:
+        raise diag(
+            UNKNOWN_NODE, node.path, "fn needs a return type and a parameter list"
+        )
+    ret, index = _read_type_at(node.items, 2, types, node.path)
+    if index >= len(node.items):
+        raise diag(UNKNOWN_NODE, node.path, "fn needs a parameter list")
+    params: list[tuple[str, Ty]] = []
+    names: set[str] = set()
+    for param in _param_nodes(node.items[index], node.path):
+        name, item = _param_parts(param)
+        if name in names:
+            raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
+        names.add(name)
+        params.append((name, _read_type(item, types, param.path)))
+    return ret, params, index + 1
+
+
+def let_shape(
+    node: Node, types: dict[str, Ty]
+) -> tuple[str, Ty | None, Node | Token]:
+    """A binding's name, its declared type and the item holding its initialiser.
+
+    ``declared`` is ``None`` for the unannotated spelling. The three spellings
+    are ``(let x v)``, ``(let x :i64 v)`` and ``(let x :(vec :i64) v)``; the
+    third splits into a marker, a list and the initialiser, which is why the
+    initialiser's index is not fixed.
+    """
+    items = node.items
+    shape = f"{node.kind} {_LET_SHAPE}"
+    if len(items) < 3:
+        raise diag(WRONG_ARITY, node.path, shape)
+    name = _name(items[1], node.path, node.kind)
+    if len(items) == 3:
+        if _clearly_type(items[2]):
+            # The annotation is there, the initialiser is missing.
+            raise diag(WRONG_ARITY, node.path, shape)
+        return name, None, items[2]
+    if not _is_type_slot(items[2]):
+        raise diag(WRONG_ARITY, node.path, shape)
+    declared, index = _read_type_at(items, 2, types, node.path)
+    if len(items) != index + 1:
+        raise diag(WRONG_ARITY, node.path, shape)
+    return name, declared, items[index]
+
+
 @dataclass(slots=True)
 class _Var:
     ty: Ty
@@ -161,8 +223,19 @@ class _Visible:
     fns: dict[str, FnTy]
 
 
-#: ``expect`` and ``expect-leak`` are harness directives, not expressions.
-_DIRECTIVES = ("expect", "expect-leak")
+#: ``expect`` and ``expect-leak`` are harness directives, not expressions. The
+#: lowerer skips them too, so the list is public rather than copied.
+DIRECTIVES = ("expect", "expect-leak")
+
+#: Functions the language provides without a definition. Both write a ``:str``
+#: unchanged and return nothing: a value that is not already text needs the
+#: runtime's formatter, which arrives with the rest of ``:str`` support. A
+#: module-level ``fn`` of one of these names shadows the builtin, because
+#: ``env.fns`` is consulted first.
+BUILTINS = {
+    "print": FnTy((Prim("str"),), Prim("void")),
+    "println": FnTy((Prim("str"),), Prim("void")),
+}
 
 _ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "modulo"}
 _ORDERED = ("<", "<=", ">", ">=")
@@ -235,46 +308,8 @@ class _Checker:
     def _signature(self, node: Node, types: dict[str, Ty]) -> FnTy:
         if node.name is None or node.name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
-        if len(node.items) < 3:
-            raise diag(
-                UNKNOWN_NODE, node.path, "fn needs a return type and a parameter list"
-            )
-        ret, index = self._type_at(node.items, 2, types, node.path)
-        if index >= len(node.items):
-            raise diag(UNKNOWN_NODE, node.path, "fn needs a parameter list")
-        params: list[Ty] = []
-        names: set[str] = set()
-        for param in _param_nodes(node.items[index], node.path):
-            name, item = _param_parts(param)
-            if name in names:
-                raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
-            names.add(name)
-            params.append(self._type(item, types, param.path))
-        return FnTy(tuple(params), ret)
-
-    def _type(self, item: Node | Token, types: dict[str, Ty], fallback: str) -> Ty:
-        path = item.path if isinstance(item, Node) and item.path else fallback
-        return _resolve(parse_type(item, path=path), types, path)
-
-    def _type_at(
-        self,
-        items: tuple[Node | Token, ...],
-        start: int,
-        types: dict[str, Ty],
-        fallback: str,
-    ) -> tuple[Ty, int]:
-        """Read the type at ``items[start]``, returning it and the next index.
-
-        A composite type is written ``:(vec :i64)``, which the lexer splits
-        into a lone ``:`` atom and the list, so the marker is consumed here.
-        """
-        item = items[start]
-        if _marker(item):
-            if start + 1 >= len(items):
-                raise diag(UNKNOWN_TYPE, fallback, "expected a type after ':'")
-            item = items[start + 1]
-            start += 1
-        return self._type(item, types, fallback), start + 1
+        ret, params, _ = fn_shape(node, types)
+        return FnTy(tuple(ty for _, ty in params), ret)
 
     # -- bodies ----------------------------------------------------------
 
@@ -301,7 +336,7 @@ class _Checker:
         for item in node.items[2:]:
             if not isinstance(item, Node):
                 raise diag(UNKNOWN_NODE, node.path, "a test body must be a form")
-            if item.kind in _DIRECTIVES:
+            if item.kind in DIRECTIVES:
                 continue
             if item.kind == "fn":
                 self._check_helper(item, env)
@@ -477,32 +512,20 @@ class _Checker:
         return Prim("bool")
 
     def _let(self, node: Node, env: _Env, *, mutable: bool) -> Ty:
-        items = node.items
-        shape = f"{node.kind} {_LET_SHAPE}"
-        if len(items) < 3:
-            raise diag(WRONG_ARITY, node.path, shape)
-        name = _name(items[1], node.path, node.kind)
-        if len(items) == 3:
-            if _clearly_type(items[2]):
-                # The annotation is there, the initialiser is missing.
-                raise diag(WRONG_ARITY, node.path, shape)
-            ty = self._value(items[2], env, None, node.path)
-            env.define(name, ty, mutable=mutable, path=node.path)
-            return Prim("void")
-
-        if not _is_type_slot(items[2]):
-            raise diag(WRONG_ARITY, node.path, shape)
-        declared, index = self._type_at(items, 2, self._types, node.path)
-        if len(items) != index + 1:
-            raise diag(WRONG_ARITY, node.path, shape)
-        value = self._value(items[index], env, declared, node.path)
-        if not compatible(declared, value):
+        name, declared, init = let_shape(node, self._types)
+        ty = self._value(init, env, declared, node.path)
+        if declared is not None and not compatible(declared, ty):
             raise diag(
                 TYPE_MISMATCH,
-                _at(items[index], node),
-                f"{node.kind} '{name}' has type {declared}, found {value}",
+                _at(init, node),
+                f"{node.kind} '{name}' has type {declared}, found {ty}",
             )
-        env.define(name, declared, mutable=mutable, path=node.path)
+        env.define(
+            name,
+            declared if declared is not None else ty,
+            mutable=mutable,
+            path=node.path,
+        )
         return Prim("void")
 
     def _set(self, node: Node, env: _Env) -> Ty:
@@ -595,6 +618,8 @@ class _Checker:
         else:
             found = env.fns.get(name)
             if found is None:
+                found = BUILTINS.get(name)
+            if found is None:
                 raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
             sig = found
         args = node.items[1:]
@@ -637,12 +662,42 @@ def _declared(name: str, node: Node) -> Ty:
     raise diag(UNKNOWN_NODE, body.path, f"unknown type body '{body.kind}'")
 
 
-def _resolve(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
+def _read_type(item: Node | Token, types: dict[str, Ty], fallback: str) -> Ty:
+    """Read one type item and resolve its names, locating errors at it."""
+    path = item.path if isinstance(item, Node) and item.path else fallback
+    return resolve_type(parse_type(item, path=path), types, path)
+
+
+def _read_type_at(
+    items: tuple[Node | Token, ...],
+    start: int,
+    types: dict[str, Ty],
+    fallback: str,
+) -> tuple[Ty, int]:
+    """Read the type at ``items[start]``, returning it and the next index.
+
+    A composite type is written ``:(vec :i64)``, which the lexer splits into a
+    lone ``:`` atom and the list, so the marker is consumed here.
+    """
+    item = items[start]
+    if _marker(item):
+        if start + 1 >= len(items):
+            raise diag(UNKNOWN_TYPE, fallback, "expected a type after ':'")
+        item = items[start + 1]
+        start += 1
+    return _read_type(item, types, fallback), start + 1
+
+
+def resolve_type(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
     """Resolve every named reference in ``ty`` against ``types``.
 
     A ``StructRef`` becomes the declared type, which turns it into an
     ``EnumRef`` when the name is an enum. An undeclared name is E0101. The
     lookup is total: an absent name is a diagnostic, never a ``KeyError``.
+
+    Public because the lowerer needs the same answer for a type annotation it
+    reads from the tree: the checker proves the annotation resolves, and the
+    backend must not guess a second time.
     """
     if isinstance(ty, TypeVar):
         raise diag(
@@ -658,23 +713,23 @@ def _resolve(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
             raise diag(UNKNOWN_TYPE, path, f"unknown type '{ty.name}'")
         return declared
     if isinstance(ty, Ptr):
-        return Ptr(_resolve(ty.elem, types, path))
+        return Ptr(resolve_type(ty.elem, types, path))
     if isinstance(ty, Own):
-        return Own(_resolve(ty.elem, types, path))
+        return Own(resolve_type(ty.elem, types, path))
     if isinstance(ty, Opt):
-        return Opt(_resolve(ty.elem, types, path))
+        return Opt(resolve_type(ty.elem, types, path))
     if isinstance(ty, Shared):
-        return Shared(_resolve(ty.elem, types, path))
+        return Shared(resolve_type(ty.elem, types, path))
     if isinstance(ty, Vec):
-        return Vec(_resolve(ty.elem, types, path))
+        return Vec(resolve_type(ty.elem, types, path))
     if isinstance(ty, Res):
-        return Res(_resolve(ty.ok, types, path), _resolve(ty.err, types, path))
+        return Res(resolve_type(ty.ok, types, path), resolve_type(ty.err, types, path))
     if isinstance(ty, FnTy):
-        params = tuple(_resolve(param, types, path) for param in ty.params)
-        return FnTy(params, _resolve(ty.ret, types, path))
+        params = tuple(resolve_type(param, types, path) for param in ty.params)
+        return FnTy(params, resolve_type(ty.ret, types, path))
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
-    return Arr(_resolve(ty.elem, types, path), ty.n)
+    return Arr(resolve_type(ty.elem, types, path), ty.n)
 
 
 def _param_nodes(item: Node | Token, path: str) -> list[Node]:

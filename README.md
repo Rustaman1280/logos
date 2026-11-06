@@ -15,24 +15,32 @@ runtime in `runtime/`.
 
 ## Status
 
-Incremental build. Task 1 provides the repository scaffold, the command line
-skeleton and runtime placeholders. The compiler passes land in later tasks, so
-every subcommand except `version` currently reports `not implemented`.
+Incremental build. Tasks 1-4 provide the scaffold, the command line skeleton,
+lexing, parsing, node paths, canonical printing, diagnostics, name resolution
+and the type checker. Task 5 adds the first backend: IR, the LLVM text emitter
+and the driver, so `build` produces a real ELF for the part of the language the
+lowerer covers — integer literals, `let`, `ret`, calls and `print`/`println`.
+Everything else reports `not implemented` or a diagnostic at the construct.
 
 ## Requirements
 
 - Ubuntu 22.04, x86_64
 - Python 3.10 or newer (3.10.12 ships with Ubuntu 22.04; 3.14 also works)
-- clang 14 and lld: `apt-get install -y clang lld`
+- clang 14 and lld: `apt-get install -y clang lld` (`lld` is unused so far;
+  clang links through the system linker)
 - GNU make
 
 ## Usage
 
 ```sh
-python3 -m logos version      # logos 0.1.0
-python3 -m logos build FILE   # not implemented yet
-python3 -m logos test FILE    # not implemented yet
+python3 -m logos version                      # logos 0.1.0
+python3 -m logos build examples/hello.logos   # build/hello, and build/hello.ll
+./build/hello                                 # hello
+python3 -m logos test FILE                    # not implemented yet
 ```
+
+The IR is always kept beside the binary under `build/`: it is the artefact to
+read when a compiled program misbehaves.
 
 ## Development
 

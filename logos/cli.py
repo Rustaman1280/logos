@@ -1,8 +1,9 @@
 """Command line entry point for the Logos toolchain.
 
-The compiler is built incrementally. Every subcommand except ``version`` is a
-placeholder that parses its arguments and reports that it is not implemented
-yet, so the command surface is fixed before the passes behind it exist.
+The compiler is built incrementally. ``build`` compiles a file to a native
+binary; every other subcommand except ``version`` and ``fmt`` parses its
+arguments and reports that it is not implemented yet, so the command surface
+is fixed before the passes behind it exist.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-from logos import __version__
+from logos import __version__, driver
 from logos.diag import LogosError
 from logos.fmt import render
 from logos.parser import parse
@@ -128,7 +129,27 @@ def main(argv: list[str]) -> int:
     if args.command == "fmt":
         return _fmt(args.files)
 
+    if args.command == "build":
+        return _build(args.file, args.out, args.opt)
+
     print(f"{args.command}: not implemented")
+    return 0
+
+
+def _build(source: str, out: str | None, opt: str) -> int:
+    """Compile one file and report a failure the way every other pass does.
+
+    The IR is always kept: it is the artefact a person reads when a program
+    misbehaves, so ``--keep-ir`` is accepted but changes nothing today.
+    """
+    try:
+        driver.build(source, out, opt=opt, keep_ir=True)
+    except driver.BuildError as error:
+        print(f"logos: {error}", file=sys.stderr)
+        return 1
+    except LogosError as error:
+        print(error.render(), file=sys.stderr)
+        return 1
     return 0
 
 

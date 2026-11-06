@@ -1,0 +1,116 @@
+"""The intermediate representation: flat blocks of instruction tuples.
+
+Shape
+-----
+An ``IrModule`` is a target triple, its private globals, the runtime functions
+it calls but does not define, and its functions. A function is a name, its
+parameters, its return type and a list of blocks. A block is a label, a list of
+instructions, and exactly one terminator.
+
+Instructions are tuples rather than classes because the IR exists to be read
+and printed, not to be walked by a dozen visitors: item 0 is the opcode and the
+rest are operands. The vocabulary is closed and small, and
+:func:`logos.llvm.emit` raises on an opcode it does not know, so a lowering bug
+fails loudly instead of printing something that merely looks like LLVM IR.
+
+=========================  ===================================================
+Opcode                     Tuple
+=========================  ===================================================
+``alloca``                 ``(dest, ty)`` — a named stack slot
+``store``                  ``(ty, value, slot)``
+``load``                   ``(dest, ty, slot)``
+``gaddr``                  ``(dest, global)`` — address of a global's byte 0
+``add sub mul sdiv srem``  ``(dest, ty, left, right)``
+``icmp``                   ``(dest, pred, ty, left, right)``
+``call``                   ``(dest, callee, (arg, ...))``
+=========================  ===================================================
+
+Terminators:
+
+=========================  ===================================================
+``ret``                    ``(ty, value_or_None)`` — ``None`` is ``ret void``
+``br``                     ``(label,)``
+``cbr``                    ``(cond, then_label, else_label)``
+=========================  ===================================================
+
+Names
+-----
+Every local and every block has a name; nothing is numbered implicitly by the
+printer. A local is spelled with its ``%`` (``%t3``, ``%x.addr``) because an
+operand may equally be a literal (``41``) and that sigil is what tells the two
+apart. A global (``.str0``), a function (``main``) and a label (``entry``) are
+spelled bare; the printer adds ``@`` or ``%`` where LLVM wants one.
+
+Ordering
+--------
+``globals`` are in first-use order, with the shared newline last, so the same
+source always produces the same module byte for byte.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from logos.types import Ty
+
+#: The one target this compiler produces code for.
+TRIPLE = "x86_64-unknown-linux-gnu"
+
+#: The global that holds ``println``'s trailing newline. It has a fixed name
+#: because it is not a literal from the source and must never collide with one.
+NEWLINE = ".str.nl"
+
+
+@dataclass(frozen=True, slots=True)
+class IrGlobal:
+    """A private constant in the module: ``data`` is the exact byte range.
+
+    No terminator is appended. A Logos string carries its own length, so the
+    bytes here are exactly the bytes ``rt_write`` is handed.
+    """
+
+    name: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class IrDecl:
+    """A function this module calls but does not define."""
+
+    name: str
+    params: tuple[Ty, ...]
+    ret: Ty
+
+
+@dataclass(slots=True)
+class IrBlock:
+    """One basic block: a label, its instructions and its terminator."""
+
+    label: str
+    instrs: list[tuple] = field(default_factory=list)
+    term: tuple | None = None
+
+
+@dataclass(slots=True)
+class IrFn:
+    """One function. ``params`` pairs each name with its type, in order."""
+
+    name: str
+    params: list[tuple[str, Ty]]
+    ret: Ty
+    blocks: list[IrBlock] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class IrModule:
+    """A whole translation unit.
+
+    ``declares`` is the only field beyond the three the plan names, and it has
+    a default, so ``IrModule(triple, globals, functions)`` still constructs a
+    module with nothing to declare.
+    """
+
+    triple: str
+    globals: list[IrGlobal]
+    functions: list[IrFn]
+    declares: list[IrDecl] = field(default_factory=list)

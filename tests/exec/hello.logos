@@ -1,0 +1,6 @@
+(mod hello)
+
+(test hello
+  (expect (out "hello\n")
+    (code 0))
+  (println "hello"))

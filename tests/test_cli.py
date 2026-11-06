@@ -31,12 +31,17 @@ class CliVersionTest(unittest.TestCase):
 
 class CliFlagParsingTest(unittest.TestCase):
     def test_build_accepts_output_flag(self):
-        """The exact build command the plan runs in a later task."""
-        out = io.StringIO()
-        with redirect_stdout(out):
+        """The exact build command the plan runs, on a file that is not there.
+
+        ``-o`` has to parse as the flag's value; the build itself then fails on
+        the missing source, which is reported as one line on stderr and a
+        status of 1 rather than a traceback.
+        """
+        err = io.StringIO()
+        with redirect_stderr(err):
             code = main(["build", "x.logos", "-o", "/tmp/o"])
-        self.assertEqual(code, 0)
-        self.assertIn("build: not implemented", out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("x.logos", err.getvalue())
 
     def test_test_accepts_repeated_optimisation_levels(self):
         """A value starting with ``-`` must parse as the value of ``--opt``."""
