@@ -46,6 +46,8 @@ or ``:f64`` otherwise. A literal beside a non-literal operand looks ahead to
 that operand's type, in arithmetic and in comparisons, so ``(< 1 a)`` with
 ``a :u8`` checks as ``:u8``. This is not a conversion: nothing is cast at run
 time, and a value that already has a type never changes under ``compatible``.
+The adopted type is also the literal's range: an integer literal that does not
+fit its resolved type is E0106, never a silent truncation.
 
 Returning
 ---------
@@ -68,6 +70,7 @@ from dataclasses import dataclass
 from logos.diag import (
     CIRCULAR,
     DUPLICATE,
+    LITERAL_RANGE,
     MISSING_RETURN,
     NOT_FOUND,
     NOT_MUTABLE,
@@ -242,6 +245,20 @@ _ORDERED = ("<", "<=", ">", ">=")
 _EQUALITY = ("=", "!=")
 #: The only types ``=`` and ``!=`` accept: scalars, never :void or a function.
 _SCALARS = INTEGERS + FLOATS + ("bool", "str")
+
+#: Every integer width's inclusive range, so a literal can be refused at check
+#: time instead of being truncated by the backend.
+_INT_RANGE = {
+    "i8": (-(2**7), 2**7 - 1),
+    "i16": (-(2**15), 2**15 - 1),
+    "i32": (-(2**31), 2**31 - 1),
+    "i64": (-(2**63), 2**63 - 1),
+    "u8": (0, 2**8 - 1),
+    "u16": (0, 2**16 - 1),
+    "u32": (0, 2**32 - 1),
+    "u64": (0, 2**64 - 1),
+}
+
 _TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "res", "opt", "shared")
 _LET_SHAPE = "takes a name, an optional type and a value"
 
@@ -293,10 +310,15 @@ class _Checker:
             }
             types = dict(inherited)
             types.update(own_types)
-            own_fns = {
-                name: self._signature(node, types)
-                for name, node in module.fns.items()
-            }
+            own_fns: dict[str, FnTy] = {}
+            for name, node in module.fns.items():
+                if name.startswith("rt_"):
+                    # The rt_ prefix belongs to the C runtime. A program
+                    # definition would be emitted as a symbol the runtime
+                    # already owns, so it is refused here rather than at link
+                    # time.
+                    raise diag(DUPLICATE, node.path, "rt_ names are reserved")
+                own_fns[name] = self._signature(node, types)
             fns = dict(inherited_fns)
             fns.update(own_fns)
             visible = _Visible(own_types, own_fns, types, fns)
@@ -418,7 +440,7 @@ class _Checker:
         self, token: Token, env: _Env, expected: Ty | None, where: str
     ) -> Ty:
         if token.kind == NUMBER:
-            return _number(token, expected)
+            return _number(token, expected, where)
         if token.kind == STRING:
             return Prim("str")
         if token.kind == ATOM:
@@ -809,8 +831,13 @@ def _params_item(node: Node) -> Node | Token:
     return node.items[index]
 
 
-def _number(token: Token, expected: Ty | None) -> Ty:
-    """The type of a numeric literal: the expected one when it fits, else a default."""
+def _number(token: Token, expected: Ty | None, where: str) -> Ty:
+    """The type of a numeric literal: the expected one when it fits, else a default.
+
+    An integer literal takes the width it is checked against, so the width's
+    range is the literal's range: ``(let x :i8 300)`` is E0106, not a silent
+    truncation to 44. A literal with no context is ``:i64`` and must fit that.
+    """
     text = token.value
     is_float = "." in text or "e" in text or "E" in text
     if is_float:
@@ -818,8 +845,14 @@ def _number(token: Token, expected: Ty | None) -> Ty:
             return expected
         return Prim("f64")
     if isinstance(expected, Prim) and expected.name in INTEGERS:
-        return expected
-    return Prim("i64")
+        ty = expected
+    else:
+        ty = Prim("i64")
+    low, high = _INT_RANGE[ty.name]
+    value = int(text)
+    if not low <= value <= high:
+        raise diag(LITERAL_RANGE, where, f"literal {text} does not fit {ty}")
+    return ty
 
 
 def _literal(item: Node | Token) -> bool:

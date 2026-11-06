@@ -65,8 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--opt",
         metavar="O",
-        default="-O0",
-        help="optimisation level, -O0 or -O2 (default: -O0)",
+        default="-O2",
+        help="optimisation level, -O0 or -O2 (default: -O2)",
     )
     build.add_argument(
         "--keep-ir",

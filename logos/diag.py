@@ -4,6 +4,21 @@ Every diagnostic code lives in ``CODES``. Passes import the code they report
 instead of spelling a literal, so ``E0001`` cannot mean two different things in
 two modules. ``E0001``-``E0006`` are the read-only passes (lexing, parsing,
 resolution); ``E01xx`` is the type checker.
+
+Runtime codes
+-------------
+A ``R0xxx`` code is not a compiler diagnostic: it is a stable name the C
+runtime prints when a program panics at run time, so ``.expect`` tests can
+quote it.
+
+* ``R0001`` division by zero — emitted by the lowerer before every ``/`` and
+  ``%`` that reaches a zero divisor.
+* ``R0002`` double free — reserved for the owning allocator; raised by the
+  runtime, not by the compiler.
+* ``R0003`` failed runtime check — reserved for a runtime assertion (bounds,
+  channel state) that cannot be proven at compile time.
+
+R0002 and R0003 are reserved names only: nothing emits them yet.
 """
 
 from __future__ import annotations
@@ -23,6 +38,7 @@ CODES = {
     "E0103": "unknown function",
     "E0104": "not mutable",
     "E0105": "missing return",
+    "E0106": "integer literal out of range",
 }
 
 UNBALANCED = "E0001"
@@ -37,6 +53,12 @@ WRONG_ARITY = "E0102"
 UNKNOWN_FUNCTION = "E0103"
 NOT_MUTABLE = "E0104"
 MISSING_RETURN = "E0105"
+LITERAL_RANGE = "E0106"
+
+#: The runtime panic code the lowerer emits for a division by zero. The other
+#: runtime codes (``R0002`` double free, ``R0003`` failed runtime check) are
+#: reserved in the module docstring and are raised by the runtime itself.
+DIVISION_BY_ZERO = "R0001"
 
 
 class LogosError(Exception):

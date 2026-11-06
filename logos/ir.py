@@ -20,8 +20,12 @@ Opcode                     Tuple
 ``store``                  ``(ty, value, slot)``
 ``load``                   ``(dest, ty, slot)``
 ``gaddr``                  ``(dest, global)`` — address of a global's byte 0
-``add sub mul sdiv srem``  ``(dest, ty, left, right)``
+``add sub mul``            ``(dest, ty, left, right)``
+``sdiv srem udiv urem``    ``(dest, ty, left, right)``
+``and``                    ``(dest, ty, left, right)`` — on an ``i1``
 ``icmp``                   ``(dest, pred, ty, left, right)``
+``phi``                    ``(dest, ty, ((value, label), ...))``
+``trunc``                  ``(dest, from_ty, to_ty, value)``
 ``call``                   ``(dest, callee, (arg, ...))``
 =========================  ===================================================
 
@@ -31,15 +35,17 @@ Terminators:
 ``ret``                    ``(ty, value_or_None)`` — ``None`` is ``ret void``
 ``br``                     ``(label,)``
 ``cbr``                    ``(cond, then_label, else_label)``
+``unreachable``            ``()`` — after a call to a ``_Noreturn`` function
 =========================  ===================================================
 
 Names
 -----
 Every local and every block has a name; nothing is numbered implicitly by the
-printer. A local is spelled with its ``%`` (``%t3``, ``%x.addr``) because an
+printer. A local is spelled with its ``%`` (``%t3``, ``%v.0.addr``) because an
 operand may equally be a literal (``41``) and that sigil is what tells the two
-apart. A global (``.str0``), a function (``main``) and a label (``entry``) are
-spelled bare; the printer adds ``@`` or ``%`` where LLVM wants one.
+apart. A global (``.str0``), a function (``lg.m.add``) and a label (``entry``)
+are spelled bare; the printer adds ``@`` or ``%`` where LLVM wants one and
+quotes the name when it is not something LLVM reads unquoted.
 
 Ordering
 --------
@@ -93,12 +99,22 @@ class IrBlock:
 
 @dataclass(slots=True)
 class IrFn:
-    """One function. ``params`` pairs each name with its type, in order."""
+    """One function. ``params`` pairs each emitted name with its type, in order.
+
+    ``name`` is the source name the checker and the diagnostics use; ``symbol``
+    is the linker-visible one, empty when it is the source name (``main``). A
+    program function is ``internal`` and mangled ``lg.<module>.<name>``, so a
+    source name can never interpose on a libc or runtime symbol. A parameter's
+    name is already the safe spelling the lowerer chose (``v.0``), not the
+    source's.
+    """
 
     name: str
     params: list[tuple[str, Ty]]
     ret: Ty
     blocks: list[IrBlock] = field(default_factory=list)
+    symbol: str = ""
+    internal: bool = False
 
 
 @dataclass(slots=True)

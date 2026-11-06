@@ -19,9 +19,19 @@ A string global is an array of exactly its own bytes — no NUL terminator,
 because a Logos string carries its length and ``rt_write`` is handed that
 length. Every byte outside printable ASCII is escaped as ``\\XX``, so a string
 containing a quote, a backslash or a newline round-trips.
+
+Symbols
+-------
+A function is printed at ``fn.symbol`` when it has one (the lowerer mangles a
+program function to ``lg.<module>.<name>``) and with ``internal`` linkage when
+``fn.internal`` is set; ``main`` keeps its name and external linkage. A name
+LLVM does not read unquoted is printed as a quoted identifier, so no source
+name and no module name can produce text clang refuses.
 """
 
 from __future__ import annotations
+
+import re
 
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
 from logos.types import Prim, Ptr, Ty
@@ -45,12 +55,34 @@ _PRIM = {
 }
 
 #: Opcodes that print as ``dest = op ty a, b``.
-_BINARY = ("add", "sub", "mul", "sdiv", "srem")
+_BINARY = ("add", "sub", "mul", "sdiv", "srem", "udiv", "urem", "and")
+
+#: A name LLVM reads unquoted: ``[-a-zA-Z$._][-a-zA-Z$._0-9]*``.
+_UNQUOTED = re.compile(r"[-a-zA-Z$._][-a-zA-Z$._0-9]*\Z")
 
 
 def emit(m: IrModule) -> str:
     """Return the LLVM IR text for ``m``, trailing newline included."""
     return _Text(m).module()
+
+
+def _named(sigil: str, name: str) -> str:
+    """Spell ``name`` after its ``@`` or ``%``, quoted unless LLVM reads it bare.
+
+    A source name is sanitised by the lowerer before it reaches the IR, but a
+    mangled symbol still carries the module name, and nothing about a Logos
+    atom guarantees LLVM's identifier grammar. Quoting is total: any byte
+    outside printable ASCII, and any quote or backslash, is escaped ``\\XX``.
+    """
+    if _UNQUOTED.match(name):
+        return f"{sigil}{name}"
+    parts = []
+    for byte in name.encode("utf-8"):
+        if 0x20 <= byte < 0x7F and byte not in (0x22, 0x5C):
+            parts.append(chr(byte))
+        else:
+            parts.append(f"\\{byte:02X}")
+    return f'{sigil}"' + "".join(parts) + '"'
 
 
 def type_text(ty: Ty) -> str:
@@ -74,7 +106,10 @@ class _Text:
             d.name: (d.params, d.ret) for d in m.declares
         }
         for fn in m.functions:
-            self.sigs[fn.name] = (tuple(ty for _, ty in fn.params), fn.ret)
+            self.sigs[fn.symbol or fn.name] = (
+                tuple(ty for _, ty in fn.params),
+                fn.ret,
+            )
 
     # -- module ----------------------------------------------------------
 
@@ -101,15 +136,17 @@ class _Text:
 
     def decl_line(self, decl: IrDecl) -> str:
         params = ", ".join(type_text(ty) for ty in decl.params)
-        return f"declare {type_text(decl.ret)} @{decl.name}({params})"
+        return f"declare {type_text(decl.ret)} {_named('@', decl.name)}({params})"
 
     # -- functions -------------------------------------------------------
 
     def fn_lines(self, fn: IrFn) -> list[str]:
         params = ", ".join(
-            f"{type_text(ty)} %{name}" for name, ty in fn.params
+            f"{type_text(ty)} {_named('%', name)}" for name, ty in fn.params
         )
-        lines = [f"define {type_text(fn.ret)} @{fn.name}({params}) {{"]
+        linkage = "internal " if fn.internal else ""
+        symbol = _named("@", fn.symbol or fn.name)
+        lines = [f"define {linkage}{type_text(fn.ret)} {symbol}({params}) {{"]
         for block in fn.blocks:
             lines.extend(self.block_lines(block))
         lines.append("}")
@@ -142,12 +179,20 @@ class _Text:
             size = self.size(name)
             return (
                 f"{dest} = getelementptr inbounds [{size} x i8], "
-                f"[{size} x i8]* @{name}, i64 0, i64 0"
+                f"[{size} x i8]* {_named('@', name)}, i64 0, i64 0"
             )
         if op in _BINARY:
             _, dest, ty, left, right = instr
             spelled = type_text(ty)
             return f"{dest} = {op} {spelled} {left}, {right}"
+        if op == "phi":
+            _, dest, ty, incoming = instr
+            spelled = type_text(ty)
+            pairs = ", ".join(f"[ {value}, %{label} ]" for value, label in incoming)
+            return f"{dest} = phi {spelled} {pairs}"
+        if op == "trunc":
+            _, dest, from_ty, to_ty, value = instr
+            return f"{dest} = trunc {type_text(from_ty)} {value} to {type_text(to_ty)}"
         if op == "icmp":
             _, dest, pred, ty, left, right = instr
             spelled = type_text(ty)
@@ -160,6 +205,8 @@ class _Text:
         _, dest, callee, args = instr
         sig = self.sigs.get(callee)
         if sig is None:
+            # The lowerer owns the diagnostic for a call with no definition;
+            # reaching this means the IR was built by hand and is inconsistent.
             raise ValueError(f"call to undefined function '@{callee}'")
         params, ret = sig
         if len(params) != len(args):
@@ -169,7 +216,7 @@ class _Text:
         spelled = ", ".join(
             f"{type_text(ty)} {arg}" for ty, arg in zip(params, args)
         )
-        text = f"call {type_text(ret)} @{callee}({spelled})"
+        text = f"call {type_text(ret)} {_named('@', callee)}({spelled})"
         return f"{dest} = {text}" if dest else text
 
     def size(self, name: str) -> int:
@@ -195,6 +242,8 @@ class _Text:
         if op == "cbr":
             _, cond, then_label, else_label = term
             return f"br i1 {cond}, label %{then_label}, label %{else_label}"
+        if op == "unreachable":
+            return "unreachable"
         raise ValueError(f"unknown IR terminator '{op}'")
 
 

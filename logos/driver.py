@@ -90,16 +90,22 @@ def build(
 ) -> str:
     """Compile ``src_path`` to a native binary and return its path.
 
-    ``out`` defaults to ``build/<name>``. The IR is written before clang runs,
-    so a failed build leaves the text that failed behind; ``keep_ir=False``
-    removes it again once the binary exists.
+    ``out`` defaults to ``build/<name>``. A failed build leaves no artefact
+    behind: the binary and the ``.ll`` at the output paths are removed before
+    the error is re-raised, so nothing can run a stale program or be read as
+    the text that failed. ``keep_ir=False`` removes the IR after a success.
     """
-    cm = check_module(load(src_path))
-    if "main" not in cm.module.fns:
-        raise BuildError(f"{src_path}: no 'main' function to build")
-    module = lower.lower_module(cm)
     target = out if out is not None else str(BUILD_DIR / Path(src_path).stem)
-    return _link(module, ir_path(src_path), target, opt, keep_ir)
+    ll = ir_path(src_path)
+    try:
+        cm = check_module(load(src_path))
+        if "main" not in cm.module.fns:
+            raise BuildError(f"{src_path}: no 'main' function to build")
+        module = lower.lower_module(cm)
+        return _link(module, ll, target, opt, keep_ir)
+    except BaseException:
+        _discard(ll, Path(target))
+        raise
 
 
 def run_test(
@@ -108,11 +114,17 @@ def run_test(
     """Build one ``(test ...)`` body of ``src_path`` as a standalone program.
 
     The test body becomes ``main``: that is what lets the harness run a test as
-    an ordinary process and compare its output and exit status.
+    an ordinary process and compare its output and exit status. The module's
+    own functions are lowered alongside it, so a test may call one.
     """
-    cm = check_module(load(src_path))
-    module = lower.lower_test(cm, test_name)
-    return _link(module, test_ir_path(src_path, test_name), out, opt, True)
+    ll = test_ir_path(src_path, test_name)
+    try:
+        cm = check_module(load(src_path))
+        module = lower.lower_test(cm, test_name)
+        return _link(module, ll, out, opt, True)
+    except BaseException:
+        _discard(ll, Path(out))
+        raise
 
 
 def _link(
@@ -135,6 +147,7 @@ def _link(
     ]
     done = subprocess.run(command, capture_output=True, text=True)
     if done.returncode != 0:
+        _discard(ll, Path(out))
         raise BuildError(
             "clang failed: "
             + " ".join(command)
@@ -143,6 +156,20 @@ def _link(
     if not keep_ir:
         ll.unlink()
     return out
+
+
+def _discard(*paths: Path) -> None:
+    """Remove build artefacts, ignoring what is already gone.
+
+    Called on every failure path. An ``OSError`` is swallowed on purpose: the
+    caller is about to raise the error that actually matters, and a permission
+    problem while cleaning up must not replace it.
+    """
+    for path in paths:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _read(path: Path) -> str:

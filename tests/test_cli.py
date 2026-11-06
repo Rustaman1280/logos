@@ -51,6 +51,13 @@ class CliFlagParsingTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("test: not implemented", out.getvalue())
 
+    def test_build_defaults_to_the_drivers_optimisation_level(self):
+        """The CLI default and ``driver.build``'s default are the same -O2."""
+        with patch("logos.cli.driver.build") as build:
+            code = main(["build", "x.logos"])
+        self.assertEqual(code, 0)
+        build.assert_called_once_with("x.logos", None, opt="-O2", keep_ir=True)
+
 
 class CliFmtTest(unittest.TestCase):
     def test_fmt_rewrites_files_in_place_and_prints_nothing(self):
