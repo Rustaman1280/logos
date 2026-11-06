@@ -87,6 +87,8 @@ def build(
     out: str | None = None,
     opt: str = "-O2",
     keep_ir: bool = True,
+    *,
+    debug: bool = False,
 ) -> str:
     """Compile ``src_path`` to a native binary and return its path.
 
@@ -94,6 +96,9 @@ def build(
     behind: the binary and the ``.ll`` at the output paths are removed before
     the error is re-raised, so nothing can run a stale program or be read as
     the text that failed. ``keep_ir=False`` removes the IR after a success.
+
+    ``debug`` makes ``main`` report every block still live at exit. A release
+    build does not, because its stderr belongs to the program.
     """
     target = out if out is not None else str(BUILD_DIR / Path(src_path).stem)
     ll = ir_path(src_path)
@@ -101,7 +106,7 @@ def build(
         cm = check_module(load(src_path))
         if "main" not in cm.module.fns:
             raise BuildError(f"{src_path}: no 'main' function to build")
-        module = lower.lower_module(cm)
+        module = lower.lower_module(cm, debug=debug)
         return _link(module, ll, target, opt, keep_ir)
     except BaseException:
         _discard(ll, Path(target))
@@ -109,18 +114,22 @@ def build(
 
 
 def run_test(
-    src_path: str, test_name: str, out: str, *, opt: str = "-O2"
+    src_path: str, test_name: str, out: str, *, opt: str = "-O2", debug: bool = True
 ) -> str:
     """Build one ``(test ...)`` body of ``src_path`` as a standalone program.
 
     The test body becomes ``main``: that is what lets the harness run a test as
     an ordinary process and compare its output and exit status. The module's
     own functions are lowered alongside it, so a test may call one.
+
+    A test build is a debug build by default: its ``main`` reports every block
+    still live at exit, which is what makes a leaked block visible to the
+    runner instead of silently passing.
     """
     ll = test_ir_path(src_path, test_name)
     try:
         cm = check_module(load(src_path))
-        module = lower.lower_test(cm, test_name)
+        module = lower.lower_test(cm, test_name, debug=debug)
         return _link(module, ll, out, opt, True)
     except BaseException:
         _discard(ll, Path(out))

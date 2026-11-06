@@ -52,11 +52,13 @@ the entry block, but the name is known only inside the block that declared it
 binding table on entry and restores it on exit, so a branch's ``let`` cannot
 retarget a later read of the same outer name.
 
-A declared type with no LLVM layout — ``(vec T)``, ``(own T)``, ``(res T E)``
-and the rest — is E0002 at the node that materialises it, never a
-``ValueError`` from the printer: the type vocabulary is larger than this
-backend, and the refusal must carry a path. A struct or an array is lowerable
-when every type inside it is; an enum is not, until results arrive.
+A declared type with no LLVM layout — ``(vec T)``, ``(res T E)`` and the rest
+— is E0002 at the node that materialises it, never a ``ValueError`` from the
+printer: the type vocabulary is larger than this backend, and the refusal must
+carry a path. The walk descends through arrays *and* pointers, so a struct
+behind a ``(ptr T)`` cannot hide a field this backend cannot spell. A struct or
+an array is lowerable when every type inside it is; an enum is not, until
+results arrive.
 
 Control flow
 ------------
@@ -113,6 +115,28 @@ coming apart. ``print``/``println`` extract both fields and hand them to one
 scan for a terminator that was never written. A panic argument is the one
 exception: it is a NUL-terminated C string, because ``rt_panic`` reads it with
 ``strlen``.
+
+Memory
+------
+``(alloc T n)`` becomes ``rt_alloc(bytes, align, path)`` — the byte count is
+``n`` times the element's layout, the alignment is the element's own, and the
+path is a compiler-generated C string the leak report prints at exit. The
+result crosses the C boundary once, as ``i8*``, and is ``bitcast`` to ``T*``;
+``(own T)`` and ``(ptr T)`` are both ``T*`` in the IR, because the difference
+between them is what the checker knows, not what is stored.
+
+``(deref p)`` is a typed ``load`` and ``(set-deref p v)`` a typed ``store``;
+``(ptr-add p n)`` is a ``gep`` whose stride is the pointee's size. ``(ptr p)``
+emits nothing at all: it is the same machine value under a type that cannot
+free it. A move emits nothing either — the pointer is copied where the checker
+allowed it and the old binding is never read again — so ownership costs no
+instructions and the release is exactly the ``free`` the source spelled.
+
+A debug build (a test build, by default) calls ``rt_leak_report`` on every path
+out of ``main``, after the exit status is computed; a release build does not.
+The runtime, not the compiler, decides what a live block is, which is why a
+double free is caught there: a copy of a pointer the checker could not see —
+through an aggregate, or from C — still reaches ``rt_free`` twice.
 """
 
 from __future__ import annotations
@@ -156,7 +180,7 @@ from logos.ir import (
 )
 from logos.lexer import ATOM, NUMBER, STRING, Token
 from logos.nodes import Node
-from logos.types import INTEGERS, Arr, Prim, Ptr, StructRef, Ty
+from logos.types import INTEGERS, Arr, Own, Prim, Ptr, StructRef, Ty
 
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
@@ -186,6 +210,8 @@ _STATEMENTS = (
     "continue",
     "set-field",
     "arr-set",
+    "free",
+    "set-deref",
 )
 
 #: The one aggregate this backend builds by hand: the ``:str`` the spec fixes.
@@ -214,6 +240,23 @@ _RT_PANIC = IrDecl(
     (Ptr(Prim("u8")), Ptr(Prim("u8")), Ptr(Prim("u8"))),
     Prim("void"),
 )
+
+#: ``rt_alloc``'s C signature: ``void *(size_t, size_t, const char*)``. The size
+#: is in bytes and the third argument is the node path of the ``alloc``, a
+#: NUL-terminated literal the leak report prints back at exit.
+_RT_ALLOC = IrDecl(
+    "rt_alloc", (Prim("i64"), Prim("i64"), Ptr(Prim("u8"))), Ptr(Prim("u8"))
+)
+
+#: ``void rt_free(void *)`` — the block goes back to the allocator.
+_RT_FREE = IrDecl("rt_free", (Ptr(Prim("u8")),), Prim("void"))
+
+#: ``void rt_leak_report(void)`` — one line per live block, at the end of main.
+_RT_LEAK_REPORT = IrDecl("rt_leak_report", (), Prim("void"))
+
+#: ``i8*`` is the C boundary's ``void *``; a Logos pointer is ``T*`` and crosses
+#: it with one ``bitcast``.
+_VOID_PTR = Ptr(Prim("u8"))
 
 #: ``main`` returns a C exit status, whatever the Logos program says.
 _ENTRY_RET = Prim("i32")
@@ -250,7 +293,24 @@ def lowered_type(
 def _unlowered(
     ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]], stack: tuple[str, ...]
 ) -> tuple[Ty | None, str | None]:
-    """The first type in ``ty`` with no layout, and any value cycle found."""
+    """The first type in ``ty`` with no layout, and any value cycle found.
+
+    A pointer is followed rather than accepted as spellable on its own:
+    ``(ptr bad)`` prints as ``%struct.bad*`` even when ``bad`` has no
+    definition, so a struct whose field is a ``(vec :i64)`` would reach the
+    printer and escape as a bare ``ValueError`` with no node path. Descending
+    turns that into E0002 at the node that named the pointer.
+
+    A cycle reached *through* a pointer is finite — ``(struct (head (ptr
+    node)))`` is one word — so it is not reported; the same cycle by value is.
+    """
+    if isinstance(ty, (Ptr, Own)):
+        bad, _ = _unlowered(ty.elem, structs, stack)
+        return bad, None
+    if isinstance(ty, Arr):
+        if _is_void(ty.elem):
+            return ty.elem, None
+        return _unlowered(ty.elem, structs, stack)
     try:
         llvm.type_text(ty)
     except ValueError:
@@ -269,26 +329,25 @@ def _unlowered(
             bad, cycle = _unlowered(field, structs, stack + (ty.name,))
             if bad is not None or cycle is not None:
                 return bad, cycle
-    elif isinstance(ty, Arr):
-        if _is_void(ty.elem):
-            return ty.elem, None
-        return _unlowered(ty.elem, structs, stack)
     return None, None
 
 
-def lower_module(cm: CheckedModule) -> IrModule:
+def lower_module(cm: CheckedModule, *, debug: bool = False) -> IrModule:
     """Lower every function of ``cm``; a module with a ``main`` is a program.
 
     Tests are compiled out: they are grammar nodes for the harness, and a
-    build must not carry their bodies into the binary.
+    build must not carry their bodies into the binary. ``debug`` adds the leak
+    report at the exit of ``main``; a release build runs without the tracker's
+    output, because a program that leaks is a program the author has decided
+    to run as it is.
     """
-    lowering = _Lower(cm)
+    lowering = _Lower(cm, debug=debug)
     for name, node in cm.module.fns.items():
         lowering.fn(name, node)
     return lowering.close()
 
 
-def lower_test(cm: CheckedModule, test_name: str) -> IrModule:
+def lower_test(cm: CheckedModule, test_name: str, *, debug: bool = True) -> IrModule:
     """Lower one ``(test ...)`` body into ``main``.
 
     The body's harness directives are skipped, because they are instructions to
@@ -298,6 +357,9 @@ def lower_test(cm: CheckedModule, test_name: str) -> IrModule:
     call with no definition is a diagnostic rather than a symbol the linker
     would fail to find. A module-level ``main`` is skipped, because the test
     body is the entry point and two definitions of ``@main`` cannot coexist.
+
+    A test build is a debug build: its ``main`` reports every live block at
+    exit, which is what lets a ``(leaks 0)`` expectation be checked.
     """
     node = cm.module.tests.get(test_name)
     if node is None:
@@ -306,7 +368,7 @@ def lower_test(cm: CheckedModule, test_name: str) -> IrModule:
             "",
             f"no test named '{test_name}' in module '{cm.module.name}'",
         )
-    lowering = _Lower(cm)
+    lowering = _Lower(cm, debug=debug)
     lowering.symbols.pop("main", None)
     for name, fn_node in cm.module.fns.items():
         if name == "main":
@@ -329,12 +391,13 @@ def lower_test(cm: CheckedModule, test_name: str) -> IrModule:
 class _Lower:
     """One module's shared state: its globals, its declarations, its IR."""
 
-    def __init__(self, cm: CheckedModule) -> None:
+    def __init__(self, cm: CheckedModule, *, debug: bool = False) -> None:
         # The layout registry answers by name alone, so it describes exactly
         # one module at a time: drop whatever an earlier module left there
         # before this one registers its structs.
         llvm.reset_structs()
         self.cm = cm
+        self.debug = debug
         self.ir = IrModule(TRIPLE, [], [])
         self.strings: dict[bytes, str] = {}
         self.declares: list[IrDecl] = []
@@ -411,7 +474,7 @@ class _Lower:
                 self._collect(field, stack + (ty.name,))
             self.structs[ty.name] = fields
             llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
-        elif isinstance(ty, (Arr, Ptr)):
+        elif isinstance(ty, (Arr, Ptr, Own)):
             self._collect(ty.elem, stack)
 
     def fn(self, name: str, node: Node) -> None:
@@ -558,6 +621,7 @@ class _Fn:
         if self.block.term is not None:
             return
         if self.is_main:
+            self.leak_report()
             self.block.term = ("ret", _ENTRY_RET, "0")
         elif _is_void(self.ret):
             self.block.term = ("ret", Prim("void"), None)
@@ -590,6 +654,10 @@ class _Fn:
             self.set_field(node)
         elif kind == "arr-set":
             self.arr_set(node)
+        elif kind == "set-deref":
+            self.set_deref(node)
+        elif kind == "free":
+            self.free_stmt(node)
         elif kind == "ret":
             self.ret_stmt(node)
         elif kind == "while":
@@ -678,11 +746,22 @@ class _Fn:
         else:
             value = None
         if self.is_main:
-            self.block.term = ("ret", _ENTRY_RET, self.exit_status(value))
+            # The tracker reports before the process leaves ``main``, on every
+            # path out of it: a test's ``(leaks 0)`` is about the whole run.
+            status = self.exit_status(value)
+            self.leak_report()
+            self.block.term = ("ret", _ENTRY_RET, status)
         elif value is None:
             self.block.term = ("ret", Prim("void"), None)
         else:
             self.block.term = ("ret", self.ret, value)
+
+    def leak_report(self) -> None:
+        """Ask the runtime to print every block still live, in a debug build."""
+        if not self.lowering.debug:
+            return
+        self.lowering.declare(_RT_LEAK_REPORT)
+        self.emit(("call", "", "rt_leak_report", ()))
 
     def exit_status(self, value: str | None) -> str:
         """The value ``main`` returns as a process status, truncated to ``i32``.
@@ -823,6 +902,140 @@ class _Fn:
         self.emit(("gep", address, ty, slot, (("i64", "0"), ("i64", checked))))
         self.emit(("store", ty.elem, value, address))
 
+    # -- memory ----------------------------------------------------------
+
+    def alloc(self, node: Node) -> str:
+        """``(alloc T n)``: one block of n T, as ``rt_alloc`` returns it.
+
+        The count is in elements and ``rt_alloc`` takes bytes, so the block's
+        size is one multiply by the element's layout. The multiply is guarded:
+        ``count * size`` wrapping would ask the allocator for a short block and
+        then let the program write past it, which is the one arithmetic
+        overflow in this compiler that would corrupt memory rather than wrap.
+
+        ``rt_alloc`` also takes the alignment and the node path. The path is a
+        compiler-generated C string, and it is what the leak report prints at
+        exit: a live block names the ``alloc`` that made it.
+        """
+        ty = self.type_of(node)
+        if not isinstance(ty, Own):
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'alloc' did not produce an owning pointer, found {ty}",
+            )
+        self.lowering.use_type(ty.elem, node.path)
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "alloc takes a type and an element count"
+            )
+        count = self.index64(items[2], node.path, "alloc count")
+        size = sizeof_of(ty.elem, self.cm.structs)
+        self.no_overflow(count, size, node.path)
+        if size == 1:
+            bytes_ = count
+        else:
+            bytes_ = self.temp()
+            self.emit(("mul", bytes_, Prim("i64"), count, str(size)))
+        path = self._c_argument(node.path)
+        align = align_of(ty.elem, self.cm.structs)
+        self.lowering.declare(_RT_ALLOC)
+        raw = self.temp()
+        self.emit(("call", raw, "rt_alloc", (bytes_, str(align), path)))
+        cast = self.temp()
+        self.emit(("bitcast", cast, _VOID_PTR, ty, raw))
+        return cast
+
+    def no_overflow(self, count: str, size: int, where: str) -> None:
+        """Branch to ``rt_panic`` unless ``count * size`` fits a byte count.
+
+        One unsigned compare: a negative count is above any limit once read
+        unsigned, so it fails here instead of becoming a huge ``size_t``.
+        """
+        limit = (2**63 - 1) // size if size else 2**63 - 1
+        self.labels += 1
+        tag = f"alloc{self.labels}"
+        ok, bad = f"{tag}.ok", f"{tag}.bad"
+        test = self.temp()
+        self.emit(("icmp", test, "ugt", Prim("i64"), count, str(limit)))
+        self.block.term = ("cbr", test, bad, ok)
+        self.new_block(bad)
+        self.panic(where, ARRAY_BOUNDS, "allocation size overflows")
+        self.new_block(ok)
+
+    def deref(self, node: Node) -> str:
+        """``(deref p)``: one ``load`` of the pointee type through p."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "deref takes one pointer")
+        ty = self.type_of(node)
+        self.lowering.use_type(ty, node.path)
+        pointer = self.value(items[1], node.path)
+        dest = self.temp()
+        self.emit(("load", dest, ty, pointer))
+        return dest
+
+    def set_deref(self, node: Node) -> None:
+        """``(set-deref p v)``: one ``store`` through p."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "set-deref takes a pointer and a value"
+            )
+        pointer_ty = self.type_of_item(items[1], node.path)
+        elem = _pointee(pointer_ty)
+        if elem is None:
+            raise diag(
+                TYPE_MISMATCH, node.path, f"deref needs a pointer, found {pointer_ty}"
+            )
+        self.lowering.use_type(elem, node.path)
+        pointer = self.value(items[1], node.path)
+        value = self.value(items[2], node.path)
+        self.emit(("store", elem, value, pointer))
+
+    def ptr_form(self, node: Node) -> str:
+        """``(ptr p)``: the same pointer under a type that cannot free it."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "ptr takes one owning pointer")
+        return self.value(items[1], node.path)
+
+    def ptr_add(self, node: Node) -> str:
+        """``(ptr-add p n)``: a ``gep`` scaled by the pointee's own size."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "ptr-add takes a pointer and an offset"
+            )
+        pointer_ty = self.type_of_item(items[1], node.path)
+        elem = _pointee(pointer_ty)
+        if elem is None:
+            raise diag(
+                TYPE_MISMATCH, node.path, f"ptr-add needs a pointer, found {pointer_ty}"
+            )
+        pointer = self.value(items[1], node.path)
+        offset = self.index64(items[2], node.path, "pointer offset")
+        dest = self.temp()
+        self.emit(("gep", dest, elem, pointer, (("i64", offset),)))
+        return dest
+
+    def free_stmt(self, node: Node) -> None:
+        """``(free p)``: hand the block back, through the C boundary's ``void *``."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "free takes one pointer")
+        pointer_ty = self.type_of_item(items[1], node.path)
+        if _pointee(pointer_ty) is None:
+            raise diag(
+                TYPE_MISMATCH, node.path, f"free needs an (own T), found {pointer_ty}"
+            )
+        pointer = self.value(items[1], node.path)
+        cast = self.temp()
+        self.emit(("bitcast", cast, pointer_ty, _VOID_PTR, pointer))
+        self.lowering.declare(_RT_FREE)
+        self.emit(("call", "", "rt_free", (cast,)))
+
     def field(self, ty: StructRef, name: str, where: str) -> tuple[int, Ty]:
         """The declaration index and type of one field."""
         fields = self.cm.structs.get(ty.name)
@@ -849,12 +1062,14 @@ class _Fn:
         self.emit(("store", ty, self.value(item, where), slot))
         return slot
 
-    def index64(self, item: Node | Token, where: str) -> str:
-        """An array index widened to ``i64`` for one unsigned bounds test.
+    def index64(self, item: Node | Token, where: str, what: str = "array index") -> str:
+        """An index widened to ``i64`` for one unsigned bounds test.
 
         A narrow or signed index is extended, never truncated: a negative index
         then reads as a huge unsigned number and fails the same test a too-large
-        one does, instead of wrapping into range.
+        one does, instead of wrapping into range. ``what`` names the operand in
+        the diagnostic, because an element count and a pointer offset are
+        widened for the same reason an array index is.
         """
         value = self.value(item, where)
         ty = self.type_of_item(item, where)
@@ -862,7 +1077,7 @@ class _Fn:
             raise diag(
                 TYPE_MISMATCH,
                 where,
-                f"array index must be an integer, found {ty}",
+                f"{what} must be an integer, found {ty}",
             )
         if ty.name in ("i64", "u64"):
             return value
@@ -915,6 +1130,14 @@ class _Fn:
             return self.get_field(item)
         if kind == "arr-get":
             return self.arr_get(item)
+        if kind == "alloc":
+            return self.alloc(item)
+        if kind == "deref":
+            return self.deref(item)
+        if kind == "ptr":
+            return self.ptr_form(item)
+        if kind == "ptr-add":
+            return self.ptr_add(item)
         if kind in _STATEMENTS:
             raise diag(UNKNOWN_NODE, item.path, f"'{kind}' is a statement, not a value")
         # A module-level ``fn`` shadows a builtin: the checker resolves
@@ -1392,6 +1615,78 @@ class _Fn:
 
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
+
+
+def _pointee(ty: Ty) -> Ty | None:
+    """The type a pointer points at, or ``None`` when ``ty`` is not a pointer."""
+    if isinstance(ty, (Own, Ptr)):
+        return ty.elem
+    return None
+
+
+#: Bytes and alignment of every primitive, spelled as LLVM lays them out.
+#: ``:bool`` is ``i1`` and an ``i1`` in memory is one byte; ``:str`` is the
+#: sixteen-byte ``{ i8*, i64 }`` aggregate the spec fixes.
+_SIZES = {
+    "i8": 1,
+    "u8": 1,
+    "bool": 1,
+    "i16": 2,
+    "u16": 2,
+    "i32": 4,
+    "u32": 4,
+    "f32": 4,
+    "i64": 8,
+    "u64": 8,
+    "f64": 8,
+    "str": 16,
+}
+
+_FLOATS = ("f32", "f64")
+
+
+def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
+    """The size in bytes of one ``ty``, as LLVM lays it out.
+
+    A struct is its fields in declaration order, each padded to its own
+    alignment and the whole padded to the largest of them — C's rule, which is
+    the rule LLVM applies to an identified struct. An empty struct is zero
+    bytes here, because ``{ }`` is zero bytes; the language never allocates one
+    more widely than that, and nothing reads through such a pointer.
+    """
+    if isinstance(ty, Prim):
+        return _SIZES.get(ty.name, 1)
+    if isinstance(ty, (Ptr, Own)):
+        return 8
+    if isinstance(ty, Arr):
+        return ty.n * sizeof_of(ty.elem, structs)
+    if isinstance(ty, StructRef):
+        fields = structs.get(ty.name, ())
+        offset = 0
+        align = 1
+        for _, field in fields:
+            field_align = align_of(field, structs)
+            offset = (offset + field_align - 1) // field_align * field_align
+            offset += sizeof_of(field, structs)
+            align = max(align, field_align)
+        return (offset + align - 1) // align * align
+    return 1
+
+
+def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
+    """The alignment in bytes of one ``ty``: what ``rt_alloc`` is asked for."""
+    if isinstance(ty, Prim):
+        if ty.name in _FLOATS:
+            return 4 if ty.name == "f32" else 8
+        return min(_SIZES.get(ty.name, 1), 16)
+    if isinstance(ty, (Ptr, Own)):
+        return 8
+    if isinstance(ty, Arr):
+        return align_of(ty.elem, structs)
+    if isinstance(ty, StructRef):
+        fields = structs.get(ty.name, ())
+        return max([align_of(field, structs) for _, field in fields] or [1])
+    return 1
 
 
 def _is_marker(item: Node | Token) -> bool:

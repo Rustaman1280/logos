@@ -1,0 +1,10 @@
+(mod double-free)
+
+(type holder (struct (p (own :i64))))
+
+(test double-free-panics
+  (expect (code 2)
+    (err-contains "R0002: double free"))
+  (let h holder (make holder (alloc :i64 2)))
+  (free (get h p))
+  (free (get h p)))

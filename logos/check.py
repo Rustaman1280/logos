@@ -5,14 +5,34 @@ Scope
 This pass checks what the language has so far: primitives, arithmetic,
 comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
 ``while``, ``match``, ``break``/``continue``, ``ret``, calls, struct field
-access and fixed arrays. A form from a later task (``deref``, ``alloc``,
-``vec-push``) is not special yet, so it reaches the call path and is reported
-as an unknown function: the vocabulary grows one task at a time, and a name is
-only a built-in once this module has a rule for it. ``print`` and ``println``
-are the built-ins so far: each takes one ``:str``, writes it unchanged and
-returns ``:void``. Formatting a number as text is a job for the runtime, not
-for the checker, so an integer argument is a type mismatch rather than a
-conversion.
+access, fixed arrays and manual memory. A form from a later task
+(``vec-push``, ``ok``) is not special yet, so it reaches the call path and is
+reported as an unknown function: the vocabulary grows one task at a time, and a
+name is only a built-in once this module has a rule for it. ``print`` and
+``println`` are the only built-in functions: each takes one ``:str``, writes it
+unchanged and returns ``:void``. Formatting a number as text is a job for the
+runtime, not for the checker, so an integer argument is a type mismatch rather
+than a conversion.
+
+Memory and ownership
+--------------------
+``(alloc T n)`` has type ``(own T)``: a block of n elements the program must
+release with ``(free p)``. ``(ptr p)`` gives the same address as a raw
+``(ptr T)``, which may be walked with ``(ptr-add p i)`` and read or written
+with ``(deref p)``/``(set-deref p v)``; only the owner may free, so a raw
+pointer is E0301 there.
+
+An owning value is not copied, it moves: into a binding, into a call's
+``(own T)`` parameter, into a struct field, out of a ``ret``, or through
+``free``. The binding left behind holds nothing, and reading it is E0300 —
+which is what makes a double free a compile error in the direct case. A move
+is only legal out of a ``letmut`` or a parameter (E0302): a plain ``let``
+promised to hold the same value for its whole scope, while ``free`` destroys
+the value rather than transferring it and so is allowed on any owning binding.
+Moves are tracked per binding and conservatively across branches: a name moved
+on any path counts as moved after the join, because the alternative would
+accept a second free on the other path. A copy the checker cannot see — through
+an aggregate, or from C — is what the runtime's double-free panic is for.
 
 Structs and fixed arrays
 ------------------------
@@ -99,8 +119,10 @@ from logos.diag import (
     CIRCULAR,
     DUPLICATE,
     FIELD_TYPE_MISMATCH,
+    FREE_NON_OWN,
     LITERAL_RANGE,
     MISSING_RETURN,
+    MOVE_IMMUTABLE,
     NOT_FOUND,
     NOT_MUTABLE,
     TYPE_MISMATCH,
@@ -108,6 +130,7 @@ from logos.diag import (
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
     UNKNOWN_TYPE,
+    USE_AFTER_MOVE,
     WRONG_ARITY,
     diag,
 )
@@ -326,8 +349,19 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
 
 @dataclass(slots=True)
 class _Var:
+    """One binding: its type, and what the checker knows about its value.
+
+    ``moved`` is the ownership state of an ``(own T)`` binding: once its value
+    has been transferred or released, the binding holds nothing and any read of
+    it is E0300. ``param`` records that the name arrived as a parameter, which
+    the callee owns outright — a parameter may be moved on, while a plain
+    ``let`` needs ``letmut`` before its value can be transferred (E0302).
+    """
+
     ty: Ty
     mutable: bool
+    moved: bool = False
+    param: bool = False
 
 
 class _Env:
@@ -361,11 +395,13 @@ class _Env:
         finally:
             self.scopes.pop()
 
-    def define(self, name: str, ty: Ty, *, mutable: bool, path: str) -> None:
+    def define(
+        self, name: str, ty: Ty, *, mutable: bool, path: str, param: bool = False
+    ) -> None:
         block = self.scopes[-1]
         if name in block:
             raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
-        block[name] = _Var(ty, mutable)
+        block[name] = _Var(ty, mutable, param=param)
 
     def lookup(self, name: str) -> _Var | None:
         for block in reversed(self.scopes):
@@ -536,7 +572,11 @@ class _Checker:
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
             env.define(
-                param_name, sig.params[index], mutable=False, path=param.path
+                param_name,
+                sig.params[index],
+                mutable=False,
+                path=param.path,
+                param=True,
             )
         self._body(node, _body_start(node), env)
 
@@ -568,7 +608,11 @@ class _Checker:
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
             inner.define(
-                param_name, sig.params[index], mutable=False, path=param.path
+                param_name,
+                sig.params[index],
+                mutable=False,
+                path=param.path,
+                param=True,
             )
         self._body(node, _body_start(node), inner)
 
@@ -630,6 +674,18 @@ class _Checker:
             return self._arr_get(node, env)
         if kind == "arr-set":
             return self._arr_set(node, env)
+        if kind == "alloc":
+            return self._alloc(node, env)
+        if kind == "free":
+            return self._free(node, env)
+        if kind == "ptr":
+            return self._ptr(node, env)
+        if kind == "deref":
+            return self._deref(node, env)
+        if kind == "set-deref":
+            return self._set_deref(node, env)
+        if kind == "ptr-add":
+            return self._ptr_add(node, env)
         head = node.items[0] if node.items else None
         if isinstance(head, Token) and head.kind == ATOM:
             return self._call(node, env)
@@ -656,6 +712,13 @@ class _Checker:
                 raise diag(UNKNOWN_NODE, where, f"type name '{token.value}' is not a value")
             var = env.lookup(token.value)
             if var is not None:
+                if var.moved:
+                    # The binding is empty: whatever it used to own has been
+                    # transferred or released, so reading it would read a
+                    # pointer into freed memory.
+                    raise diag(
+                        USE_AFTER_MOVE, where, f"use after move of '{token.value}'"
+                    )
                 return var.ty
             if token.value in ("true", "false"):
                 return Prim("bool")
@@ -770,6 +833,10 @@ class _Checker:
                 _at(init, node),
                 f"cannot bind '{name}' to a :void value",
             )
+        if isinstance(ty, Own):
+            # An owning pointer is not copied into a second binding: the
+            # initialiser's value moves here, and the old name is empty.
+            self._consume(init, env, node.path)
         env.define(
             name,
             declared if declared is not None else ty,
@@ -795,6 +862,11 @@ class _Checker:
                 _at(items[2], node),
                 f"cannot set '{name}' of type {var.ty} to {value}",
             )
+        if isinstance(var.ty, Own):
+            # Assigning to an owning binding moves the new value in, and
+            # re-arms a binding that was moved out of earlier.
+            self._consume(items[2], env, node.path)
+            var.moved = False
         return Prim("void")
 
     def _if(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
@@ -962,6 +1034,9 @@ class _Checker:
                 node.path,
                 f"{env.label} returns {env.ret}, found {value}",
             )
+        if isinstance(env.ret, Own):
+            # Returning an owning pointer hands it to the caller.
+            self._consume(args[0], env, node.path)
         return Prim("void")
 
     # -- structs and fixed arrays ----------------------------------------
@@ -1003,6 +1078,8 @@ class _Checker:
                         _at(item, node),
                         f"field '{field}' of '{ty.name}' expects {fty}, found {got}",
                     )
+                if isinstance(fty, Own):
+                    self._consume(item, env, node.path)
             return ty
         if isinstance(ty, Arr):
             if len(values) != ty.n:
@@ -1020,6 +1097,8 @@ class _Checker:
                         _at(item, node),
                         f"cannot store {got} in {ty}",
                     )
+                if isinstance(ty.elem, Own):
+                    self._consume(item, env, node.path)
             return ty
         if isinstance(ty, EnumRef):
             raise diag(
@@ -1091,6 +1170,8 @@ class _Checker:
                     _at(items[3], node),
                     f"field '{field}' of '{var.ty.name}' expects {fty}, found {got}",
                 )
+            if isinstance(fty, Own):
+                self._consume(items[3], env, node.path)
             return Prim("void")
         raise diag(
             UNKNOWN_FIELD,
@@ -1158,7 +1239,179 @@ class _Checker:
                 _at(items[3], node),
                 f"cannot store {got} in {var.ty}",
             )
+        if isinstance(var.ty.elem, Own):
+            self._consume(items[3], env, node.path)
         return Prim("void")
+
+    # -- memory ----------------------------------------------------------
+
+    def _alloc(self, node: Node, env: _Env) -> Ty:
+        """``(alloc T n)``: ``(own T)``, n elements of T on the heap.
+
+        The count is in elements, not bytes: the lowerer multiplies by the
+        element's size, which is the one place that knows the layout. Nothing
+        is initialised, because a block the program has not written is not a
+        value the language has a spelling for.
+        """
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "alloc takes a type and an element count"
+            )
+        elem, _ = _read_type_at(items, 1, self._types, node.path)
+        if _is_void(elem):
+            raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
+        count = self._value(items[2], env, None, node.path)
+        if not _integer(count):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"alloc count must be an integer, found {count}",
+            )
+        return Own(elem)
+
+    def _free(self, node: Node, env: _Env) -> Ty:
+        """``(free p)``: release a block and empty the binding that owned it.
+
+        Releasing is not a transfer, so it is legal on a plain ``let``: the
+        value is destroyed where it stands and nothing takes its place. A raw
+        pointer is E0301, because it is a view of memory somebody else owns and
+        freeing it would release a block twice or release what was never
+        allocated.
+        """
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "free takes one pointer")
+        ty = self._value(items[1], env, None, node.path)
+        if isinstance(ty, Ptr):
+            raise diag(
+                FREE_NON_OWN,
+                _at(items[1], node),
+                f"cannot free {ty}: it does not own its memory",
+            )
+        if not isinstance(ty, Own):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"free needs an (own T), found {ty}",
+            )
+        self._consume(items[1], env, node.path, release=True)
+        return Prim("void")
+
+    def _ptr(self, node: Node, env: _Env) -> Ty:
+        """``(ptr p)``: an owning pointer seen as a raw one.
+
+        The conversion is what makes a borrow explicit: the raw pointer may be
+        handed to code that cannot release, and the owner is still the one that
+        frees. Nothing moves, so the own binding stays usable.
+        """
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "ptr takes one owning pointer")
+        ty = self._value(items[1], env, None, node.path)
+        if isinstance(ty, Own):
+            return Ptr(ty.elem)
+        raise diag(
+            TYPE_MISMATCH,
+            _at(items[1], node),
+            f"ptr takes an owning pointer, found {ty}",
+        )
+
+    def _deref(self, node: Node, env: _Env) -> Ty:
+        """``(deref p)``: the T a pointer to T points at."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "deref takes one pointer")
+        ty = self._value(items[1], env, None, node.path)
+        elem = _pointee(ty)
+        if elem is None:
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"deref needs a pointer, found {ty}",
+            )
+        return elem
+
+    def _set_deref(self, node: Node, env: _Env) -> Ty:
+        """``(set-deref p v)``: store v where p points.
+
+        The binding that holds the pointer is not mutated — the memory behind
+        the pointer is — so this needs no ``letmut``, exactly like a field
+        write through a C pointer.
+        """
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "set-deref takes a pointer and a value")
+        ty = self._value(items[1], env, None, node.path)
+        elem = _pointee(ty)
+        if elem is None:
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"deref needs a pointer, found {ty}",
+            )
+        got = self._value(items[2], env, elem, node.path)
+        if not compatible(elem, got):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"cannot store {got} through {ty}",
+            )
+        if isinstance(elem, Own):
+            self._consume(items[2], env, node.path)
+        return Prim("void")
+
+    def _ptr_add(self, node: Node, env: _Env) -> Ty:
+        """``(ptr-add p n)``: the pointer n elements along.
+
+        The result is raw: an offset may point past the end of the block or
+        into the middle of an element, and only the caller knows which offsets
+        it will read, so the arithmetic always leaves the owning pointer behind.
+        """
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "ptr-add takes a pointer and an offset")
+        ty = self._value(items[1], env, None, node.path)
+        elem = _pointee(ty)
+        if elem is None:
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"ptr-add needs a pointer, found {ty}",
+            )
+        offset = self._value(items[2], env, None, node.path)
+        if not _integer(offset):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"pointer offset must be an integer, found {offset}",
+            )
+        return Ptr(elem)
+
+    def _consume(
+        self, item: Node | Token, env: _Env, where: str, *, release: bool = False
+    ) -> None:
+        """Move the value ``item`` names out of its binding.
+
+        Only a name has a binding to empty; a temporary is already unattached,
+        so a form is consumed by nobody and this is a no-op for it. A plain
+        ``let`` cannot be transferred from — the binding promised to hold the
+        same value for its whole scope — unless the move is a release, which
+        destroys the value rather than handing it on. A parameter may always be
+        moved, because its value was given up by the caller already.
+        """
+        if not (isinstance(item, Token) and item.kind == ATOM):
+            return
+        var = env.lookup(item.value)
+        if var is None or not isinstance(var.ty, Own) or var.moved:
+            return
+        if not release and not var.mutable and not var.param:
+            raise diag(
+                MOVE_IMMUTABLE,
+                where,
+                f"cannot move out of immutable binding '{item.value}'",
+            )
+        var.moved = True
 
     def _call(self, node: Node, env: _Env) -> Ty:
         name = node.kind
@@ -1192,6 +1445,10 @@ class _Checker:
                     _at(arg, node),
                     f"argument {index} of '{name}' expects {param}, found {ty}",
                 )
+            if isinstance(param, Own):
+                # The callee owns what it is handed: the argument moves into
+                # the parameter and the caller's binding is empty afterwards.
+                self._consume(arg, env, node.path)
         return sig.ret
 
 
@@ -1339,14 +1596,18 @@ def _clearly_type(item: Node | Token) -> bool:
     """Whether an item can only be a type, never a value.
 
     A bare atom is left out: it might be a variable, so a three-item ``let``
-    treats it as the initialiser. A colon atom, a marker or a type form has no
-    value reading.
+    treats it as the initialiser. A lone ``:`` marker and a ``:primitive`` have
+    no value reading at all. A composite *node* is deliberately not included:
+    ``(ptr p)`` is a type when ``p`` names a struct and a value when it names a
+    binding, and only the scope could tell them apart. An annotated binding
+    whose type is composite therefore carries the marker, ``(let x
+    :(own :i64) ...)``, which is the spelling the language prints anyway.
     """
     if _marker(item):
         return True
     if isinstance(item, Token):
         return item.kind == ATOM and item.value.startswith(":")
-    return item.kind in _TYPE_FORMS
+    return False
 
 
 def _body_start(node: Node) -> int:
@@ -1414,6 +1675,17 @@ def _numeric(ty: Ty) -> bool:
 def _integer(ty: Ty) -> bool:
     """Whether ``ty`` is an integer width — what a ``match`` can test."""
     return isinstance(ty, Prim) and ty.name in INTEGERS
+
+
+def _pointee(ty: Ty) -> Ty | None:
+    """The type a pointer points at, or ``None`` when ``ty`` is not a pointer.
+
+    An owning pointer and a raw pointer name the same element: which one you
+    hold decides who may free the block, not what a read through it returns.
+    """
+    if isinstance(ty, (Own, Ptr)):
+        return ty.elem
+    return None
 
 
 def _is_void(ty: Ty) -> bool:

@@ -44,7 +44,7 @@ from __future__ import annotations
 import re
 
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
-from logos.types import Arr, Prim, Ptr, StructRef, Ty
+from logos.types import Arr, Own, Prim, Ptr, StructRef, Ty
 
 #: Closed primitive spelling. ``:str`` is the frozen 16-byte fat pointer the
 #: spec defines; no value of it is lowered yet, but the layout is fixed.
@@ -112,12 +112,18 @@ def _named(sigil: str, name: str) -> str:
 
 
 def type_text(ty: Ty) -> str:
-    """Spell ``ty`` as an LLVM type, or raise ``ValueError`` with no layout."""
+    """Spell ``ty`` as an LLVM type, or raise ``ValueError`` with no layout.
+
+    A ``(ptr T)`` and an ``(own T)`` are the same machine value, ``T*``: the
+    difference between them is what the checker knows about it, not what the
+    backend stores. ``T`` still has to have a layout of its own, so the walk
+    that refuses an unlowered type descends through both before asking here.
+    """
     if isinstance(ty, Prim):
         spelled = _PRIM.get(ty.name)
         if spelled is not None:
             return spelled
-    if isinstance(ty, Ptr):
+    if isinstance(ty, (Ptr, Own)):
         return f"{type_text(ty.elem)}*"
     if isinstance(ty, Arr):
         return f"[{ty.n} x {type_text(ty.elem)}]"
@@ -296,6 +302,12 @@ class _Text:
             _, dest, from_ty, to_ty, value = instr
             return (
                 f"{dest} = {op} {type_text(from_ty)} {value} "
+                f"to {type_text(to_ty)}"
+            )
+        if op == "bitcast":
+            _, dest, from_ty, to_ty, value = instr
+            return (
+                f"{dest} = bitcast {type_text(from_ty)} {value} "
                 f"to {type_text(to_ty)}"
             )
         if op == "call":

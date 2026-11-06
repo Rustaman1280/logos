@@ -1,0 +1,6 @@
+(mod move)
+
+(fn f :void ()
+  (let p (alloc :i64 2))
+  (free p)
+  (free p))

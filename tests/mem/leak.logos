@@ -1,0 +1,39 @@
+(mod leak)
+
+(fn consume :void ((p (own :i64)))
+  (free p))
+
+(test no-leak
+  (expect (out "seven\n")
+    (code 0)
+    (leaks 0))
+  (let p (alloc :i64 4))
+  (set-deref p 7)
+  (println (match (deref p) (7 "seven")
+             (_ "other")))
+  (free p))
+
+(test array-elements
+  (expect (out "three\n")
+    (code 0)
+    (leaks 0))
+  (let p (alloc :i64 4))
+  (set-deref (ptr-add p 2) 3)
+  (println (match (deref (ptr-add p 2)) (3 "three")
+             (_ "other")))
+  (free p))
+
+(test handoff
+  (expect (out "ok\n")
+    (code 0)
+    (leaks 0))
+  (letmut p (alloc :i64 2))
+  (consume p)
+  (println "ok"))
+
+(test leak-reported
+  (expect (code 0)
+    (leaks 1)
+    (err-contains "LEAK"))
+  (let p (alloc :i64 4))
+  (set-deref p 1))

@@ -1,0 +1,5 @@
+(mod move-immutable)
+
+(fn f :void ()
+  (let p (alloc :i64 2))
+  (let q p))

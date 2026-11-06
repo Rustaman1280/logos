@@ -13,17 +13,21 @@ quote it.
 
 * ``R0001`` division by zero — emitted by the lowerer before every ``/`` and
   ``%`` that reaches a zero divisor.
-* ``R0002`` double free — reserved for the owning allocator; raised by the
-  runtime, not by the compiler.
+* ``R0002`` double free — raised by the runtime's leak tracker when a block is
+  handed back twice, or when a pointer it never allocated is freed. The message
+  is ``double free``; the path is the node that allocated the block, because a
+  pointer that has already been released no longer names anything.
 * ``R0003`` no match arm matched — emitted by the lowerer for a ``match`` on
   an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
   (E0600) once exhaustiveness is checked, and until then the unmatched path
   panics instead of returning a fabricated value. The same code is emitted for
-  an array index outside ``0..n``: both are runtime checks that cannot be
-  proven at compile time, and both panic with the node path of the operation.
-  It is reserved for checks of that kind (channel state and the rest).
+  an array index outside ``0..n``, for an allocation count whose byte size
+  would overflow, and for an allocation the allocator could not satisfy: all
+  are runtime checks that cannot be proven at compile time, and all panic with
+  the node path of the operation. It is reserved for checks of that kind
+  (channel state and the rest).
 
-R0002 and R0003 are runtime names only: nothing in the compiler emits R0002.
+R0002 is a runtime name only: nothing in the compiler emits it.
 """
 
 from __future__ import annotations
@@ -46,6 +50,9 @@ CODES = {
     "E0106": "integer literal out of range",
     "E0200": "unknown field",
     "E0201": "field type mismatch",
+    "E0300": "use after move",
+    "E0301": "free of a non-owning pointer",
+    "E0302": "move out of an immutable binding",
 }
 
 UNBALANCED = "E0001"
@@ -63,6 +70,9 @@ MISSING_RETURN = "E0105"
 LITERAL_RANGE = "E0106"
 UNKNOWN_FIELD = "E0200"
 FIELD_TYPE_MISMATCH = "E0201"
+USE_AFTER_MOVE = "E0300"
+FREE_NON_OWN = "E0301"
+MOVE_IMMUTABLE = "E0302"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

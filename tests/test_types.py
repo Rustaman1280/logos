@@ -755,11 +755,13 @@ class UnknownFormTest(unittest.TestCase):
         self.assertEqual(error.path, "m/f")
 
     def test_a_form_from_a_later_task_is_an_unknown_function(self):
+        # ``deref`` and ``alloc`` are forms now (Task 8); ``vec-push`` arrives
+        # with Task 9, so it is still only a name the checker has no rule for.
         error = expect_error(
-            "(mod m)(fn f :i64 ((p :(ptr :i32))) (ret (deref p)))", "E0103"
+            "(mod m)(fn f :i64 ((p :(ptr :i32))) (ret (vec-push p 1)))", "E0103"
         )
         self.assertEqual(error.path, "m/f/2/0")
-        self.assertIn("'deref'", error.message)
+        self.assertIn("'vec-push'", error.message)
 
 
 class CorpusTest(unittest.TestCase):

@@ -28,6 +28,7 @@ Opcode                     Tuple
 ``extractvalue``           ``(dest, agg_ty, elem_ty, agg, index)``
 ``gep``                    ``(dest, base_ty, base, ((ty, index), ...))``
 ``sext zext``              ``(dest, from_ty, to_ty, value)``
+``bitcast``                ``(dest, from_ty, to_ty, value)``
 ``phi``                    ``(dest, ty, ((value, label), ...))``
 ``trunc``                  ``(dest, from_ty, to_ty, value)``
 ``call``                   ``(dest, callee, (arg, ...))``
