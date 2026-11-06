@@ -1,4 +1,16 @@
-.superpowers/
+# Build output
 build/
+*.o
+*.ll
+*.out
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Agent working state
+.superpowers/
