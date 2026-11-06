@@ -1,0 +1,143 @@
+(mod strings)
+
+(test multiline
+  (expect (out "line one\nline two\n")
+    (code 0))
+  (println "line one\nline two"))
+
+(test byte-count
+  (expect (out "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\n300\n")
+    (code 0)
+    (leaks 0))
+  (let s "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")
+  (println s)
+  (println (str-len s)))
+
+(test multibyte-length
+  (expect (out "5\n")
+    (code 0))
+  (let s "é→")
+  (println (str-len s)))
+
+(test print-without-newline
+  (expect (out "ab")
+    (code 0))
+  (print "a")
+  (print "b"))
+
+(test concat
+  (expect (out "abcd\nempty:\n")
+    (code 0))
+  (println (str-concat "ab" "cd"))
+  (print "empty:")
+  (println (str-concat "" "")))
+
+(test concat-grows
+  (expect (out "100\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n")
+    (code 0))
+  (letmut s :str "")
+  (letmut i :i64 0)
+  (while (< i 100)
+    (set s (str-concat s "x"))
+    (set i (+ i 1)))
+  (println (str-len s))
+  (println s))
+
+(test slice
+  (expect (out "bcd\ndef\n\n")
+    (code 0))
+  (println (str-slice "abcdef" 1 4))
+  (println (str-slice "abcdef" 3 6))
+  (println (str-slice "abcdef" 2 2)))
+
+(test slice-of-a-computed-string
+  (expect (out "bcd\n")
+    (code 0))
+  (let s (str-concat "ab" "cdef"))
+  (println (str-slice s 1 4)))
+
+(test equality
+  (expect (out "true\nfalse\ntrue\nfalse\ntrue\ntrue\n")
+    (code 0))
+  (println (= "abc" "abc"))
+  (println (= "abc" "abd"))
+  (println (!= "abc" "abd"))
+  (println (= "abc" "abcd"))
+  (println (str-eq "abc" "abc"))
+  (println (str-eq "" "")))
+
+(test equality-through-names
+  (expect (out "true\nfalse\n")
+    (code 0))
+  (let a "hello")
+  (let b (str-concat "hel" "lo"))
+  (println (= a b))
+  (println (= a "hellp")))
+
+(test slice-out-of-bounds
+  (expect (code 2)
+    (err-contains "R0003: string slice out of bounds"))
+  (println (str-slice "abc" 1 9)))
+
+(test formats-signed
+  (expect (out "0\n-1\n9223372036854775807\n-9223372036854775808\n")
+    (code 0))
+  (println 0)
+  (println -1)
+  (println 9223372036854775807)
+  (println -9223372036854775808))
+
+(test formats-unsigned
+  (expect (out "18446744073709551615\n0\n")
+    (code 0))
+  (let big :u64 18446744073709551615)
+  (let zero :u64 0)
+  (println big)
+  (println zero))
+
+(test formats-floats
+  (expect (out "3.5\n0.5\n2\n-1.25\n0.1\n1e+300\n")
+    (code 0))
+  (println 3.5)
+  (println 0.5)
+  (println 2.0)
+  (println -1.25)
+  (println 0.1)
+  (println 1e300))
+
+(test formats-bools
+  (expect (out "true\nfalse\ntrue")
+    (code 0))
+  (println true)
+  (println false)
+  (print true))
+
+(test formats-a-binding
+  (expect (out "41\n")
+    (code 0))
+  (let n :i64 41)
+  (println n))
+
+(test nul-byte
+  (expect (out "a\0b\n3\n")
+    (code 0))
+  (let s "a\0b")
+  (println s)
+  (println (str-len s)))
+
+(test nul-is-not-a-terminator
+  (expect (out "true\nfalse\ntrue\n")
+    (code 0))
+  (println (= "a\0b" "a\0b"))
+  (println (= "a\0b" "a"))
+  (println (= (str-slice "a\0b" 2 3) "b")))
+
+(test slice-reversed
+  (expect (code 2)
+    (err-contains "R0003: string slice out of bounds"))
+  (println (str-slice "abc" 2 1)))
+
+(test slice-negative
+  (expect (code 2)
+    (err-contains "R0003: string slice out of bounds"))
+  (println (str-slice "abc" -1 2)))

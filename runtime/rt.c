@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -322,4 +323,175 @@ void rt_leak_report(void) {
         (void)rt_write(STDERR_FILENO, newline, sizeof newline - 1);
     }
     free(live_blocks);
+}
+
+/* ---------------------------------------------------------------------------
+ * Printing and formatting
+ *
+ * Output goes through rt_write, so it is exactly the bytes intended: no
+ * terminator is trusted, no format string interprets the data, and a NUL
+ * inside a string is written like any other byte.
+ * ------------------------------------------------------------------------- */
+
+/* The decimal digits of v, most significant first. Returns the count. */
+static size_t rt_format_u64(char *out, unsigned long long v) {
+    char digits[20];
+    size_t n = 0;
+    size_t i;
+
+    do {
+        digits[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    } while (v != 0);
+
+    for (i = 0; i < n; i++) {
+        out[i] = digits[n - 1 - i];
+    }
+    return n;
+}
+
+/* The decimal text of v, `-` included. Returns the count.
+ *
+ * The magnitude is taken as an unsigned value: negating INT64_MIN in a signed
+ * type is undefined, while `0 - (unsigned)v` is exactly 2^63. */
+static size_t rt_format_i64(char *out, long long v) {
+    unsigned long long magnitude;
+
+    if (v < 0) {
+        out[0] = '-';
+        magnitude = 0ULL - (unsigned long long)v;
+        return 1 + rt_format_u64(out + 1, magnitude);
+    }
+    return rt_format_u64(out, (unsigned long long)v);
+}
+
+/* The shortest decimal text that reads back as v, and its length.
+ *
+ * `%g` at fifteen significant digits already round-trips most values; the
+ * loop raises the precision until strtod returns the same double, so 0.1
+ * prints as `0.1` instead of `0.10000000000000001`. NaN never compares equal
+ * to itself, so it is returned as the first spelling tried. */
+static size_t rt_format_f64(char *out, size_t cap, double v) {
+    int precision;
+    size_t last = 0;
+
+    for (precision = 15; precision <= 17; precision++) {
+        int written = snprintf(out, cap, "%.*g", precision, v);
+        char *end = NULL;
+
+        if (written <= 0 || (size_t)written >= cap) {
+            return last;
+        }
+        last = (size_t)written;
+        if (v != v) {
+            /* NaN: there is no round trip to ask about. */
+            return last;
+        }
+        if (strtod(out, &end) == v && end != NULL && *end == '\0') {
+            return last;
+        }
+    }
+    return last;
+}
+
+void rt_print_str(const unsigned char *p, size_t n) {
+    if (n != 0) {
+        (void)rt_write(STDOUT_FILENO, p, n);
+    }
+}
+
+void rt_print_i64(long long v) {
+    char text[24];
+    size_t n = rt_format_i64(text, v);
+    (void)rt_write(STDOUT_FILENO, text, n);
+}
+
+void rt_print_u64(unsigned long long v) {
+    char text[20];
+    size_t n = rt_format_u64(text, v);
+    (void)rt_write(STDOUT_FILENO, text, n);
+}
+
+void rt_print_f64(double v) {
+    char text[40];
+    size_t n = rt_format_f64(text, sizeof text, v);
+    if (n != 0) {
+        (void)rt_write(STDOUT_FILENO, text, n);
+    }
+}
+
+void rt_println(void) {
+    static const char newline[] = "\n";
+    (void)rt_write(STDOUT_FILENO, newline, sizeof newline - 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * Strings built by the runtime
+ *
+ * These are not tracked by the leak tracker; see rt.h for why. A process that
+ * builds a string pays one malloc for it and never gives it back, which is
+ * the price of `:str` having no owner to hand it to.
+ * ------------------------------------------------------------------------- */
+
+/* A fresh, empty buffer with room for `cap` bytes. */
+static rt_str rt_str_new(size_t cap) {
+    rt_str s;
+
+    s.data = malloc(cap ? cap : 1);
+    if (s.data == NULL) {
+        rt_panic(NULL, "R0003", "out of memory");
+    }
+    s.len = 0;
+    s.cap = cap;
+    return s;
+}
+
+unsigned char *rt_str_concat(const unsigned char *a, size_t an,
+                             const unsigned char *b, size_t bn,
+                             size_t *out_len) {
+    rt_str s;
+    size_t total;
+
+    if (an > (size_t)-1 - bn) {
+        rt_panic(NULL, "R0003", "string length overflows");
+    }
+    total = an + bn;
+    s = rt_str_new(total);
+    if (an != 0) {
+        memcpy(s.data, a, an);
+    }
+    if (bn != 0) {
+        memcpy(s.data + an, b, bn);
+    }
+    s.len = total;
+    if (out_len != NULL) {
+        *out_len = s.len;
+    }
+    return s.data;
+}
+
+int rt_str_eq(const unsigned char *a, size_t an,
+              const unsigned char *b, size_t bn) {
+    if (an != bn) {
+        return 0;
+    }
+    if (an == 0) {
+        /* Two empty strings are equal wherever their data pointers point,
+         * including nowhere. */
+        return 1;
+    }
+    return memcmp(a, b, an) == 0;
+}
+
+unsigned char *rt_str_from_i64(long long v, size_t *out_len) {
+    char text[24];
+    size_t n = rt_format_i64(text, v);
+    rt_str s = rt_str_new(n);
+
+    memcpy(s.data, text, n);
+    s.len = n;
+    if (out_len != NULL) {
+        *out_len = n;
+    }
+    return s.data;
 }

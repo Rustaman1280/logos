@@ -167,25 +167,18 @@ class ControlFlowCheckTest(unittest.TestCase):
         )
         self.assertEqual(cm.expr_types[path_of(cm, "match")], Prim("i64"))
 
-    def test_string_equality_is_not_lowered_yet(self):
-        # A checker form with no lowering is a bug: string equality waits for
-        # Task 9's ``str-eq``, which adds the operator and the lowering together.
+    def test_string_equality_is_lowered_as_a_byte_comparison(self):
+        # The operator and its lowering landed together (Task 9): ``=`` on two
+        # strings is the same length test and ``memcmp`` that ``str-eq`` is.
         for op, source in (
             ("=", '(mod m)(fn f :bool () (ret (= "a" "b")))'),
             ("=", '(mod m)(fn f :bool ((s :str)) (ret (= s "a")))'),
             ("!=", '(mod m)(fn f :bool ((s :str)) (ret (!= s "a")))'),
         ):
             with self.subTest(source=source):
-                error = fail_on(source)
-                self.assertEqual(error.code, "E0100")
-                self.assertEqual(
-                    error.message,
-                    f"'{op}' on :str is not lowered yet: "
-                    "string comparison arrives with str-eq",
-                )
-        self.assertEqual(
-            fail_on('(mod m)(fn f :bool () (ret (= "a" "b")))').path, "m/f/2/0"
-        )
+                text = llvm.emit(lower.lower_module(checked(source)))
+                self.assertIn("call i32 @memcmp(i8*", text)
+                self.assertIn("icmp eq i64", text)
 
     def test_a_binding_from_an_if_branch_is_not_visible_after_the_join(self):
         error = fail_on(
@@ -396,7 +389,9 @@ class ControlFlowLoweringTest(unittest.TestCase):
         self.assertIn("insertvalue { i8*, i64 } %t", text)
         self.assertIn("extractvalue { i8*, i64 } %t", text)
         self.assertIn("store { i8*, i64 } %t", text)
-        self.assertEqual([c[2] for c in calls(m.functions[0])], ["rt_write", "rt_write"])
+        self.assertEqual(
+            [c[2] for c in calls(m.functions[0])], ["rt_print_str", "rt_println"]
+        )
 
     def test_a_str_value_carries_its_byte_count_not_its_character_count(self):
         m = lower.lower_module(
@@ -442,13 +437,15 @@ class ControlFlowLoweringTest(unittest.TestCase):
         self.assertIn("%v.1.addr = alloca i8", llvm.emit(m))
 
     def test_a_type_with_no_layout_is_e0002_not_a_value_error(self):
+        # ``(vec T)`` has a layout now (Task 9); ``(opt T)`` is the vocabulary
+        # this backend still cannot spell, and it must still be a diagnostic.
         with self.assertRaises(LogosError) as caught:
             lower.lower_module(
-                checked("(mod m)(fn f :void ((v :(vec :i64))) (ret))")
+                checked("(mod m)(fn f :void ((v :(opt :i64))) (ret))")
             )
         error = caught.exception
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(vec :i64) is not lowered yet")
+        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
         self.assertEqual(error.path, "m/f/1/0")
 
     def test_a_constant_true_loop_has_no_exit_edge(self):

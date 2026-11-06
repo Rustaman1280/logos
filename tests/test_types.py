@@ -504,12 +504,12 @@ class ComparisonTest(unittest.TestCase):
             "(mod m)(fn f :bool ((a :i64) (b :i64)) (ret (< a b)))"
         )
         self.assertEqual(checked.expr_types["m/f/2/0"], Prim("bool"))
-        # ``:str`` equality is Task 9's: until the ``str-eq`` operator and its
-        # lowering land together, the checker refuses it.
-        error = expect_error(
-            '(mod m)(fn f :bool ((a :str) (b :str)) (ret (= a b)))', "E0100"
+        # ``:str`` equality is accepted since Task 9: it is byte equality, and
+        # the lowerer emits the comparison that means it.
+        strings = check_src(
+            '(mod m)(fn f :bool ((a :str) (b :str)) (ret (= a b)))'
         )
-        self.assertIn("str-eq", error.message)
+        self.assertEqual(strings.expr_types["m/f/2/0"], Prim("bool"))
 
     def test_a_comparison_needs_matching_types(self):
         error = expect_error(
@@ -755,13 +755,13 @@ class UnknownFormTest(unittest.TestCase):
         self.assertEqual(error.path, "m/f")
 
     def test_a_form_from_a_later_task_is_an_unknown_function(self):
-        # ``deref`` and ``alloc`` are forms now (Task 8); ``vec-push`` arrives
-        # with Task 9, so it is still only a name the checker has no rule for.
+        # ``deref``, ``alloc`` and ``vec-push`` are forms now; ``ok`` arrives
+        # with results (Task 11), so it is still only a name with no rule.
         error = expect_error(
-            "(mod m)(fn f :i64 ((p :(ptr :i32))) (ret (vec-push p 1)))", "E0103"
+            "(mod m)(fn f :i64 ((p :i32)) (ret (ok p)))", "E0103"
         )
         self.assertEqual(error.path, "m/f/2/0")
-        self.assertIn("'vec-push'", error.message)
+        self.assertIn("'ok'", error.message)
 
 
 class CorpusTest(unittest.TestCase):

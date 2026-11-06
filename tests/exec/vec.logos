@@ -1,0 +1,183 @@
+(mod vec)
+
+(test empty
+  (expect (out "0\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (println (vec-len v)))
+
+(test push-and-get
+  (expect (out "3\n1\n2\n3\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (vec-push v 2)
+  (vec-push v 3)
+  (println (vec-len v))
+  (println (vec-get v 0))
+  (println (vec-get v 1))
+  (println (vec-get v 2))
+  (vec-free v))
+
+(test growth
+  (expect (out "100\n0\n50\n99\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (letmut i :i64 0)
+  (while (< i 100)
+    (vec-push v i)
+    (set i (+ i 1)))
+  (println (vec-len v))
+  (println (vec-get v 0))
+  (println (vec-get v 50))
+  (println (vec-get v 99))
+  (vec-free v))
+
+(test set
+  (expect (out "9\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (vec-push v 2)
+  (vec-set v 1 9)
+  (println (vec-get v 1))
+  (vec-free v))
+
+(test strings
+  (expect (out "b\n2\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :str)
+    (make (vec :str)))
+  (vec-push v "a")
+  (vec-push v (str-concat "b" ""))
+  (println (vec-get v 1))
+  (println (vec-len v))
+  (vec-free v))
+
+(test free
+  (expect (out "ok\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 7)
+  (vec-free v)
+  (println "ok"))
+
+(test free-an-empty-vector
+  (expect (out "ok\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-free v)
+  (println "ok"))
+
+(fn total :i64 ((v (vec :i64)) (n :i64))
+  (letmut i :i64 0)
+  (letmut sum :i64 0)
+  (while (< i n)
+    (set sum (+ sum (vec-get v i)))
+    (set i (+ i 1)))
+  (ret sum))
+
+(test read-across-a-call
+  (expect (out "10\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (vec-push v 2)
+  (vec-push v 3)
+  (vec-push v 4)
+  (println (total v 4))
+  (vec-free v))
+
+(test get-out-of-bounds
+  (expect (code 2)
+    (err-contains "R0003: vector index out of bounds"))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (println (vec-get v 0)))
+
+(test set-out-of-bounds
+  (expect (code 2)
+    (err-contains "R0003: vector index out of bounds"))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (vec-set v 3 9))
+
+(type point (struct (x :i64) (y :i64)))
+
+(test small-elements
+  (expect (out "true\n3\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec :i8)
+    (make (vec :i8)))
+  (vec-push v 1)
+  (vec-push v 2)
+  (vec-push v 3)
+  (println (= (vec-get v 2) 3))
+  (println (vec-len v))
+  (vec-free v))
+
+(test struct-elements
+  (expect (out "4\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec point)
+    (make (vec point)))
+  (vec-push v (make point 1 2))
+  (vec-push v (make point 3 4))
+  (println (get (vec-get v 1) y))
+  (vec-free v))
+
+(test nested
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (letmut inner
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push inner 7)
+  (letmut outer
+    (vec (vec :i64))
+    (make (vec (vec :i64))))
+  (vec-push outer inner)
+  (println (vec-get (vec-get outer 0) 0))
+  (vec-free inner)
+  (vec-free outer))
+
+(test growth-leak-is-reported
+  (expect (code 0)
+    (leaks 1)
+    (err-contains "LEAK 32 bytes"))
+  (letmut v
+    (vec :i64)
+    (make (vec :i64)))
+  (vec-push v 1)
+  (vec-push v 2))

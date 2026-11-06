@@ -54,8 +54,8 @@ quotes the name when it is not something LLVM reads unquoted.
 
 Ordering
 --------
-``globals`` are in first-use order, with the shared newline last, so the same
-source always produces the same module byte for byte.
+``globals`` are in first-use order, so the same source always produces the
+same module byte for byte.
 """
 
 from __future__ import annotations
@@ -66,11 +66,6 @@ from logos.types import Ty
 
 #: The one target this compiler produces code for.
 TRIPLE = "x86_64-unknown-linux-gnu"
-
-#: The global that holds ``println``'s trailing newline. It has a fixed name
-#: because it is not a literal from the source and must never collide with one.
-NEWLINE = ".str.nl"
-
 
 @dataclass(frozen=True, slots=True)
 class IrGlobal:

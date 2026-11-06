@@ -44,10 +44,11 @@ from __future__ import annotations
 import re
 
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
-from logos.types import Arr, Own, Prim, Ptr, StructRef, Ty
+from logos.types import Arr, Own, Prim, Ptr, StructRef, Ty, Vec
 
 #: Closed primitive spelling. ``:str`` is the frozen 16-byte fat pointer the
-#: spec defines; no value of it is lowered yet, but the layout is fixed.
+#: spec defines. A ``(vec T)`` is a literal three-word struct, so its layout is
+#: read off the type itself and needs no identified name.
 _PRIM = {
     "i8": "i8",
     "i16": "i16",
@@ -118,6 +119,12 @@ def type_text(ty: Ty) -> str:
     difference between them is what the checker knows about it, not what the
     backend stores. ``T`` still has to have a layout of its own, so the walk
     that refuses an unlowered type descends through both before asking here.
+
+    A ``(vec T)`` is three words in a literal struct, ``{ T*, i64, i64 }``:
+    the buffer, its length in elements and its capacity in elements. It is
+    spelled as a literal rather than an identified struct so two vectors of
+    different elements cannot share a name, and so the layout is read off the
+    type itself with no registry to keep in step.
     """
     if isinstance(ty, Prim):
         spelled = _PRIM.get(ty.name)
@@ -125,6 +132,8 @@ def type_text(ty: Ty) -> str:
             return spelled
     if isinstance(ty, (Ptr, Own)):
         return f"{type_text(ty.elem)}*"
+    if isinstance(ty, Vec):
+        return f"{{ {type_text(ty.elem)}*, i64, i64 }}"
     if isinstance(ty, Arr):
         return f"[{ty.n} x {type_text(ty.elem)}]"
     if isinstance(ty, StructRef):

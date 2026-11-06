@@ -3,7 +3,8 @@
 Every diagnostic code lives in ``CODES``. Passes import the code they report
 instead of spelling a literal, so ``E0001`` cannot mean two different things in
 two modules. ``E0001``-``E0006`` are the read-only passes (lexing, parsing,
-resolution); ``E01xx`` is the type checker.
+resolution); ``E01xx`` is the type checker, ``E02xx`` struct fields, ``E03xx``
+ownership, and ``E04xx`` the string and vector operations.
 
 Runtime codes
 -------------
@@ -18,15 +19,16 @@ quote it.
   allocated the block, because a pointer that has already been released no
   longer names anything. It is exactly that case: a free of an address no
   ``alloc`` ever produced is ``R0004``, not a double free.
-* ``R0003`` no match arm matched — emitted by the lowerer for a ``match`` on
+* ``R0003`` failed runtime check — emitted by the lowerer for a ``match`` on
   an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
   (E0600) once exhaustiveness is checked, and until then the unmatched path
   panics instead of returning a fabricated value. The same code is emitted for
-  an array index outside ``0..n``, for an allocation count whose byte size
-  would overflow, and for an allocation the allocator could not satisfy: all
-  are runtime checks that cannot be proven at compile time, and all panic with
-  the node path of the operation. It is reserved for checks of that kind
-  (channel state and the rest).
+  an index outside ``0..n`` — of a fixed array, of a vector, or of a string
+  slice — for an allocation count or a string length whose byte size would
+  overflow, and for an allocation the allocator could not satisfy: all are
+  runtime checks that cannot be proven at compile time, and all panic with the
+  node path of the operation. It is reserved for checks of that kind (channel
+  state and the rest).
 * ``R0004`` free of a pointer that was never allocated — raised by the same
   tracker when ``rt_free`` is handed an address this process never allocated.
   The location is ``<runtime>``: no ``alloc`` node made the block, so there is
@@ -60,6 +62,8 @@ CODES = {
     "E0300": "use after move",
     "E0301": "free of a non-owning pointer",
     "E0302": "move out of an immutable binding",
+    "E0400": "index type mismatch",
+    "E0401": "string not a str",
 }
 
 UNBALANCED = "E0001"
@@ -80,6 +84,8 @@ FIELD_TYPE_MISMATCH = "E0201"
 USE_AFTER_MOVE = "E0300"
 FREE_NON_OWN = "E0301"
 MOVE_IMMUTABLE = "E0302"
+INDEX_TYPE = "E0400"
+NOT_A_STR = "E0401"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

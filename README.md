@@ -27,8 +27,13 @@ structs with C layout (`make`, `get`, `set-field`) and fixed arrays
 time. Task 8 adds manual memory: `(alloc T n)` gives an `(own T)`, `free`
 releases it, `(ptr p)` takes a raw view, `deref`/`set-deref`/`ptr-add` read and
 walk it; an owning pointer moves, so a moved binding cannot be used again, and
-a debug build reports every block still live when `main` returns. Everything
-else reports a diagnostic at the construct.
+a debug build reports every block still live when `main` returns. Task 9 adds
+strings (`str-len`, `str-concat`, `str-eq`, `str-slice`, and `=` on `:str` as
+byte equality) and growable vectors (`(vec T)` with `make`, `vec-push`,
+`vec-len`, `vec-get`, `vec-set`, `vec-free`), and gives `print`/`println` a
+formatter for every scalar it prints: `:i64`, `:u64`, `:f64`, `:bool` and
+`:str`. A narrower integer still needs a cast, because nothing in the language
+converts implicitly. Everything else reports a diagnostic at the construct.
 
 ## Requirements
 

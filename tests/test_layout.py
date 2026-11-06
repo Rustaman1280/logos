@@ -371,7 +371,7 @@ class ArrayCheckTest(unittest.TestCase):
             "(mod m)(fn f :i64 ()"
             ' (let a (arr :i64 2) (make (arr :i64 2) 1 2)) (ret (arr-get a "x")))'
         )
-        self.assertEqual(error.code, "E0100")
+        self.assertEqual(error.code, "E0400")
         self.assertEqual(error.message, "array index must be an integer, found :str")
 
     def test_arr_set_needs_a_mutable_binding(self):
@@ -443,12 +443,14 @@ class StructLoweringTest(unittest.TestCase):
         self.assertIn("store i64 5, i64* %t", text)
 
     def test_a_struct_field_with_no_layout_is_e0002_at_the_use(self):
+        # ``(vec T)`` is lowerable now; ``(opt T)`` is not, and a field that
+        # names it must be refused where the struct is materialised.
         error = fail_on_lower(
-            "(mod m)(type box (struct (v (vec :i64))))"
+            "(mod m)(type box (struct (v (opt :i64))))"
             "(fn f :void ((b box)) (ret))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(vec :i64) is not lowered yet")
+        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
         self.assertEqual(error.path, "m/f/1/0")
 
     def test_a_void_field_is_e0002_at_the_use(self):

@@ -5,8 +5,10 @@ Scope
 This pass lowers what the check accepts: integer literals, ``let``/``letmut``
 and ``set``, ``ret``, calls, ``if``, ``while``, ``match``, ``break``/
 ``continue``, comparisons, ``and``/``or``/``not``, ``print``/``println`` over
-any ``:str`` value, checked integer division, structs (``make``, ``get``,
-``set-field``) and fixed arrays (``make``, ``arr-get``, ``arr-set``). A
+every printable scalar, checked integer division, structs (``make``, ``get``,
+``set-field``), fixed arrays (``make``, ``arr-get``, ``arr-set``), strings
+(``str-len``, ``str-concat``, ``str-eq``, ``str-slice``) and vectors
+(``make``, ``vec-push``, ``vec-len``, ``vec-get``, ``vec-set``, ``vec-free``). A
 construct the checker accepts but this pass does not lower yet is reported as
 a diagnostic at its own path — never a ``KeyError`` or a ``ValueError``, and
 never silently miscompiled.
@@ -52,13 +54,13 @@ the entry block, but the name is known only inside the block that declared it
 binding table on entry and restores it on exit, so a branch's ``let`` cannot
 retarget a later read of the same outer name.
 
-A declared type with no LLVM layout — ``(vec T)``, ``(res T E)`` and the rest
+A declared type with no LLVM layout — ``(res T E)``, ``(opt T)`` and the rest
 — is E0002 at the node that materialises it, never a ``ValueError`` from the
 printer: the type vocabulary is larger than this backend, and the refusal must
-carry a path. The walk descends through arrays *and* pointers, so a struct
-behind a ``(ptr T)`` cannot hide a field this backend cannot spell. A struct or
-an array is lowerable when every type inside it is; an enum is not, until
-results arrive.
+carry a path. The walk descends through arrays, vectors *and* pointers, so a
+struct behind a ``(ptr T)`` cannot hide a field this backend cannot spell. A
+struct, an array or a vector is lowerable when every type inside it is; an enum
+is not, until results arrive.
 
 Control flow
 ------------
@@ -110,11 +112,46 @@ by every use of the same bytes, and the value of type ``:str`` is the aggregate
 A literal builds it with two ``insertvalue`` steps from ``undef``; a ``:str``
 parameter, return or binding carries the whole aggregate, so one string can be
 passed through any number of functions without the pointer and the length
-coming apart. ``print``/``println`` extract both fields and hand them to one
-``rt_write``, never a ``printf`` format: the length is the value's own, not a
-scan for a terminator that was never written. A panic argument is the one
-exception: it is a NUL-terminated C string, because ``rt_panic`` reads it with
-``strlen``.
+coming apart. ``print``/``println`` hand the two fields to ``rt_print_str``,
+never a ``printf`` format: the length is the value's own, not a scan for a
+terminator that was never written. A panic argument is the one exception: it is
+a NUL-terminated C string, because ``rt_panic`` reads it with ``strlen``.
+
+``str-len`` reads the length field and costs nothing else. ``str-slice`` builds
+a view — the same buffer one ``gep`` along, with a shorter length — and copies
+no bytes; it checks both bounds against the length and against each other with
+three unsigned compares, then panics ``R0003``. ``str-concat`` is one call to
+``rt_str_concat``, which allocates the result for the process's life: a
+``:str`` owns nothing, so there is no one to hand the buffer back. ``str-eq``
+and ``=``/``!=`` on ``:str`` are the same lowering: compare the lengths, and
+only when they agree compare the bytes with ``memcmp``. ``!=`` inverts that
+answer.
+
+Vectors
+-------
+A ``(vec T)`` is three words, ``{ T*, i64, i64 }``: the buffer, its length in
+elements and its capacity. ``(make (vec T))`` builds the empty descriptor —
+null buffer, two zero counts — and every read is an ``extractvalue`` of the
+descriptor the binding holds.
+
+``vec-push`` may have to grow, so it is the one form here with a control-flow
+cost: it tests ``len == cap``, and on the full path allocates a new buffer with
+``rt_alloc``, copies the live elements with ``memcpy``, releases the old buffer
+with ``rt_free``, and joins with a ``phi`` carrying the new buffer and capacity.
+Capacity goes to twice itself plus four, so the first push allocates four
+elements and the copies a program pays for are logarithmic. Allocate and copy
+rather than ``realloc`` because every block's record belongs to the leak
+tracker: a buffer handed to ``realloc`` would leave the tracker describing an
+address it no longer controls, and a freed buffer would look live. Growth also
+checks that the new capacity is larger than the old one, so a wrapped value can
+never pass as a bigger buffer.
+
+The mutating forms — ``vec-push``, ``vec-set``, ``vec-free`` — name a
+``letmut`` binding, because they write the descriptor back into its slot;
+``vec-get`` and ``vec-len`` read any vector value, so a vector may be passed to
+a function and read there. ``vec-free`` releases the buffer and stores a
+zeroed descriptor, which makes a second free release NULL and a later length
+read zero.
 
 Memory
 ------
@@ -161,8 +198,11 @@ from logos.check import (
 from logos.diag import (
     ARRAY_BOUNDS,
     DIVISION_BY_ZERO,
+    INDEX_TYPE,
+    LITERAL_RANGE,
     MATCH_NO_ARM,
     MISSING_RETURN,
+    NOT_A_STR,
     NOT_FOUND,
     TYPE_MISMATCH,
     UNKNOWN_FIELD,
@@ -172,7 +212,6 @@ from logos.diag import (
     diag,
 )
 from logos.ir import (
-    NEWLINE,
     TRIPLE,
     IrBlock,
     IrDecl,
@@ -183,7 +222,7 @@ from logos.ir import (
 )
 from logos.lexer import ATOM, NUMBER, STRING, Token
 from logos.nodes import Node
-from logos.types import INTEGERS, Arr, Own, Prim, Ptr, StructRef, Ty
+from logos.types import INTEGERS, Arr, Own, Prim, Ptr, StructRef, Ty, Vec
 
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
@@ -213,6 +252,9 @@ _STATEMENTS = (
     "continue",
     "set-field",
     "arr-set",
+    "vec-push",
+    "vec-set",
+    "vec-free",
     "free",
     "set-deref",
 )
@@ -220,6 +262,10 @@ _STATEMENTS = (
 #: The one aggregate this backend builds by hand: the ``:str`` the spec fixes.
 _STR = Prim("str")
 _PTR_U8 = Ptr(Prim("u8"))
+
+#: What a printer accepts, and the entry point for each. ``:bool`` and ``:str``
+#: are handled separately: one has two spellings, the other is already bytes.
+_PRINTABLE = ("i64", "u64", "f64", "bool", "str")
 
 #: ``INT_MIN`` for every signed width, the dividend of the one overflowing
 #: division. ``INT_MIN / -1`` wraps to ``INT_MIN`` on x86-64; the hardware would
@@ -230,11 +276,6 @@ _INT_MIN = {
     "i32": -(2**31),
     "i64": -(2**63),
 }
-
-#: ``rt_write``'s C signature, spelled exactly: ``long (int, const void*, size_t)``.
-#: The return value is ignored, but the declaration has to match or the call is
-#: undefined behaviour at the ABI level.
-_RT_WRITE = IrDecl("rt_write", (Prim("i32"), Ptr(Prim("u8")), Prim("i64")), Prim("i64"))
 
 #: ``rt_panic``'s C signature: ``_Noreturn void (const char*, const char*, const char*)``.
 #: All three arguments are NUL-terminated C strings the compiler emits itself.
@@ -264,7 +305,34 @@ _VOID_PTR = Ptr(Prim("u8"))
 #: ``main`` returns a C exit status, whatever the Logos program says.
 _ENTRY_RET = Prim("i32")
 
-_STDOUT = "1"
+#: The printers. Each takes the value in its own native type — an ``i8*`` plus
+#: a length, an ``i64``, an ``unsigned long long`` (``i64`` in the IR, which has
+#: no signedness), a ``double`` — and writes formatted bytes to stdout.
+_RT_PRINT_STR = IrDecl("rt_print_str", (_VOID_PTR, Prim("i64")), Prim("void"))
+_RT_PRINT_I64 = IrDecl("rt_print_i64", (Prim("i64"),), Prim("void"))
+_RT_PRINT_U64 = IrDecl("rt_print_u64", (Prim("u64"),), Prim("void"))
+_RT_PRINT_F64 = IrDecl("rt_print_f64", (Prim("f64"),), Prim("void"))
+_RT_PRINTLN = IrDecl("rt_println", (), Prim("void"))
+
+#: ``unsigned char *rt_str_concat(a, an, b, bn, size_t *out_len)``. The length
+#: comes back through a pointer rather than in a returned struct: a three-word
+#: return would be lowered to an ``sret`` argument by the ABI, and a signature
+#: of scalars and pointers crosses it the same way in both languages.
+_RT_STR_CONCAT = IrDecl(
+    "rt_str_concat",
+    (_VOID_PTR, Prim("i64"), _VOID_PTR, Prim("i64"), Ptr(Prim("i64"))),
+    _VOID_PTR,
+)
+
+#: ``int memcmp(const void *a, const void *b, size_t n)``: the byte comparison
+#: inside ``str-eq``. Declared with its real signature so the call is not a
+#: lie about the C ABI; the result is the sign of the difference, and only its
+#: equality with zero is read.
+_MEMCMP = IrDecl("memcmp", (_VOID_PTR, _VOID_PTR, Prim("i64")), Prim("i32"))
+
+#: ``void *memcpy(void *dst, const void *src, size_t n)``: what a vector's
+#: growth uses to carry the old elements into the new buffer.
+_MEMCPY = IrDecl("memcpy", (_VOID_PTR, _VOID_PTR, Prim("i64")), _VOID_PTR)
 
 
 def lowered_type(
@@ -310,6 +378,13 @@ def _unlowered(
     if isinstance(ty, (Ptr, Own)):
         bad, _ = _unlowered(ty.elem, structs, stack)
         return bad, None
+    if isinstance(ty, Vec):
+        # A vector's element has to have a layout: ``(vec :void)`` has no
+        # storage for an element, and ``(vec (res ...))`` would print a struct
+        # the backend cannot spell.
+        if _is_void(ty.elem):
+            return ty.elem, None
+        return _unlowered(ty.elem, structs, stack)
     if isinstance(ty, Arr):
         if _is_void(ty.elem):
             return ty.elem, None
@@ -404,7 +479,6 @@ class _Lower:
         self.ir = IrModule(TRIPLE, [], [])
         self.strings: dict[bytes, str] = {}
         self.declares: list[IrDecl] = []
-        self.newline = False
         #: Structs a function materialises, in dependency-first order. A
         #: declaration nothing uses is not emitted: its layout may name a type
         #: this backend cannot spell, and a module should not fail to build
@@ -477,7 +551,7 @@ class _Lower:
                 self._collect(field, stack + (ty.name,))
             self.structs[ty.name] = fields
             llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
-        elif isinstance(ty, (Arr, Ptr, Own)):
+        elif isinstance(ty, (Arr, Ptr, Own, Vec)):
             self._collect(ty.elem, stack)
 
     def fn(self, name: str, node: Node) -> None:
@@ -514,13 +588,11 @@ class _Lower:
         self.ir.functions.append(fn)
 
     def close(self) -> IrModule:
-        """Finish the module: structs, then the shared newline and declarations."""
+        """Finish the module: its struct definitions, then its declarations."""
         self.ir.structs = [
             IrStruct(name, tuple(fty for _, fty in fields))
             for name, fields in self.structs.items()
         ]
-        if self.newline:
-            self.ir.globals.append(IrGlobal(NEWLINE, b"\n"))
         self.ir.declares = list(self.declares)
         return self.ir
 
@@ -657,6 +729,12 @@ class _Fn:
             self.set_field(node)
         elif kind == "arr-set":
             self.arr_set(node)
+        elif kind == "vec-push":
+            self.vec_push(node)
+        elif kind == "vec-set":
+            self.vec_set(node)
+        elif kind == "vec-free":
+            self.vec_free(node)
         elif kind == "set-deref":
             self.set_deref(node)
         elif kind == "free":
@@ -797,6 +875,14 @@ class _Fn:
         # A composite type may be written behind the ``:`` marker,
         # ``(make :(arr :i64 3) 1 2 3)``, which occupies its own item.
         start = 3 if _is_marker(items[1]) else 2
+        if isinstance(ty, Vec):
+            if len(items) > start:
+                raise diag(
+                    WRONG_ARITY,
+                    node.path,
+                    "a vector starts empty: make takes no elements",
+                )
+            return self.empty_vector(ty, node.path)
         values = [self.value(item, node.path) for item in items[start:]]
         if isinstance(ty, StructRef):
             fields = self.cm.structs.get(ty.name, ())
@@ -873,7 +959,7 @@ class _Fn:
         self.lowering.use_type(ty, node.path)
         place = self.place(items[1], ty, node.path)
         index = self.index64(items[2], node.path)
-        checked = self.bounds(ty.n, index, node.path)
+        checked = self.bounds(str(ty.n), index, node.path)
         address = self.temp()
         self.emit(("gep", address, ty, place, (("i64", "0"), ("i64", checked))))
         dest = self.temp()
@@ -899,11 +985,384 @@ class _Fn:
             )
         self.lowering.use_type(ty, node.path)
         index = self.index64(items[2], node.path)
-        checked = self.bounds(ty.n, index, node.path)
+        checked = self.bounds(str(ty.n), index, node.path)
         value = self.value(items[3], node.path)
         address = self.temp()
         self.emit(("gep", address, ty, slot, (("i64", "0"), ("i64", checked))))
         self.emit(("store", ty.elem, value, address))
+
+    # -- strings ----------------------------------------------------------
+
+    def str_parts(self, item: Node | Token, where: str) -> tuple[str, str]:
+        """The data pointer and the byte count of one ``:str`` value."""
+        ty = self.type_of_item(item, where)
+        if not (isinstance(ty, Prim) and ty.name == "str"):
+            raise diag(NOT_A_STR, _path_of(item, where), f"expected a :str, found {ty}")
+        whole = self.value(item, where)
+        pointer = self.temp()
+        self.emit(("extractvalue", pointer, _STR, _PTR_U8, whole, 0))
+        length = self.temp()
+        self.emit(("extractvalue", length, _STR, Prim("i64"), whole, 1))
+        return pointer, length
+
+    def str_value(self, pointer: str, length: str) -> str:
+        """One ``:str`` value from a data pointer and a byte count."""
+        partial = self.temp()
+        self.emit(("insertvalue", partial, _STR, "undef", _PTR_U8, pointer, 0))
+        whole = self.temp()
+        self.emit(("insertvalue", whole, _STR, partial, Prim("i64"), length, 1))
+        return whole
+
+    def str_eq_form(self, node: Node) -> str:
+        """``(str-eq a b)``: the same bytes comparison ``=`` lowers to."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'str-eq' takes two strings")
+        return self.str_compare(items[1], items[2], node.path)
+
+    def str_len(self, node: Node) -> str:
+        """``(str-len s)``: the byte count the value already carries."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'str-len' takes a :str")
+        _, length = self.str_parts(items[1], node.path)
+        return length
+
+    def str_compare(
+        self, left_item: Node | Token, right_item: Node | Token, path: str
+    ) -> str:
+        """Byte equality: the lengths, then ``memcmp`` of the bytes.
+
+        The length test comes first and the byte comparison only runs when the
+        two agree, so ``memcmp`` is never asked to read past the end of the
+        shorter string. Equal lengths and no difference is the definition of a
+        matching string; a difference in length is answered without touching
+        either buffer.
+        """
+        left_pointer, left_length = self.str_parts(left_item, path)
+        right_pointer, right_length = self.str_parts(right_item, path)
+        same = self.temp()
+        self.emit(("icmp", same, "eq", Prim("i64"), left_length, right_length))
+        self.labels += 1
+        tag = f"streq{self.labels}"
+        compare, differ, join = f"{tag}.bytes", f"{tag}.differ", f"{tag}.join"
+        self.block.term = ("cbr", same, compare, differ)
+        self.new_block(compare)
+        self.lowering.declare(_MEMCMP)
+        difference = self.temp()
+        self.emit(
+            ("call", difference, "memcmp", (left_pointer, right_pointer, left_length))
+        )
+        equal = self.temp()
+        self.emit(("icmp", equal, "eq", Prim("i32"), difference, "0"))
+        self.block.term = ("br", join)
+        self.new_block(differ)
+        self.block.term = ("br", join)
+        self.new_block(join)
+        dest = self.temp()
+        self.emit(("phi", dest, Prim("bool"), ((equal, compare), ("false", differ))))
+        return dest
+
+    def str_concat(self, node: Node) -> str:
+        """``(str-concat a b)``: one runtime call, one new buffer.
+
+        The sum is guarded against wrapping before the runtime sees it; the
+        runtime allocates the result for the process's life (see ``rt.h``) and
+        hands the length back through a slot, so the ``:str`` built here
+        carries the bytes the runtime actually produced.
+        """
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'str-concat' takes two strings")
+        left_pointer, left_length = self.str_parts(items[1], node.path)
+        right_pointer, right_length = self.str_parts(items[2], node.path)
+        total = self.temp()
+        self.emit(("add", total, Prim("i64"), left_length, right_length))
+        wrapped = self.temp()
+        self.emit(("icmp", wrapped, "ult", Prim("i64"), total, left_length))
+        self.labels += 1
+        tag = f"concat{self.labels}"
+        bad, ok = f"{tag}.overflow", f"{tag}.ok"
+        self.block.term = ("cbr", wrapped, bad, ok)
+        self.new_block(bad)
+        self.panic(node.path, ARRAY_BOUNDS, "string length overflows")
+        self.new_block(ok)
+        slot = self.slot(Prim("i64"), path=node.path)
+        self.lowering.declare(_RT_STR_CONCAT)
+        data = self.temp()
+        self.emit(
+            (
+                "call",
+                data,
+                "rt_str_concat",
+                (left_pointer, left_length, right_pointer, right_length, slot),
+            )
+        )
+        length = self.temp()
+        self.emit(("load", length, Prim("i64"), slot))
+        return self.str_value(data, length)
+
+    def str_slice(self, node: Node) -> str:
+        """``(str-slice s start end)``: bytes ``[start, end)``, as a view.
+
+        No bytes are copied: a ``:str`` is a fat pointer, so the slice is the
+        same buffer at an offset with a shorter length. Both bounds are checked
+        against the length and against each other — one unsigned compare each,
+        which also catches a negative bound — because a slice of a computed
+        string is only known at run time.
+        """
+        items = node.items
+        if len(items) != 4:
+            raise diag(
+                WRONG_ARITY, node.path, "'str-slice' takes a :str, a start and an end"
+            )
+        pointer, length = self.str_parts(items[1], node.path)
+        start = self.index64(items[2], node.path, "slice index")
+        end = self.index64(items[3], node.path, "slice index")
+        starts_inside = self.temp()
+        self.emit(("icmp", starts_inside, "ule", Prim("i64"), start, length))
+        ends_inside = self.temp()
+        self.emit(("icmp", ends_inside, "ule", Prim("i64"), end, length))
+        ordered = self.temp()
+        self.emit(("icmp", ordered, "ule", Prim("i64"), start, end))
+        both_inside = self.temp()
+        self.emit(("and", both_inside, Prim("bool"), starts_inside, ends_inside))
+        all = self.temp()
+        self.emit(("and", all, Prim("bool"), both_inside, ordered))
+        self.labels += 1
+        tag = f"slice{self.labels}"
+        bad, ok = f"{tag}.bad", f"{tag}.ok"
+        self.block.term = ("cbr", all, ok, bad)
+        self.new_block(bad)
+        self.panic(node.path, ARRAY_BOUNDS, "string slice out of bounds")
+        self.new_block(ok)
+        view = self.temp()
+        self.emit(("gep", view, Prim("u8"), pointer, (("i64", start),)))
+        size = self.temp()
+        self.emit(("sub", size, Prim("i64"), end, start))
+        return self.str_value(view, size)
+
+    # -- vectors ----------------------------------------------------------
+
+    def empty_vector(self, ty: Vec, path: str) -> str:
+        """An empty ``(vec T)``: no buffer, no length, no capacity."""
+        self.lowering.use_type(ty, path)
+        return self.vec_value(ty, "null", "0", "0")
+
+    def vec_value(self, ty: Vec, data: str, length: str, capacity: str) -> str:
+        """The three-word descriptor, built as a value."""
+        whole = "undef"
+        parts = ((Ptr(ty.elem), data), (Prim("i64"), length), (Prim("i64"), capacity))
+        for index, (field_ty, value) in enumerate(parts):
+            dest = self.temp()
+            self.emit(("insertvalue", dest, ty, whole, field_ty, value, index))
+            whole = dest
+        return whole
+
+    def vec_part(self, ty: Vec, whole: str, index: int) -> str:
+        """One field of a descriptor: 0 the buffer, 1 the length, 2 the capacity."""
+        field_ty = (Ptr(ty.elem), Prim("i64"), Prim("i64"))[index]
+        dest = self.temp()
+        self.emit(("extractvalue", dest, ty, field_ty, whole, index))
+        return dest
+
+    def vector(self, item: Node | Token, where: str, what: str) -> tuple[Vec, str]:
+        """A vector operand: its type and its descriptor value."""
+        ty = self.type_of_item(item, where)
+        if not isinstance(ty, Vec):
+            raise diag(
+                TYPE_MISMATCH,
+                _path_of(item, where),
+                f"'{what}' needs a (vec T), found {ty}",
+            )
+        return ty, self.value(item, where)
+
+    def vec_len(self, node: Node) -> str:
+        """``(vec-len v)``: the length field."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'vec-len' takes a vector")
+        ty, whole = self.vector(items[1], node.path, "vec-len")
+        return self.vec_part(ty, whole, 1)
+
+    def vec_get(self, node: Node) -> str:
+        """``(vec-get v i)``: bounds check the length, then ``load``."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'vec-get' takes a vector and an index")
+        ty, whole = self.vector(items[1], node.path, "vec-get")
+        self.lowering.use_type(ty.elem, node.path)
+        data = self.vec_part(ty, whole, 0)
+        length = self.vec_part(ty, whole, 1)
+        index = self.index64(items[2], node.path, "vector index")
+        checked = self.bounds(length, index, node.path, "vector index")
+        address = self.temp()
+        self.emit(("gep", address, ty.elem, data, (("i64", checked),)))
+        dest = self.temp()
+        self.emit(("load", dest, ty.elem, address))
+        return dest
+
+    def vec_set(self, node: Node) -> None:
+        """``(vec-set v i x)``: bounds check, ``gep``, ``store``.
+
+        The descriptor does not change, so only the element is written.
+        """
+        items = node.items
+        shape = "vec-set takes a mutable name, an index and a value"
+        ty, slot = self.vec_binding(node, 4, shape)
+        self.lowering.use_type(ty.elem, node.path)
+        whole = self.temp()
+        self.emit(("load", whole, ty, slot))
+        data = self.vec_part(ty, whole, 0)
+        length = self.vec_part(ty, whole, 1)
+        index = self.index64(items[2], node.path, "vector index")
+        checked = self.bounds(length, index, node.path, "vector index")
+        value = self.value(items[3], node.path)
+        address = self.temp()
+        self.emit(("gep", address, ty.elem, data, (("i64", checked),)))
+        self.emit(("store", ty.elem, value, address))
+
+    def vec_free(self, node: Node) -> None:
+        """``(vec-free v)``: release the buffer and zero the descriptor.
+
+        The zeroed descriptor is what makes a second ``vec-free`` harmless:
+        ``rt_free`` treats NULL as free(NULL), and a later ``vec-len`` reads
+        zero rather than a count of elements that no longer exist.
+        """
+        ty, slot = self.vec_binding(node, 2, "vec-free takes a mutable name")
+        self.lowering.use_type(ty.elem, node.path)
+        whole = self.temp()
+        self.emit(("load", whole, ty, slot))
+        data = self.vec_part(ty, whole, 0)
+        pointer = self.temp()
+        self.emit(("bitcast", pointer, Ptr(ty.elem), _VOID_PTR, data))
+        self.lowering.declare(_RT_FREE)
+        self.emit(("call", "", "rt_free", (pointer,)))
+        self.emit(("store", ty, "zeroinitializer", slot))
+
+    def vec_binding(self, node: Node, arity: int, shape: str) -> tuple[Vec, str]:
+        """The mutable vector binding a mutating form writes through."""
+        items = node.items
+        if len(items) != arity:
+            raise diag(WRONG_ARITY, node.path, shape)
+        if not isinstance(items[1], Token):
+            raise diag(WRONG_ARITY, node.path, shape)
+        binding = self.vars.get(items[1].value)
+        if binding is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{items[1].value}'")
+        ty, slot = binding
+        if not isinstance(ty, Vec):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                f"'{node.kind}' needs a (vec T), found {ty}",
+            )
+        return ty, slot
+
+    def vec_push(self, node: Node) -> None:
+        """``(vec-push v x)``: append, growing the buffer when it is full.
+
+        Growth is allocate, copy, release — ``rt_alloc``, ``memcpy`` and
+        ``rt_free`` — rather than a ``realloc``, because the leak tracker owns
+        every block's record: a block handed to ``realloc`` would leave the
+        tracker describing an address it no longer controls. With that shape
+        the old buffer is a released block, not a live one, so a debug build
+        reports nothing at exit.
+
+        The capacity goes to twice itself plus four, which makes the first push
+        allocate four elements and every later one at least double: the copies
+        a program pays for are logarithmic in its pushes. The sum is checked
+        against the old capacity so a wrapped value can never look like a
+        larger buffer.
+        """
+        items = node.items
+        ty, slot = self.vec_binding(
+            node, 3, "vec-push takes a mutable name and a value"
+        )
+        self.lowering.use_type(ty.elem, node.path)
+        value = self.value(items[2], node.path)
+        origin = self.block.label
+        current = self.temp()
+        self.emit(("load", current, ty, slot))
+        data = self.vec_part(ty, current, 0)
+        length = self.vec_part(ty, current, 1)
+        capacity = self.vec_part(ty, current, 2)
+        full = self.temp()
+        self.emit(("icmp", full, "eq", Prim("i64"), length, capacity))
+
+        self.labels += 1
+        tag = f"push{self.labels}"
+        grow, room, overflow, append = (
+            f"{tag}.grow",
+            f"{tag}.room",
+            f"{tag}.capacity",
+            f"{tag}.append",
+        )
+        self.block.term = ("cbr", full, grow, append)
+
+        self.new_block(grow)
+        doubled = self.temp()
+        self.emit(("mul", doubled, Prim("i64"), capacity, "2"))
+        bigger = self.temp()
+        self.emit(("add", bigger, Prim("i64"), doubled, "4"))
+        grew = self.temp()
+        self.emit(("icmp", grew, "ugt", Prim("i64"), bigger, capacity))
+        self.block.term = ("cbr", grew, room, overflow)
+        self.new_block(overflow)
+        self.panic(node.path, ARRAY_BOUNDS, "vector capacity overflows")
+
+        self.new_block(room)
+        size = sizeof_of(ty.elem, self.cm.structs)
+        self.no_overflow(bigger, size, node.path)
+        if size == 1:
+            bytes_ = bigger
+        else:
+            bytes_ = self.temp()
+            self.emit(("mul", bytes_, Prim("i64"), bigger, str(size)))
+        align = align_of(ty.elem, self.cm.structs)
+        self.lowering.declare(_RT_ALLOC)
+        raw = self.temp()
+        path = self._c_argument(node.path)
+        self.emit(("call", raw, "rt_alloc", (bytes_, str(align), path)))
+        fresh = self.temp()
+        self.emit(("bitcast", fresh, _VOID_PTR, Ptr(ty.elem), raw))
+        if size == 1:
+            copied_bytes = length
+        else:
+            copied_bytes = self.temp()
+            self.emit(("mul", copied_bytes, Prim("i64"), length, str(size)))
+        any_data = self.temp()
+        self.emit(("icmp", any_data, "ne", Ptr(ty.elem), data, "null"))
+        copy, copied = f"{tag}.copy", f"{tag}.copied"
+        self.block.term = ("cbr", any_data, copy, copied)
+        self.new_block(copy)
+        destination = self.temp()
+        self.emit(("bitcast", destination, Ptr(ty.elem), _VOID_PTR, fresh))
+        source = self.temp()
+        self.emit(("bitcast", source, Ptr(ty.elem), _VOID_PTR, data))
+        self.lowering.declare(_MEMCPY)
+        self.emit(("call", "", "memcpy", (destination, source, copied_bytes)))
+        self.block.term = ("br", copied)
+        self.new_block(copied)
+        stale = self.temp()
+        self.emit(("bitcast", stale, Ptr(ty.elem), _VOID_PTR, data))
+        self.lowering.declare(_RT_FREE)
+        self.emit(("call", "", "rt_free", (stale,)))
+        self.block.term = ("br", append)
+
+        self.new_block(append)
+        buffer = self.temp()
+        self.emit(("phi", buffer, Ptr(ty.elem), ((data, origin), (fresh, copied))))
+        room_now = self.temp()
+        self.emit(
+            ("phi", room_now, Prim("i64"), ((capacity, origin), (bigger, copied)))
+        )
+        address = self.temp()
+        self.emit(("gep", address, ty.elem, buffer, (("i64", length),)))
+        self.emit(("store", ty.elem, value, address))
+        bumped = self.temp()
+        self.emit(("add", bumped, Prim("i64"), length, "1"))
+        self.emit(("store", ty, self.vec_value(ty, buffer, bumped, room_now), slot))
 
     # -- memory ----------------------------------------------------------
 
@@ -1085,8 +1544,8 @@ class _Fn:
         ty = self.type_of_item(item, where)
         if not (isinstance(ty, Prim) and ty.name in INTEGERS):
             raise diag(
-                TYPE_MISMATCH,
-                where,
+                INDEX_TYPE,
+                _path_of(item, where),
                 f"{what} must be an integer, found {ty}",
             )
         if ty.name in ("i64", "u64"):
@@ -1096,22 +1555,30 @@ class _Fn:
         self.emit((op, dest, ty, Prim("i64"), value))
         return dest
 
-    def bounds(self, length: int, index: str, where: str) -> str:
+    def bounds(
+        self,
+        length: str,
+        index: str,
+        where: str,
+        what: str = "array index",
+    ) -> str:
         """Branch to ``rt_panic`` unless ``0 <= index < length``.
 
         One unsigned compare covers both ends: ``i64`` is the index's widened
-        type, and a negative value is above ``length`` once read unsigned. The
-        panic names the indexing node, so a program that dies here says which
-        ``arr-get`` was out of range.
+        type, and a negative value is above ``length`` once read unsigned.
+        ``length`` is an operand rather than a constant because a vector's
+        length is a field of a value the program built; an array's is the
+        literal its type spells. The panic names the indexing node, so a
+        program that dies here says which operation was out of range.
         """
         self.labels += 1
         tag = f"arr{self.labels}"
         ok, bad = f"{tag}.ok", f"{tag}.bad"
         test = self.temp()
-        self.emit(("icmp", test, "ult", Prim("i64"), index, str(length)))
+        self.emit(("icmp", test, "ult", Prim("i64"), index, length))
         self.block.term = ("cbr", test, ok, bad)
         self.new_block(bad)
-        self.panic(where, ARRAY_BOUNDS, "array index out of bounds")
+        self.panic(where, ARRAY_BOUNDS, f"{what} out of bounds")
         self.new_block(ok)
         return index
 
@@ -1140,6 +1607,18 @@ class _Fn:
             return self.get_field(item)
         if kind == "arr-get":
             return self.arr_get(item)
+        if kind == "str-len":
+            return self.str_len(item)
+        if kind == "str-concat":
+            return self.str_concat(item)
+        if kind == "str-eq":
+            return self.str_eq_form(item)
+        if kind == "str-slice":
+            return self.str_slice(item)
+        if kind == "vec-len":
+            return self.vec_len(item)
+        if kind == "vec-get":
+            return self.vec_get(item)
         if kind == "alloc":
             return self.alloc(item)
         if kind == "deref":
@@ -1166,11 +1645,7 @@ class _Fn:
     def literal(self, token: Token, where: str) -> str:
         if token.kind == NUMBER:
             if "." in token.value or "e" in token.value or "E" in token.value:
-                raise diag(
-                    UNKNOWN_NODE,
-                    where,
-                    f"float literal '{token.value}' is not lowered yet",
-                )
+                return _float_text(token.value, where)
             # The checker has proved the value fits the resolved width; the
             # spelling is normalised so ``+5`` and ``007`` are LLVM's ``5`` and
             # ``7``.
@@ -1228,6 +1703,12 @@ class _Fn:
             return self.type_of(item)
         if item.kind == STRING:
             return _STR
+        if item.kind == NUMBER:
+            # The same default the checker uses when nothing expects a width:
+            # a float literal is ``:f64`` and an integer literal is ``:i64``.
+            if "." in item.value or "e" in item.value or "E" in item.value:
+                return Prim("f64")
+            return Prim("i64")
         if item.kind == ATOM:
             binding = self.vars.get(item.value)
             if binding is not None:
@@ -1247,11 +1728,14 @@ class _Fn:
         A numeric literal has no width of its own — the checker gives it the
         type of the operand beside it — so ``(< 200 a)`` with ``a :u8`` is a
         ``:u8`` comparison. Only when every operand is a literal is the
-        checker's default, ``:i64``, the answer.
+        checker's default, ``:i64``, the answer. A string literal is ``:str``,
+        which is how ``(= "a" "b")`` reaches the byte comparison.
         """
         for item in items:
             if isinstance(item, Node):
                 return self.type_of(item)
+            if isinstance(item, Token) and item.kind == STRING:
+                return _STR
             if isinstance(item, Token) and item.kind == ATOM:
                 binding = self.vars.get(item.value)
                 if binding is not None:
@@ -1262,6 +1746,15 @@ class _Fn:
 
     def arith(self, node: Node) -> str:
         ty = self.type_of(node)
+        if isinstance(ty, Prim) and ty.name in _FLOATS:
+            # Formatting a float is in scope; arithmetic on one is not. An
+            # ``add`` over a double would be invalid IR, and silence would be
+            # worse than the refusal.
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'{node.kind}' on {ty} is not lowered by this backend yet",
+            )
         args = node.items[1:]
         acc = self.value(args[0], node.path)
         for arg in args[1:]:
@@ -1281,11 +1774,28 @@ class _Fn:
         ``i8`` comparison of ``1`` and ``a``; an unsigned width swaps the
         signed predicate for the unsigned one. ``:bool`` is comparable with
         ``=`` and ``!=`` only, which the checker has already enforced.
+
+        ``:str`` equality is not an ``icmp``: the operands are aggregates, so
+        it is the byte comparison :meth:`str_compare` emits. ``!=`` is that
+        answer, inverted.
         """
         items = node.items
         if len(items) != 3:
             raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes two operands")
         ty = self.operand_type(items[1:])
+        if isinstance(ty, Prim) and ty.name == "str":
+            if node.kind == "!=":
+                equal = self.str_compare(items[1], items[2], node.path)
+                dest = self.temp()
+                self.emit(("icmp", dest, "eq", Prim("bool"), equal, "false"))
+                return dest
+            if node.kind == "=":
+                return self.str_compare(items[1], items[2], node.path)
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'{node.kind}' on :str is not lowered by this backend yet",
+            )
         if not (isinstance(ty, Prim) and ty.name in INTEGERS + ("bool",)):
             raise diag(
                 UNKNOWN_NODE,
@@ -1566,42 +2076,74 @@ class _Fn:
         return dest
 
     def builtin(self, node: Node) -> str:
-        """``print``/``println``: one ``rt_write`` per byte range.
+        """``print``/``println``: format one value, then end the line.
 
-        The argument is any lowered ``:str`` — a literal, a binding, a call's
-        result or a ``match`` — so a program prints what it computed and not
-        only what it spelled. A literal skips the aggregate: its bytes and its
-        length are known here, and building a value only to take it apart again
-        would be work with no observable effect.
+        The argument keeps its own type and picks the entry point that already
+        knows how to spell it: ``rt_print_str`` for bytes and their length,
+        ``rt_print_i64``, ``rt_print_u64``, ``rt_print_f64``. A ``:bool`` is
+        the one value with two spellings, so it branches on it and prints
+        ``true`` or ``false`` — never its 0/1 representation, which is a fact
+        about ``i1`` and not about the language.
+
+        A string literal skips the aggregate: its bytes and its length are
+        known here, and building a value only to take it apart again would be
+        work with no observable effect.
         """
         items = node.items
         if len(items) != 2:
-            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes one :str")
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes one value")
         arg = items[1]
         ty = self.type_of_item(arg, node.path)
-        if not (isinstance(ty, Prim) and ty.name == "str"):
+        if not (isinstance(ty, Prim) and ty.name in _PRINTABLE):
             raise diag(
-                UNKNOWN_NODE, _where(arg, node), f"'{node.kind}' takes a :str, found {ty}"
+                TYPE_MISMATCH,
+                _path_of(arg, node.path),
+                f"'{node.kind}' takes one of :i64, :u64, :f64, :bool or :str, found {ty}",
             )
-        self.lowering.declare(_RT_WRITE)
-        if isinstance(arg, Token) and arg.kind == STRING:
-            data = arg.value.encode("utf-8")
+        if ty.name == "str":
+            self.print_string(arg, node.path)
+        elif ty.name == "bool":
+            self.print_bool(arg, node.path)
+        else:
+            decl = {
+                "i64": _RT_PRINT_I64,
+                "u64": _RT_PRINT_U64,
+                "f64": _RT_PRINT_F64,
+            }[ty.name]
+            self.lowering.declare(decl)
+            self.emit(("call", "", decl.name, (self.value(arg, node.path),)))
+        if node.kind == "println":
+            self.lowering.declare(_RT_PRINTLN)
+            self.emit(("call", "", "rt_println", ()))
+        return ""
+
+    def print_string(self, item: Node | Token, where: str) -> None:
+        """One ``:str`` through ``rt_print_str``, literal or computed."""
+        self.lowering.declare(_RT_PRINT_STR)
+        if isinstance(item, Token) and item.kind == STRING:
+            data = item.value.encode("utf-8")
             pointer = self.temp()
             self.emit(("gaddr", pointer, self.lowering.intern(data)))
             length = str(len(data))
         else:
-            whole = self.value(arg, node.path)
+            pointer, length = self.str_parts(item, where)
+        self.emit(("call", "", "rt_print_str", (pointer, length)))
+
+    def print_bool(self, item: Node | Token, where: str) -> None:
+        """``true`` or ``false``: two blocks, one per spelling."""
+        condition = self.value(item, where)
+        self.labels += 1
+        tag = f"bool{self.labels}"
+        yes, no, join = f"{tag}.true", f"{tag}.false", f"{tag}.join"
+        self.block.term = ("cbr", condition, yes, no)
+        for label, text in ((yes, b"true"), (no, b"false")):
+            self.new_block(label)
             pointer = self.temp()
-            self.emit(("extractvalue", pointer, _STR, _PTR_U8, whole, 0))
-            length = self.temp()
-            self.emit(("extractvalue", length, _STR, Prim("i64"), whole, 1))
-        self.emit(("call", "", "rt_write", (_STDOUT, pointer, length)))
-        if node.kind == "println":
-            self.lowering.newline = True
-            newline = self.temp()
-            self.emit(("gaddr", newline, NEWLINE))
-            self.emit(("call", "", "rt_write", (_STDOUT, newline, "1")))
-        return ""
+            self.emit(("gaddr", pointer, self.lowering.intern(text)))
+            self.lowering.declare(_RT_PRINT_STR)
+            self.emit(("call", "", "rt_print_str", (pointer, str(len(text)))))
+            self.block.term = ("br", join)
+        self.new_block(join)
 
     def panic(self, path: str, code: str, message: str) -> None:
         """Call ``rt_panic`` with three compiler-generated C strings.
@@ -1668,6 +2210,9 @@ def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
         return _SIZES.get(ty.name, 1)
     if isinstance(ty, (Ptr, Own)):
         return 8
+    if isinstance(ty, Vec):
+        # ``{ T*, i64, i64 }``: a buffer pointer and two counts.
+        return 24
     if isinstance(ty, Arr):
         return ty.n * sizeof_of(ty.elem, structs)
     if isinstance(ty, StructRef):
@@ -1696,6 +2241,9 @@ def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
         return min(_SIZES.get(ty.name, 1), 16)
     if isinstance(ty, (Ptr, Own)):
         return 8
+    if isinstance(ty, Vec):
+        # A pointer and two counts: the alignment is the pointer's.
+        return 8
     if isinstance(ty, Arr):
         return align_of(ty.elem, structs)
     if isinstance(ty, StructRef):
@@ -1723,5 +2271,31 @@ def _is_i64(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "i64"
 
 
-def _where(item: Node | Token, owner: Node) -> str:
-    return item.path if isinstance(item, Node) and item.path else owner.path
+def _path_of(item: Node | Token, where: str) -> str:
+    """The item's own node path, or ``where`` when a token has none."""
+    return item.path if isinstance(item, Node) and item.path else where
+
+
+def _float_text(text: str, where: str) -> str:
+    """Spell a float literal the way LLVM reads a ``double`` operand.
+
+    LLVM's decimal form needs a digit, a dot and then whatever exponent the
+    value has, so ``2.0`` stays ``2.0`` and ``1e300`` becomes ``1.0e+300``.
+    Python's ``repr`` is the shortest text that reads back as the same double,
+    which is also what the runtime prints, so a literal and the value it
+    formats agree.
+    """
+    value = float(text)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise diag(
+            LITERAL_RANGE, where, f"float literal '{text}' is not a finite :f64"
+        )
+    spelled = repr(value)
+    if "e" in spelled or "E" in spelled:
+        mantissa, _, exponent = spelled.partition("e")
+        if "." not in mantissa:
+            mantissa += ".0"
+        return f"{mantissa}e{exponent}"
+    if "." not in spelled:
+        return spelled + ".0"
+    return spelled

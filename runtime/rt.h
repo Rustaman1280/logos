@@ -90,6 +90,77 @@ size_t rt_leak_count(void);
  * Nothing at all when every block was released. */
 void rt_leak_report(void);
 
+/* ---------------------------------------------------------------------------
+ * Printing and formatting
+ *
+ * Every function here writes to standard output with rt_write, so a Logos
+ * program's output is exactly the bytes it asked for. `rt_print_str` takes a
+ * pointer and a length and never looks for a terminator: a Logos string is
+ * bytes, and a NUL inside one is data.
+ *
+ * Integers are formatted by hand, in a fixed buffer, with no locale. A double
+ * goes through snprintf, because the shortest text that reads back as the same
+ * value is not a loop worth writing by hand; the process never calls
+ * setlocale, so the C locale is the one in force. `2.0` prints as `2`, `0.1`
+ * as `0.1`, `1e300` as `1e+300`, and `inf`/`nan` for the non-finite values.
+ *
+ * A boolean prints as `true` or `false`, because that is the spelling the
+ * language has for it; its 0/1 representation never reaches the output.
+ * ------------------------------------------------------------------------- */
+
+/* Write n bytes of p to stdout. No NUL terminator is expected or added. */
+void rt_print_str(const unsigned char *p, size_t n);
+
+/* Write a signed 64-bit integer in decimal, `-` for a negative value. */
+void rt_print_i64(long long v);
+
+/* Write an unsigned 64-bit integer in decimal. A separate entry point
+ * because the signed one would print the top half of the range negative. */
+void rt_print_u64(unsigned long long v);
+
+/* Write a double: the shortest decimal text that reads back as the same
+ * value, with `inf`/`nan` for the non-finite ones. */
+void rt_print_f64(double v);
+
+/* Write one newline to stdout. */
+void rt_println(void);
+
+/* ---------------------------------------------------------------------------
+ * Strings built by the runtime
+ *
+ * A Logos `:str` is a fat pointer and owns nothing: it borrows its bytes, so a
+ * program has no way to release a buffer. A string the runtime builds (a
+ * concatenation, a formatted number) is therefore allocated for the life of
+ * the process and is deliberately NOT tracked by the leak tracker: reporting
+ * it would blame every program that ever concatenated for a leak it cannot
+ * fix. A block a program allocates itself still goes through rt_alloc and
+ * rt_free, and is still tracked.
+ *
+ * `rt_str` is the buffer those builders use internally: `data` holds `len`
+ * bytes in `cap` bytes of allocation.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    unsigned char *data;
+    size_t len;
+    size_t cap;
+} rt_str;
+
+/* Build a new string holding a's bytes followed by b's, and store its byte
+ * count in *out_len. Panics with R0003 if the two lengths do not fit a
+ * size_t or the allocator cannot satisfy the request. */
+unsigned char *rt_str_concat(const unsigned char *a, size_t an,
+                             const unsigned char *b, size_t bn,
+                             size_t *out_len);
+
+/* Whether two byte ranges are the same string: equal length, then equal
+ * bytes. NUL bytes inside either range are data, not terminators. */
+int rt_str_eq(const unsigned char *a, size_t an,
+              const unsigned char *b, size_t bn);
+
+/* Format v as decimal text in a new string and store its byte count. */
+unsigned char *rt_str_from_i64(long long v, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

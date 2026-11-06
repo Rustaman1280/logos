@@ -84,7 +84,7 @@ class HelloBuildTest(unittest.TestCase):
         text = Path(driver.ir_path(str(HELLO))).read_text(encoding="utf-8")
         self.assertIn('target triple = "x86_64-unknown-linux-gnu"', text)
         self.assertIn("define i32 @main()", text)
-        self.assertIn("declare i64 @rt_write(i32, i8*, i64)", text)
+        self.assertIn("declare void @rt_print_str(i8*, i64)", text)
         # The length is explicit and the bytes are exact: no NUL terminator is
         # invented for a language whose strings carry their own length.
         self.assertIn('[5 x i8] c"hello"', text)
@@ -141,26 +141,35 @@ class LoweringTest(unittest.TestCase):
         m = lower.lower_module(checked('(mod m)\n(fn main :void () (println "hello"))\n'))
         self.assertEqual(
             [(g.name, g.data) for g in m.globals],
-            [(".str0", b"hello"), (ir.NEWLINE, b"\n")],
+            [(".str0", b"hello")],
         )
         self.assertEqual(m.functions[0].blocks[0].term, ("ret", Prim("i32"), "0"))
 
     def test_println_writes_the_bytes_then_one_newline(self):
         m = lower.lower_module(checked('(mod m)\n(fn main :void () (println "hello"))\n'))
         written = calls(m.functions[0])
-        self.assertEqual([c[2] for c in written], ["rt_write", "rt_write"])
-        self.assertEqual([c[3][-1] for c in written], ["5", "1"])
+        self.assertEqual([c[2] for c in written], ["rt_print_str", "rt_println"])
+        # The length is the literal's own; the runtime is never asked to scan
+        # for a terminator that was never written.
+        self.assertEqual(written[0][3], (written[0][3][0], "5"))
+        self.assertEqual(written[1][3], ())
 
     def test_print_writes_the_bytes_once(self):
         m = lower.lower_module(checked('(mod m)\n(fn main :void () (print "hi"))\n'))
-        self.assertEqual([c[2] for c in calls(m.functions[0])], ["rt_write"])
+        self.assertEqual([c[2] for c in calls(m.functions[0])], ["rt_print_str"])
         self.assertEqual([(g.name, g.data) for g in m.globals], [(".str0", b"hi")])
 
-    def test_the_newline_global_is_shared_by_every_println(self):
+    def test_the_newline_is_a_runtime_call_not_a_shared_global(self):
+        # println used to write a shared ``\n`` global; the runtime owns that
+        # byte now, so two printlns share a call and emit no data of their own.
         m = lower.lower_module(
             checked('(mod m)\n(fn main :void () (println "a")\n(println "b"))\n')
         )
-        self.assertEqual([g.data for g in m.globals], [b"a", b"b", b"\n"])
+        self.assertEqual([g.data for g in m.globals], [b"a", b"b"])
+        self.assertEqual(
+            [c[2] for c in calls(m.functions[0])],
+            ["rt_print_str", "rt_println", "rt_print_str", "rt_println"],
+        )
 
     def test_an_empty_string_is_a_zero_length_global(self):
         m = lower.lower_module(checked('(mod m)\n(fn main :void () (print ""))\n'))
@@ -217,7 +226,7 @@ class LoweringTest(unittest.TestCase):
         self.assertIn("call i64 @lg.m.add", llvm.emit(m))
         self.assertEqual(
             [c[2] for c in calls(m.functions[1])],
-            ["lg.m.add", "rt_write", "rt_write"],
+            ["lg.m.add", "rt_print_str", "rt_println"],
         )
         self.assertEqual(len(calls(m.functions[1])[0][3]), 2)
 
@@ -331,9 +340,11 @@ class RunTestTest(unittest.TestCase):
 class BuiltinPrintTest(unittest.TestCase):
     """``print`` and ``println`` are checker builtins, not module functions."""
 
-    def test_println_of_an_integer_is_a_type_error(self):
+    def test_println_of_a_narrow_integer_is_a_type_error(self):
+        # An integer is printable at its formatted widths; one that needs an
+        # explicit cast is refused rather than silently widened.
         with self.assertRaises(LogosError) as caught:
-            checked('(mod m)\n(fn main :void () (println 1))\n')
+            checked("(mod m)\n(fn main :void ((n :i32)) (println n))\n")
         self.assertEqual(caught.exception.code, "E0100")
 
     def test_a_program_without_main_cannot_be_built(self):
@@ -364,7 +375,7 @@ class BuiltinPrintTest(unittest.TestCase):
         self.assertTrue(Path(out).is_file())
         self.assertTrue(Path(driver.ir_path(str(source))).is_file())
         source.write_text(
-            "(mod stale)\n\n(fn main :void ()\n  (println 1))\n", encoding="utf-8"
+            "(mod stale)\n\n(fn main :void ()\n  (println 1 2))\n", encoding="utf-8"
         )
         with self.assertRaises(LogosError):
             driver.build(str(source), out)
@@ -516,7 +527,7 @@ class SymbolTest(unittest.TestCase):
         text = Path(driver.ir_path(str(path))).read_text(encoding="utf-8")
         self.assertIn("define internal i64 @lg.inter.write(", text)
         self.assertIn("call i64 @lg.inter.write", text)
-        self.assertIn("declare i64 @rt_write(i32, i8*, i64)", text)
+        self.assertIn("declare void @rt_print_str(i8*, i64)", text)
         self.assertNotIn("define i64 @write", text)
 
     def test_main_stays_external_and_keeps_its_name(self):

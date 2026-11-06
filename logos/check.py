@@ -5,14 +5,27 @@ Scope
 This pass checks what the language has so far: primitives, arithmetic,
 comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
 ``while``, ``match``, ``break``/``continue``, ``ret``, calls, struct field
-access, fixed arrays and manual memory. A form from a later task
-(``vec-push``, ``ok``) is not special yet, so it reaches the call path and is
+access, fixed arrays, manual memory, strings and growable vectors. A form from
+a later task (``ok``) is not special yet, so it reaches the call path and is
 reported as an unknown function: the vocabulary grows one task at a time, and a
 name is only a built-in once this module has a rule for it. ``print`` and
-``println`` are the only built-in functions: each takes one ``:str``, writes it
-unchanged and returns ``:void``. Formatting a number as text is a job for the
-runtime, not for the checker, so an integer argument is a type mismatch rather
-than a conversion.
+``println`` are the built-in functions: each takes one value and writes it,
+formatted by the runtime. The value is any scalar with a formatter of its own —
+``:i64``, ``:u64``, ``:f64``, ``:bool``, ``:str`` — and nothing is converted to
+reach one, so a ``:i32`` is a type mismatch and not an implicit widening.
+
+Strings and vectors
+-------------------
+``:str`` is a fat pointer of bytes: ``(str-len s)`` is its byte count,
+``(str-concat a b)`` builds a new one, ``(str-slice s start end)`` is the bytes
+of ``[start, end)``, and ``(str-eq a b)`` is byte equality — the same answer
+``=`` gives, because ``=`` accepts ``:str`` too. ``(vec T)`` is a growable
+array: it starts empty at ``(make (vec T))``, grows with ``(vec-push v x)``,
+reads with ``(vec-len v)`` and ``(vec-get v i)``, and releases its buffer with
+``(vec-free v)``. The mutating forms — push, set, free — take a ``letmut``
+binding, because they rewrite the three-word descriptor that lives in it,
+exactly as ``arr-set`` rewrites the array in its own slot. An index that is not
+an integer is E0400 and a string operand that is not a ``:str`` is E0401.
 
 Memory and ownership
 --------------------
@@ -125,9 +138,11 @@ from logos.diag import (
     DUPLICATE,
     FIELD_TYPE_MISMATCH,
     FREE_NON_OWN,
+    INDEX_TYPE,
     LITERAL_RANGE,
     MISSING_RETURN,
     MOVE_IMMUTABLE,
+    NOT_A_STR,
     NOT_FOUND,
     NOT_MUTABLE,
     TYPE_MISMATCH,
@@ -453,15 +468,21 @@ class _Visible:
 #: lowerer skips them too, so the list is public rather than copied.
 DIRECTIVES = ("expect", "expect-leak")
 
-#: Functions the language provides without a definition. Both write a ``:str``
-#: unchanged and return nothing: a value that is not already text needs the
-#: runtime's formatter, which arrives with the rest of ``:str`` support. A
-#: module-level ``fn`` of one of these names shadows the builtin, because
-#: ``env.fns`` is consulted first.
-BUILTINS = {
-    "print": FnTy((Prim("str"),), Prim("void")),
-    "println": FnTy((Prim("str"),), Prim("void")),
-}
+#: The two printers. They are the only names the language provides without a
+#: definition, and they are overloaded over every scalar the runtime knows how
+#: to format, so their rule lives in :meth:`_Checker._printer` rather than in a
+#: single signature. A module-level ``fn`` of one of these names shadows the
+#: builtin, because ``env.fns`` is consulted first.
+PRINTERS = ("print", "println")
+
+#: What a printer accepts. Exactly the widths the runtime has a formatter for:
+#: ``:i64``, ``:u64``, ``:f64``, ``:bool`` and the ``:str`` it already printed.
+#: A narrower integer needs an explicit cast, because there is no implicit
+#: conversion anywhere in the language and printing is no exception.
+PRINTABLE = ("i64", "u64", "f64", "bool", "str")
+
+#: Built-in function names. A name is here once this module has a rule for it.
+BUILTINS = PRINTERS
 
 _ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "modulo"}
 _ORDERED = ("<", "<=", ">", ">=")
@@ -470,10 +491,9 @@ _EQUALITY = ("=", "!=")
 #: must be ``:bool`` and so is the result.
 _LOGICAL = ("and", "or")
 #: The only types ``=`` and ``!=`` accept: scalars, never :void or a function.
-#: ``:str`` is absent until the ``str-eq`` operator and its lowering land
-#: together (Task 9): a checker form the backend cannot emit is a bug, so
-#: string equality is refused here rather than compiled as a bogus ``icmp``.
-_SCALARS = INTEGERS + FLOATS + ("bool",)
+#: ``:str`` is one of them: equality is byte comparison, and the lowerer emits
+#: the length test and the byte comparison that mean it.
+_SCALARS = INTEGERS + FLOATS + ("bool", "str")
 
 #: Every integer width's inclusive range, so a literal can be refused at check
 #: time instead of being truncated by the backend.
@@ -695,6 +715,24 @@ class _Checker:
             return self._arr_get(node, env)
         if kind == "arr-set":
             return self._arr_set(node, env)
+        if kind == "str-len":
+            return self._str_len(node, env)
+        if kind == "str-concat":
+            return self._str_concat(node, env)
+        if kind == "str-eq":
+            return self._str_eq(node, env)
+        if kind == "str-slice":
+            return self._str_slice(node, env)
+        if kind == "vec-push":
+            return self._vec_push(node, env)
+        if kind == "vec-len":
+            return self._vec_len(node, env)
+        if kind == "vec-get":
+            return self._vec_get(node, env)
+        if kind == "vec-set":
+            return self._vec_set(node, env)
+        if kind == "vec-free":
+            return self._vec_free(node, env)
         if kind == "alloc":
             return self._alloc(node, env)
         if kind == "free":
@@ -816,17 +854,6 @@ class _Checker:
                 TYPE_MISMATCH,
                 _at(left_item, node),
                 f"'{node.kind}' needs numbers, found {left}",
-            )
-        if node.kind in _EQUALITY and isinstance(left, Prim) and left.name == "str":
-            # Equality of ``:str`` is not lowered yet: comparing the aggregate
-            # with an ``eq`` would emit an ``icmp`` over ``{ i8*, i64 }``. The
-            # operator and its lowering arrive together with Task 9's
-            # ``str-eq``, so every spelling is refused for now.
-            raise diag(
-                TYPE_MISMATCH,
-                _at(left_item, node),
-                f"'{node.kind}' on :str is not lowered yet: "
-                "string comparison arrives with str-eq",
             )
         if node.kind in _EQUALITY and not _scalar(left):
             raise diag(
@@ -1135,6 +1162,17 @@ class _Checker:
             raise diag(WRONG_ARITY, node.path, "make takes a type and its fields")
         ty, index = _read_type_at(items, 1, self._types, node.path)
         values = items[index:]
+        if isinstance(ty, Vec):
+            # A vector is born empty. There is no ``make``-with-elements form
+            # because the element count would then be a second way to spell
+            # what ``vec-push`` already says.
+            if values:
+                raise diag(
+                    WRONG_ARITY,
+                    node.path,
+                    "a vector starts empty: make takes no elements",
+                )
+            return ty
         if isinstance(ty, StructRef):
             fields = self._fields(ty, node.path)
             if len(values) != len(fields):
@@ -1268,7 +1306,7 @@ class _Checker:
         index = self._value(items[2], env, None, node.path)
         if not _integer(index):
             raise diag(
-                TYPE_MISMATCH,
+                INDEX_TYPE,
                 _at(items[2], node),
                 f"array index must be an integer, found {index}",
             )
@@ -1302,7 +1340,7 @@ class _Checker:
         index = self._value(items[2], env, None, node.path)
         if not _integer(index):
             raise diag(
-                TYPE_MISMATCH,
+                INDEX_TYPE,
                 _at(items[2], node),
                 f"array index must be an integer, found {index}",
             )
@@ -1315,6 +1353,191 @@ class _Checker:
             )
         if isinstance(var.ty.elem, Own):
             self._consume(items[3], env, node.path)
+        return Prim("void")
+
+    # -- strings ----------------------------------------------------------
+
+    def _str_operand(self, item: Node | Token, env: _Env, node: Node, what: str) -> Ty:
+        """One operand that must be a ``:str``, or E0401 at that operand."""
+        ty = self._value(item, env, None, node.path)
+        if not (isinstance(ty, Prim) and ty.name == "str"):
+            raise diag(NOT_A_STR, _at(item, node), f"'{what}' takes a :str, found {ty}")
+        return ty
+
+    def _index(self, item: Node | Token, env: _Env, node: Node, what: str) -> Ty:
+        """One operand that must be an integer width, or E0400 at it.
+
+        A separate code from a type mismatch because every indexing operation
+        shares it: an array index, a vector index and a slice bound are the
+        same rule, and a program that gets one wrong is told the same thing.
+        """
+        ty = self._value(item, env, None, node.path)
+        if not _integer(ty):
+            raise diag(
+                INDEX_TYPE, _at(item, node), f"{what} must be an integer, found {ty}"
+            )
+        return ty
+
+    def _str_len(self, node: Node, env: _Env) -> Ty:
+        """``(str-len s)``: the byte count, as ``:i64``.
+
+        Bytes, not characters: the language's strings are UTF-8 and its length
+        has always counted bytes, so ``"é→"`` is five.
+        """
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'str-len' takes a :str")
+        self._str_operand(items[1], env, node, "str-len")
+        return Prim("i64")
+
+    def _str_concat(self, node: Node, env: _Env) -> Ty:
+        """``(str-concat a b)``: a new string holding both, in order."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'str-concat' takes two strings")
+        self._str_operand(items[1], env, node, "str-concat")
+        self._str_operand(items[2], env, node, "str-concat")
+        return Prim("str")
+
+    def _str_eq(self, node: Node, env: _Env) -> Ty:
+        """``(str-eq a b)``: byte equality, the same answer as ``=``."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'str-eq' takes two strings")
+        self._str_operand(items[1], env, node, "str-eq")
+        self._str_operand(items[2], env, node, "str-eq")
+        return Prim("bool")
+
+    def _str_slice(self, node: Node, env: _Env) -> Ty:
+        """``(str-slice s start end)``: bytes ``[start, end)`` as a view.
+
+        Both bounds are checked against the length and against each other at
+        run time (R0003), because a slice of a string the program computed is
+        not something the checker can know.
+        """
+        items = node.items
+        if len(items) != 4:
+            raise diag(
+                WRONG_ARITY, node.path, "'str-slice' takes a :str, a start and an end"
+            )
+        self._str_operand(items[1], env, node, "str-slice")
+        self._index(items[2], env, node, "slice index")
+        self._index(items[3], env, node, "slice index")
+        return Prim("str")
+
+    # -- vectors ----------------------------------------------------------
+
+    def _vec_operand(self, item: Node | Token, env: _Env, node: Node, what: str) -> Vec:
+        """One operand that must be a ``(vec T)``, or E0100 at it."""
+        ty = self._value(item, env, None, node.path)
+        if not isinstance(ty, Vec):
+            raise diag(
+                TYPE_MISMATCH, _at(item, node), f"'{what}' needs a (vec T), found {ty}"
+            )
+        return ty
+
+    def _vec_target(
+        self, node: Node, env: _Env, *, arity: int, shape: str, verb: str
+    ) -> tuple[_Var, Vec]:
+        """The mutable vector binding a mutating vector form writes through.
+
+        A push may reallocate, so it changes the descriptor; a set writes
+        through the buffer but the descriptor stays. Either way the target is
+        a binding rather than a temporary — a temporary has no storage the new
+        descriptor could be written back to — and it needs ``letmut``, exactly
+        like ``arr-set``.
+        """
+        items = node.items
+        if len(items) != arity:
+            raise diag(WRONG_ARITY, node.path, shape)
+        if not isinstance(items[1], Token) or items[1].kind != ATOM:
+            raise diag(WRONG_ARITY, node.path, shape)
+        name = _name(items[1], node.path, node.kind)
+        var = env.lookup(name)
+        if var is None:
+            raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
+        if not var.mutable:
+            raise diag(
+                NOT_MUTABLE, node.path, f"cannot {verb} immutable binding '{name}'"
+            )
+        if not isinstance(var.ty, Vec):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"'{node.kind}' needs a (vec T), found {var.ty}",
+            )
+        return var, var.ty
+
+    def _vec_push(self, node: Node, env: _Env) -> Ty:
+        """``(vec-push v x)``: append one element, growing the buffer."""
+        var, ty = self._vec_target(
+            node,
+            env,
+            arity=3,
+            shape="vec-push takes a mutable name and a value",
+            verb="push to",
+        )
+        got = self._value(node.items[2], env, ty.elem, node.path)
+        if not compatible(ty.elem, got):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(node.items[2], node),
+                f"cannot push {got} into {ty}",
+            )
+        if isinstance(ty.elem, Own):
+            self._consume(node.items[2], env, node.path)
+        return Prim("void")
+
+    def _vec_len(self, node: Node, env: _Env) -> Ty:
+        """``(vec-len v)``: how many elements the vector holds, as ``:i64``."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'vec-len' takes a vector")
+        self._vec_operand(items[1], env, node, "vec-len")
+        return Prim("i64")
+
+    def _vec_get(self, node: Node, env: _Env) -> Ty:
+        """``(vec-get v i)``: one element, bounds-checked at run time."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "'vec-get' takes a vector and an index")
+        ty = self._vec_operand(items[1], env, node, "vec-get")
+        self._index(items[2], env, node, "vector index")
+        return ty.elem
+
+    def _vec_set(self, node: Node, env: _Env) -> Ty:
+        """``(vec-set v i x)``: replace one element in place."""
+        var, ty = self._vec_target(
+            node,
+            env,
+            arity=4,
+            shape="vec-set takes a mutable name, an index and a value",
+            verb="set",
+        )
+        self._index(node.items[2], env, node, "vector index")
+        got = self._value(node.items[3], env, ty.elem, node.path)
+        if not compatible(ty.elem, got):
+            raise diag(
+                TYPE_MISMATCH, _at(node.items[3], node), f"cannot store {got} in {ty}"
+            )
+        if isinstance(ty.elem, Own):
+            self._consume(node.items[3], env, node.path)
+        return Prim("void")
+
+    def _vec_free(self, node: Node, env: _Env) -> Ty:
+        """``(vec-free v)``: release the buffer, leaving the vector empty.
+
+        The descriptor is zeroed rather than left dangling, so a second free
+        releases nothing — ``rt_free`` treats NULL as free(NULL) — and a
+        subsequent length reads zero instead of a stale count.
+        """
+        self._vec_target(
+            node,
+            env,
+            arity=2,
+            shape="vec-free takes a mutable name",
+            verb="free",
+        )
         return Prim("void")
 
     # -- memory ----------------------------------------------------------
@@ -1487,6 +1710,31 @@ class _Checker:
             )
         var.moved = True
 
+    def _printer(self, node: Node, env: _Env) -> Ty:
+        """``print``/``println`` of one scalar the runtime formats.
+
+        Overloaded rather than converted: the argument keeps its own type and
+        the backend picks the entry point for it. A ``:i32`` is refused, not
+        widened, because the language has no implicit conversion — the day a
+        cast exists, the program says which width it means.
+        """
+        name = node.kind
+        args = node.items[1:]
+        if len(args) != 1:
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                f"function '{name}' takes 1 argument, got {len(args)}",
+            )
+        ty = self._value(args[0], env, None, node.path)
+        if not (isinstance(ty, Prim) and ty.name in PRINTABLE):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(args[0], node),
+                f"{name} takes one of :i64, :u64, :f64, :bool or :str, found {ty}",
+            )
+        return Prim("void")
+
     def _call(self, node: Node, env: _Env) -> Ty:
         name = node.kind
         var = env.lookup(name)
@@ -1499,8 +1747,8 @@ class _Checker:
         else:
             found = env.fns.get(name)
             if found is None:
-                found = BUILTINS.get(name)
-            if found is None:
+                if name in PRINTERS:
+                    return self._printer(node, env)
                 raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
             sig = found
         args = node.items[1:]
