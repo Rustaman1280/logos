@@ -197,6 +197,17 @@ class _Text:
             _, dest, pred, ty, left, right = instr
             spelled = type_text(ty)
             return f"{dest} = icmp {pred} {spelled} {left}, {right}"
+        if op == "insertvalue":
+            _, dest, agg_ty, agg, elem_ty, value, index = instr
+            return (
+                f"{dest} = insertvalue {type_text(agg_ty)} {agg}, "
+                f"{type_text(elem_ty)} {value}, {index}"
+            )
+        if op == "extractvalue":
+            _, dest, agg_ty, elem_ty, agg, index = instr
+            return (
+                f"{dest} = extractvalue {type_text(agg_ty)} {agg}, {index}"
+            )
         if op == "call":
             return self.call(instr)
         raise ValueError(f"unknown IR opcode '{op}'")

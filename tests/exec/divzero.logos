@@ -1,0 +1,17 @@
+(mod divzero)
+
+(fn zero :i64 ()
+  (let z :i64 0)
+  (ret z))
+
+(test div-by-zero-panics
+  (expect (code 2)
+    (err-contains "R0001: division by zero"))
+  (let q :i64 (/ 1 (zero)))
+  (println "after"))
+
+(test modulo-by-zero-panics
+  (expect (code 2)
+    (err-contains "R0001: division by zero"))
+  (let m :i64 (% 7 (zero)))
+  (println "after"))

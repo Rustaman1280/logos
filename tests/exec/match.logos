@@ -1,0 +1,25 @@
+(mod match)
+
+(fn classify :str ((n :i64))
+  (ret (match n (0 "zero") (1 "one") (-1 "minus") (_ "many"))))
+
+(test match-returns-a-value
+  (expect (out "zero\none\nminus\nmany\n")
+    (code 0))
+  (println (classify 0))
+  (println (classify 1))
+  (println (classify -1))
+  (println (classify 7)))
+
+(test match-arms-are-statements
+  (expect (out "low\nlow\nhigh\n")
+    (code 0))
+  (letmut i :i64 0)
+  (while (< i 3)
+    (match i (0 (println "low")) (1 (println "low")) (_ (println "high")))
+    (set i (+ i 1))))
+
+(test match-arm-has-a-block-body
+  (expect (out "two\n")
+    (code 0))
+  (println (match 2 (2 (let x :i64 2) (if (= x 2) "two" "other")) (_ "no"))))

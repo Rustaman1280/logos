@@ -317,6 +317,11 @@ class SignatureTest(unittest.TestCase):
         error = expect_error("(mod m)(fn f :i64 ((a :i64)) (set a 1) (ret a))", "E0104")
         self.assertEqual(error.path, "m/f/2")
 
+    def test_a_void_parameter_is_rejected(self):
+        error = expect_error("(mod m)(fn f :void ((a :void)) (println \"x\"))", "E0100")
+        self.assertEqual(error.path, "m/f/1/0")
+        self.assertEqual(error.message, "parameter 'a' cannot be :void")
+
     def test_a_repeated_parameter_is_a_duplicate(self):
         error = expect_error("(mod m)(fn f :i64 ((a :i64) (a :i64)) (ret a))", "E0003")
         self.assertEqual(error.path, "m/f/1/1")
@@ -606,6 +611,18 @@ class BindingTest(unittest.TestCase):
         error = expect_error("(mod m)(fn f :i64 () (let y :i64 1.0) (ret y))", "E0100")
         self.assertEqual(error.path, "m/f/2")
         self.assertIn(":f64", error.message)
+
+    def test_a_void_value_cannot_be_bound(self):
+        # ``print``, ``set``, ``while`` and a void ``if`` are statements: a
+        # binding of one has nothing to store and no type to allocate.
+        for source in (
+            '(mod m)(fn f :void () (let x (println "a")))',
+            "(mod m)(fn f :void () (letmut x :i64 1) (let y (set x 2)))",
+            "(mod m)(fn f :void () (let y (while true (println \"a\"))))",
+        ):
+            with self.subTest(source=source):
+                error = expect_error(source, "E0100")
+                self.assertIn("cannot bind", error.message)
 
     def test_a_second_binding_of_one_name_is_a_duplicate(self):
         error = expect_error("(mod m)(fn f :i64 () (let a 1) (let a 2) (ret a))", "E0003")

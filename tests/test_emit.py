@@ -188,7 +188,11 @@ class LoweringTest(unittest.TestCase):
         )
         fn = m.functions[0]
         self.assertEqual([name for name, _ in fn.params], ["v.0", "v.1"])
-        self.assertEqual(ops(fn), ["alloca", "store", "alloca", "store", "load", "load", "add"])
+        # Both slots are allocated first, then filled: an alloca belongs to the
+        # entry block, so a slot inside a loop is allocated once.
+        self.assertEqual(
+            ops(fn), ["alloca", "alloca", "store", "store", "load", "load", "add"]
+        )
         self.assertEqual(fn.blocks[0].term, ("ret", Prim("i64"), "%t3"))
         text = llvm.emit(m)
         self.assertIn(
@@ -557,12 +561,12 @@ class BuiltinShadowTest(unittest.TestCase):
         self.assertIn("call i64 @lg.shadow.print(i64 41)", text)
         self.assertNotIn("call i64 @rt_write", text)
 
-    def test_a_shadow_taking_str_never_falls_back_to_the_builtin(self):
-        """The review's probe: a ``:str`` parameter is not lowerable yet.
+    def test_a_shadow_taking_str_calls_the_user_function(self):
+        """The review's probe, now that ``:str`` values are lowered.
 
-        That limitation must surface as a diagnostic. Falling back to the
-        builtin is what made it silent: the call would print ``x`` and never
-        enter the user's function.
+        Falling back to the builtin made the bug silent: the call would print
+        ``x`` and never enter the user's function. Now the parameter carries
+        the aggregate, and only ``USER-FN`` may reach stdout.
         """
         source = (
             "(mod shadow)\n\n"
@@ -571,10 +575,15 @@ class BuiltinShadowTest(unittest.TestCase):
             "(fn main :void ()\n"
             '  (print "x"))\n'
         )
-        with self.assertRaises(LogosError) as caught:
-            lower.lower_module(checked(source))
-        self.assertEqual(caught.exception.code, "E0002")
-        self.assertIn("a :str value is not lowered yet", caught.exception.message)
+        path = write_source("shadow-str", source)
+        out = str(ROOT / "build" / "test-shadow-str")
+        driver.build(str(path), out)
+        r = run(out)
+        self.assertEqual(r.stdout, "USER-FN\n")
+        self.assertEqual(r.returncode, 0)
+        text = Path(driver.ir_path(str(path))).read_text(encoding="utf-8")
+        self.assertIn("define internal void @lg.shadow.print({ i8*, i64 } %v.0)", text)
+        self.assertIn("call void @lg.shadow.print({ i8*, i64 } %t", text)
 
 
 class IntegerWidthTest(unittest.TestCase):

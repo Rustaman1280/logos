@@ -3,14 +3,26 @@
 Scope
 -----
 This pass checks what the language has so far: primitives, arithmetic,
-comparisons, ``let``/``letmut``/``set``, ``if``, ``while``, ``ret`` and calls.
-A form from a later task (``deref``, ``alloc``, ``make``) is not special yet,
-so it reaches the call path and is reported as an unknown function: the
-vocabulary grows one task at a time, and a name is only a built-in once this
-module has a rule for it. ``print`` and ``println`` are the built-ins so far:
-each takes one ``:str``, writes it unchanged and returns ``:void``. Formatting a
-number as text is a job for the runtime, not for the checker, so an integer
-argument is a type mismatch rather than a conversion.
+comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
+``while``, ``match``, ``break``/``continue``, ``ret`` and calls. A form from a
+later task (``deref``, ``alloc``, ``make``) is not special yet, so it reaches
+the call path and is reported as an unknown function: the vocabulary grows one
+task at a time, and a name is only a built-in once this module has a rule for
+it. ``print`` and ``println`` are the built-ins so far: each takes one ``:str``,
+writes it unchanged and returns ``:void``. Formatting a number as text is a job
+for the runtime, not for the checker, so an integer argument is a type mismatch
+rather than a conversion.
+
+Control flow
+------------
+``if`` is an expression: both branches must have the same type and that type is
+the ``if``'s. ``while`` is a statement. ``match`` is an expression over an
+integer scrutinee whose arms are ``(pattern body...)``; a pattern is an integer
+literal or ``_``, every arm must have the same type, and the last item of a
+body is the arm's value. ``break`` and ``continue`` are statements with no
+operand and are only legal inside a loop, which this pass tracks as a depth on
+the enclosing environment: a helper ``fn`` starts at zero, because it is not
+inside the loop that lexically contains it.
 
 Purity
 ------
@@ -155,7 +167,14 @@ def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]]
         if name in names:
             raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
         names.add(name)
-        params.append((name, _read_type(item, types, param.path)))
+        ty = _read_type(item, types, param.path)
+        if compatible(ty, Prim("void")):
+            # A parameter is a storage location, and no ``void`` value exists
+            # to put in it; a backend that tried would emit ``void %v.0``.
+            raise diag(
+                TYPE_MISMATCH, param.path, f"parameter '{name}' cannot be :void"
+            )
+        params.append((name, ty))
     return ret, params, index + 1
 
 
@@ -187,6 +206,61 @@ def let_shape(
     return name, declared, items[index]
 
 
+def match_shape(
+    node: Node,
+) -> tuple[Node | Token, list[tuple[Node | Token, tuple[Node | Token, ...]]]]:
+    """A ``match``'s scrutinee and its arms, each a pattern and its body items.
+
+    The spelling is ``(match e (pat body...)...)``: every item after the
+    scrutinee is one arm, its first item is the pattern and the rest is the
+    body, whose last item is the arm's value. One reader because two readings
+    would drift: the checker validates the spine with it and the lowerer
+    re-reads the same spine with it.
+    """
+    items = node.items
+    if len(items) < 3:
+        raise diag(
+            WRONG_ARITY, node.path, "'match' takes a scrutinee and at least one arm"
+        )
+    arms: list[tuple[Node | Token, tuple[Node | Token, ...]]] = []
+    for item in items[2:]:
+        if not isinstance(item, Node):
+            raise diag(
+                UNKNOWN_NODE, node.path, "a match arm must be (pattern body...)"
+            )
+        if not item.items:
+            raise diag(
+                WRONG_ARITY, item.path, "a match arm needs a pattern and a body"
+            )
+        pattern = item.items[0]
+        if isinstance(pattern, Node):
+            raise diag(
+                UNKNOWN_NODE,
+                pattern.path,
+                "a match pattern is an integer literal or '_'",
+            )
+        if len(item.items) < 2:
+            raise diag(
+                WRONG_ARITY, item.path, "a match arm needs a pattern and a body"
+            )
+        if arms and is_wildcard(arms[-1][0]):
+            # ``_`` matches everything, so a later arm is dead source. Say so
+            # instead of compiling it: arms are tested in order and the reader
+            # is entitled to believe the last one they wrote can run.
+            raise diag(UNKNOWN_NODE, item.path, "an arm after '_' can never match")
+        arms.append((pattern, item.items[1:]))
+    return items[1], arms
+
+
+def is_wildcard(pattern: Node | Token) -> bool:
+    """Whether a match pattern is ``_``, the arm that always matches.
+
+    Public because the lowerer branches on it too: ``_`` is the one pattern
+    with no literal to compare against, so it never becomes a test block.
+    """
+    return isinstance(pattern, Token) and pattern.kind == ATOM and pattern.value == "_"
+
+
 @dataclass(slots=True)
 class _Var:
     ty: Ty
@@ -201,6 +275,9 @@ class _Env:
         self.vars: dict[str, _Var] = {}
         self.ret = ret
         self.label = label
+        #: How many loops enclose the form being checked. ``break`` and
+        #: ``continue`` are legal only when it is non-zero.
+        self.loop = 0
 
     def define(self, name: str, ty: Ty, *, mutable: bool, path: str) -> None:
         if name in self.vars:
@@ -243,6 +320,9 @@ BUILTINS = {
 _ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "modulo"}
 _ORDERED = ("<", "<=", ">", ">=")
 _EQUALITY = ("=", "!=")
+#: Short-circuiting boolean operators. They are not arithmetic: both operands
+#: must be ``:bool`` and so is the result.
+_LOGICAL = ("and", "or")
 #: The only types ``=`` and ``!=`` accept: scalars, never :void or a function.
 _SCALARS = INTEGERS + FLOATS + ("bool", "str")
 
@@ -412,6 +492,10 @@ class _Checker:
             return self._arith(node, env, expected)
         if kind in _ORDERED or kind in _EQUALITY:
             return self._compare(node, env)
+        if kind in _LOGICAL:
+            return self._logical(node, env)
+        if kind == "not":
+            return self._not(node, env)
         if kind in ("let", "letmut"):
             return self._let(node, env, mutable=kind == "letmut")
         if kind == "set":
@@ -420,6 +504,10 @@ class _Checker:
             return self._if(node, env, expected)
         if kind == "while":
             return self._while(node, env)
+        if kind == "match":
+            return self._match(node, env, expected)
+        if kind in ("break", "continue"):
+            return self._loop_jump(node, env)
         if kind == "ret":
             return self._ret(node, env)
         head = node.items[0] if node.items else None
@@ -542,6 +630,15 @@ class _Checker:
                 _at(init, node),
                 f"{node.kind} '{name}' has type {declared}, found {ty}",
             )
+        if _is_void(ty):
+            # ``let x (println "a")`` has nothing to store: every ``:void``
+            # form is a statement, and a backend that bound one would emit an
+            # ``alloca void`` that LLVM refuses.
+            raise diag(
+                TYPE_MISMATCH,
+                _at(init, node),
+                f"cannot bind '{name}' to a :void value",
+            )
         env.define(
             name,
             declared if declared is not None else ty,
@@ -601,11 +698,107 @@ class _Checker:
                 _at(args[0], node),
                 f"condition must be :bool, found {condition}",
             )
-        for statement in args[1:]:
-            if not isinstance(statement, Node):
-                raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
-            self._expr(statement, env)
+        # The body is inside a loop, so ``break`` and ``continue`` are legal
+        # here and return to zero as soon as the body ends: the depth is a
+        # property of the enclosing form, not of the function.
+        env.loop += 1
+        try:
+            for statement in args[1:]:
+                if not isinstance(statement, Node):
+                    raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
+                self._expr(statement, env)
+        finally:
+            env.loop -= 1
         return Prim("void")
+
+    def _loop_jump(self, node: Node, env: _Env) -> Ty:
+        """``(break)`` and ``(continue)``: no operand, no value, a live loop."""
+        if len(node.items) != 1:
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes no operands")
+        if env.loop == 0:
+            raise diag(UNKNOWN_NODE, node.path, f"'{node.kind}' outside a loop")
+        return Prim("void")
+
+    def _logical(self, node: Node, env: _Env) -> Ty:
+        args = node.items[1:]
+        if len(args) != 2:
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes two operands")
+        for arg in args:
+            operand = self._value(arg, env, Prim("bool"), node.path)
+            if not compatible(operand, Prim("bool")):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(arg, node),
+                    f"'{node.kind}' needs :bool operands, found {operand}",
+                )
+        return Prim("bool")
+
+    def _not(self, node: Node, env: _Env) -> Ty:
+        args = node.items[1:]
+        if len(args) != 1:
+            raise diag(WRONG_ARITY, node.path, "'not' takes one operand")
+        operand = self._value(args[0], env, Prim("bool"), node.path)
+        if not compatible(operand, Prim("bool")):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(args[0], node),
+                f"'not' needs a :bool operand, found {operand}",
+            )
+        return Prim("bool")
+
+    def _match(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        scrutinee, arms = match_shape(node)
+        ty = self._value(scrutinee, env, None, node.path)
+        if not _integer(ty):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(scrutinee, node),
+                f"'match' needs an integer, found {ty}",
+            )
+        result: Ty | None = None
+        for pattern, body in arms:
+            self._pattern(pattern, ty, node)
+            arm = self._arm(body, env, expected, node)
+            if result is None:
+                result = arm
+            elif not compatible(result, arm):
+                raise diag(
+                    TYPE_MISMATCH,
+                    node.path,
+                    f"match arms do not agree: {result} and {arm}",
+                )
+        # ``arms`` is non-empty: ``match_shape`` refuses a match without one.
+        return result  # type: ignore[return-value]
+
+    def _pattern(self, pattern: Node | Token, ty: Ty, owner: Node) -> None:
+        """One arm's pattern: an integer literal that fits ``ty``, or ``_``."""
+        where = _at(pattern, owner)
+        if not isinstance(pattern, Token):
+            raise diag(UNKNOWN_NODE, where, "a match pattern is an integer literal or '_'")
+        if pattern.kind == NUMBER:
+            got = _number(pattern, ty, where)
+            if not compatible(ty, got):
+                raise diag(
+                    TYPE_MISMATCH, where, f"a {got} pattern cannot test a {ty}"
+                )
+            return
+        if pattern.kind == ATOM and pattern.value == "_":
+            return
+        raise diag(UNKNOWN_NODE, where, "a match pattern is an integer literal or '_'")
+
+    def _arm(
+        self,
+        body: tuple[Node | Token, ...],
+        env: _Env,
+        expected: Ty | None,
+        owner: Node,
+    ) -> Ty:
+        """The type of one arm: its last item, after the statements before it."""
+        for statement in body[:-1]:
+            if not isinstance(statement, Node):
+                raise diag(UNKNOWN_NODE, owner.path, "a statement must be a form")
+            self._expr(statement, env)
+        return self._value(body[-1], env, expected, owner.path)
 
     def _ret(self, node: Node, env: _Env) -> Ty:
         args = node.items[1:]
@@ -877,6 +1070,15 @@ def _contains_ret(items: tuple[Node | Token, ...]) -> bool:
 
 def _numeric(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name in NUMBERS
+
+
+def _integer(ty: Ty) -> bool:
+    """Whether ``ty`` is an integer width — what a ``match`` can test."""
+    return isinstance(ty, Prim) and ty.name in INTEGERS
+
+
+def _is_void(ty: Ty) -> bool:
+    return isinstance(ty, Prim) and ty.name == "void"
 
 
 def _at(item: Node | Token, owner: Node) -> str:

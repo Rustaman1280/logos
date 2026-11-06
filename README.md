@@ -18,9 +18,11 @@ runtime in `runtime/`.
 Incremental build. Tasks 1-4 provide the scaffold, the command line skeleton,
 lexing, parsing, node paths, canonical printing, diagnostics, name resolution
 and the type checker. Task 5 adds the first backend: IR, the LLVM text emitter
-and the driver, so `build` produces a real ELF for the part of the language the
-lowerer covers — integer literals, `let`, `ret`, calls and `print`/`println`.
-Everything else reports `not implemented` or a diagnostic at the construct.
+and the driver, so `build` produces a real ELF. Task 6 adds control flow —
+`if`, `while`, `match`, `break`/`continue` — comparisons and boolean logic, and
+lowers `:str` as the 16-byte `{ i8*, i64 }` value the spec defines, so
+`print`/`println` take any string value and not only a literal. Everything else
+reports a diagnostic at the construct.
 
 ## Requirements
 

@@ -24,6 +24,8 @@ Opcode                     Tuple
 ``sdiv srem udiv urem``    ``(dest, ty, left, right)``
 ``and``                    ``(dest, ty, left, right)`` — on an ``i1``
 ``icmp``                   ``(dest, pred, ty, left, right)``
+``insertvalue``            ``(dest, agg_ty, agg, elem_ty, value, index)``
+``extractvalue``           ``(dest, agg_ty, elem_ty, agg, index)``
 ``phi``                    ``(dest, ty, ((value, label), ...))``
 ``trunc``                  ``(dest, from_ty, to_ty, value)``
 ``call``                   ``(dest, callee, (arg, ...))``

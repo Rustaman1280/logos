@@ -1,0 +1,44 @@
+(mod loops)
+
+(test fizzbuzz
+  (expect (out "n\nn\nfizz\nn\nn\nfizz\nn\nn\nfizz\nn\nn\nfizz\nn\nn\nfizz\n")
+    (code 0))
+  (letmut i :i64 1)
+  (while (<= i 15)
+    (println (match (% i 3) (0 "fizz")
+               (_ "n")))
+    (set i (+ i 1))))
+
+(test break-and-continue
+  (expect (out "body\nwait\nbody\nwait\nbody\nwait\nbody\nwait\nbody\ndone\n")
+    (code 0))
+  (letmut i :i64 0)
+  (while (< i 10)
+    (set i (+ i 1))
+    (if (= i 3)
+      (continue)
+      (println "body"))
+    (if (> i 5)
+      (break)
+      (println "wait")))
+  (println "done"))
+
+(test logic
+  (expect (out "yes\nok\n")
+    (code 0))
+  (letmut i :i64 0)
+  (while (and (< i 3)
+           (not (= i 2)))
+    (set i (+ i 1)))
+  (if (or (= i 2) false)
+    (println "yes")
+    (println "no"))
+  (if (and false (= (/ 1 0) 1))
+    (println "bad")
+    (println "ok")))
+
+(test if-value
+  (expect (out "small\nbig\n")
+    (code 0))
+  (println (if (< 1 2) "small" "big"))
+  (println (if (> 1 2) "small" "big")))

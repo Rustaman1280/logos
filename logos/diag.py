@@ -15,10 +15,13 @@ quote it.
   ``%`` that reaches a zero divisor.
 * ``R0002`` double free — reserved for the owning allocator; raised by the
   runtime, not by the compiler.
-* ``R0003`` failed runtime check — reserved for a runtime assertion (bounds,
-  channel state) that cannot be proven at compile time.
+* ``R0003`` failed runtime check — a runtime assertion (bounds, channel state)
+  that cannot be proven at compile time. The lowerer emits it for a ``match``
+  on an integer whose arms have no ``_``: Task 11 makes that a static
+  diagnostic (E0600) once exhaustiveness is checked, and until then the
+  unmatched path panics instead of returning a fabricated value.
 
-R0002 and R0003 are reserved names only: nothing emits them yet.
+R0002 and R0003 are runtime names only: nothing in the compiler emits R0002.
 """
 
 from __future__ import annotations
@@ -55,10 +58,14 @@ NOT_MUTABLE = "E0104"
 MISSING_RETURN = "E0105"
 LITERAL_RANGE = "E0106"
 
-#: The runtime panic code the lowerer emits for a division by zero. The other
-#: runtime codes (``R0002`` double free, ``R0003`` failed runtime check) are
-#: reserved in the module docstring and are raised by the runtime itself.
+#: The runtime panic code the lowerer emits for a division by zero. ``R0002``
+#: double free stays a runtime-only name; the other code the lowerer emits is
+#: ``MATCH_NO_ARM``.
 DIVISION_BY_ZERO = "R0001"
+
+#: The runtime check a ``match`` with no ``_`` arm reaches when no literal
+#: matches. Task 11 turns this into the static E0600 non-exhaustive match.
+MATCH_NO_ARM = "R0003"
 
 
 class LogosError(Exception):
