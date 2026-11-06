@@ -374,10 +374,13 @@ class _Fn:
             return self.arith(item)
         if kind in _PENDING or kind in ("let", "letmut", "ret"):
             self.pending(item)
-        if kind in BUILTINS:
-            return self.builtin(item)
+        # A module-level ``fn`` shadows a builtin: the checker resolves
+        # ``env.fns`` before ``BUILTINS``, so the lowerer must agree or a user
+        # ``print`` would check as their own function and lower as the builtin.
         if kind in self.cm.fn_sigs:
             return self.call(item)
+        if kind in BUILTINS:
+            return self.builtin(item)
         if kind == "":
             raise diag(UNKNOWN_NODE, item.path, "a form must start with a name")
         raise diag(

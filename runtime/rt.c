@@ -39,19 +39,19 @@ long rt_write(int fd, const void *buf, size_t len) {
 }
 
 _Noreturn void rt_panic(const char *path, const char *code, const char *msg) {
-    static const char prefix[] = "panic: ";
     static const char sep[] = ": ";
     static const char newline[] = "\n";
 
-    /* `code` is part of the fixed signature; rendering it into the line lands
-     * with the panic tests in a later task. */
-    (void)code;
-
+    /* One line, exactly `path: code: message`, so the node path leads and the
+     * stable runtime code is machine-greppable between it and the prose. */
     if (path != NULL) {
         (void)rt_write(STDERR_FILENO, path, strlen(path));
         (void)rt_write(STDERR_FILENO, sep, sizeof sep - 1);
     }
-    (void)rt_write(STDERR_FILENO, prefix, sizeof prefix - 1);
+    if (code != NULL) {
+        (void)rt_write(STDERR_FILENO, code, strlen(code));
+        (void)rt_write(STDERR_FILENO, sep, sizeof sep - 1);
+    }
     if (msg != NULL) {
         (void)rt_write(STDERR_FILENO, msg, strlen(msg));
     }

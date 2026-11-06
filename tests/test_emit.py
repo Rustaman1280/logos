@@ -398,8 +398,7 @@ class CheckedDivisionTest(unittest.TestCase):
             driver.build(str(path), out, opt=opt)
             r = run(out)
             self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn(where, r.stderr)
-            self.assertIn("division by zero", r.stderr)
+            self.assertEqual(r.stderr, f"{where}: R0001: division by zero\n")
             # The statement after the division must not run.
             self.assertNotIn("after", r.stdout)
 
@@ -416,7 +415,9 @@ class CheckedDivisionTest(unittest.TestCase):
         driver.build(str(path), out, opt="-O0")
         r = run(out)
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn(where, r.stderr)
+        self.assertEqual(
+            r.stderr, f"{where}: R0001: division by zero\n"
+        )
 
     def test_int_min_divided_by_minus_one_wraps(self):
         """``INT_MIN / -1`` is INT_MIN, not a hardware trap.
@@ -487,8 +488,7 @@ class CheckedDivisionTest(unittest.TestCase):
         driver.build(str(path), out, opt="-O0")
         r = run(out)
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn(where, r.stderr)
-        self.assertIn("division by zero", r.stderr)
+        self.assertEqual(r.stderr, f"{where}: R0001: division by zero\n")
 
 
 class SymbolTest(unittest.TestCase):
@@ -527,6 +527,54 @@ class SymbolTest(unittest.TestCase):
             checked("(mod m)\n(fn rt_write :i64 ((fd :i64)) (ret fd))\n")
         self.assertEqual(caught.exception.code, "E0003")
         self.assertEqual(caught.exception.message, "rt_ names are reserved")
+
+
+class BuiltinShadowTest(unittest.TestCase):
+    """A module-level ``fn`` named ``print``/``println`` wins over the builtin.
+
+    The checker has always resolved ``env.fns`` before ``BUILTINS``. The
+    lowerer used to do the reverse, so a program that defined its own ``print``
+    checked against its own signature and then silently emitted the builtin
+    instead: the user function was never called and no diagnostic appeared.
+    """
+
+    def test_a_user_print_is_called_instead_of_the_builtin(self):
+        source = (
+            "(mod shadow)\n\n"
+            "(fn print :i64 ((n :i64))\n"
+            "  (ret (+ n 1)))\n\n"
+            "(fn main :i64 ()\n"
+            "  (ret (print 41)))\n"
+        )
+        path = write_source("shadow", source)
+        out = str(ROOT / "build" / "test-shadow")
+        driver.build(str(path), out)
+        r = run(out)
+        # 42 only happens if @lg.shadow.print ran and returned its sum.
+        self.assertEqual(r.returncode, 42, r.stderr)
+        self.assertEqual(r.stdout, "")
+        text = Path(driver.ir_path(str(path))).read_text(encoding="utf-8")
+        self.assertIn("call i64 @lg.shadow.print(i64 41)", text)
+        self.assertNotIn("call i64 @rt_write", text)
+
+    def test_a_shadow_taking_str_never_falls_back_to_the_builtin(self):
+        """The review's probe: a ``:str`` parameter is not lowerable yet.
+
+        That limitation must surface as a diagnostic. Falling back to the
+        builtin is what made it silent: the call would print ``x`` and never
+        enter the user's function.
+        """
+        source = (
+            "(mod shadow)\n\n"
+            "(fn print :void ((s :str))\n"
+            '  (println "USER-FN"))\n\n'
+            "(fn main :void ()\n"
+            '  (print "x"))\n'
+        )
+        with self.assertRaises(LogosError) as caught:
+            lower.lower_module(checked(source))
+        self.assertEqual(caught.exception.code, "E0002")
+        self.assertIn("a :str value is not lowered yet", caught.exception.message)
 
 
 class IntegerWidthTest(unittest.TestCase):
