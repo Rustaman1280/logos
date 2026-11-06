@@ -1,5 +1,7 @@
 (mod leak)
 
+(type record (struct (tag :i32) (name :str)))
+
 (fn consume :void ((p (own :i64)))
   (free p))
 
@@ -37,3 +39,21 @@
     (err-contains "LEAK"))
   (let p (alloc :i64 4))
   (set-deref p 1))
+
+(test zero-byte-leak
+  (expect (code 0)
+    (leaks 1)
+    (err-contains "LEAK 0 bytes"))
+  (let p (alloc :i64 0)))
+
+(test struct-leak
+  (expect (code 0)
+    (leaks 1)
+    (err-contains "LEAK 24 bytes"))
+  (let p (alloc record 1)))
+
+(test wrapped-count-panics
+  (expect (code 2)
+    (err-contains "R0003: allocation size overflows"))
+  (let n (+ 9223372036854775807 1))
+  (let p (alloc :i64 n)))

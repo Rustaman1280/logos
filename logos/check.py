@@ -29,10 +29,15 @@ which is what makes a double free a compile error in the direct case. A move
 is only legal out of a ``letmut`` or a parameter (E0302): a plain ``let``
 promised to hold the same value for its whole scope, while ``free`` destroys
 the value rather than transferring it and so is allowed on any owning binding.
-Moves are tracked per binding and conservatively across branches: a name moved
-on any path counts as moved after the join, because the alternative would
-accept a second free on the other path. A copy the checker cannot see — through
-an aggregate, or from C — is what the runtime's double-free panic is for.
+Moves are tracked per binding and conservatively across branches: each
+``if`` branch, ``while`` body and ``match`` arm is checked from the ownership
+state as it was before the first branch, so one branch's move cannot make a
+sibling's use illegal. At the join a name counts as moved if *any* branch moved
+it, because the alternative would accept a second free on the path that did.
+``set`` does not re-arm a moved binding: assigning to one is E0300, since one
+path may already have released the old value and no path-local assignment can
+be trusted to have replaced it. A copy the checker cannot see — through an
+aggregate, or from C — is what the runtime's double-free panic is for.
 
 Structs and fixed arrays
 ------------------------
@@ -113,7 +118,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Callable, Iterator
 
 from logos.diag import (
     CIRCULAR,
@@ -409,6 +414,22 @@ class _Env:
             if var is not None:
                 return var
         return None
+
+    def snapshot(self) -> list[tuple[_Var, bool]]:
+        """The moved flag of every visible binding, outermost first.
+
+        Sibling branches are checked from one snapshot: restoring it before
+        each branch means one branch's move is invisible to the next, and the
+        join can union what each branch moved without having lost the state
+        they all started from.
+        """
+        return [(var, var.moved) for block in self.scopes for var in block.values()]
+
+    @staticmethod
+    def restore(snapshot: list[tuple[_Var, bool]]) -> None:
+        """Put every binding in ``snapshot`` back the way it was recorded."""
+        for var, moved in snapshot:
+            var.moved = moved
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,11 +884,41 @@ class _Checker:
                 f"cannot set '{name}' of type {var.ty} to {value}",
             )
         if isinstance(var.ty, Own):
-            # Assigning to an owning binding moves the new value in, and
-            # re-arms a binding that was moved out of earlier.
+            if var.moved:
+                # The old value may already have been released, and a write
+                # that happens to be on this path does not undo that: one
+                # branch's ``set`` cannot re-arm a binding another branch freed.
+                raise diag(
+                    USE_AFTER_MOVE, node.path, f"set of moved binding '{name}'"
+                )
+            # Assigning to an owning binding moves the new value in. The old
+            # value is gone, which is why this needs no ``letmut`` check on it.
             self._consume(items[2], env, node.path)
-            var.moved = False
         return Prim("void")
+
+    def _branches(self, env: _Env, branches: list[Callable[[], Ty]]) -> list[Ty]:
+        """Check sibling branches from one ownership state and join them.
+
+        Every branch starts from the state before the first branch, so a move
+        in one cannot make a sibling's use illegal: ``(if c (free p) (free p))``
+        is two independent releases on two paths, not a double free. After the
+        last branch the enclosing bindings are put back in the state they
+        started from, then marked moved if *any* branch moved them — whichever
+        path runs, the value may be gone, and the conservative join is the only
+        one that never accepts a read of memory that path released.
+        """
+        before = env.snapshot()
+        moved: set[int] = set()
+        results: list[Ty] = []
+        for branch in branches:
+            env.restore(before)
+            results.append(branch())
+            moved.update(id(var) for var, _ in before if var.moved)
+        env.restore(before)
+        for var, _ in before:
+            if id(var) in moved:
+                var.moved = True
+        return results
 
     def _if(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
         args = node.items[1:]
@@ -880,10 +931,16 @@ class _Checker:
                 _at(args[0], node),
                 f"condition must be :bool, found {condition}",
             )
-        with env.block():
-            then = self._value(args[1], env, expected, node.path)
-        with env.block():
-            otherwise = self._value(args[2], env, expected, node.path)
+
+        def then_branch() -> Ty:
+            with env.block():
+                return self._value(args[1], env, expected, node.path)
+
+        def else_branch() -> Ty:
+            with env.block():
+                return self._value(args[2], env, expected, node.path)
+
+        then, otherwise = self._branches(env, [then_branch, else_branch])
         if not compatible(then, otherwise):
             raise diag(
                 TYPE_MISMATCH,
@@ -905,20 +962,30 @@ class _Checker:
                 _at(args[0], node),
                 f"condition must be :bool, found {condition}",
             )
-        # The body is inside a loop, so ``break`` and ``continue`` are legal
-        # here and return to zero as soon as the body ends: the depth is a
-        # property of the enclosing form, not of the function.
-        env.loop += 1
-        try:
-            with env.block():
-                for statement in args[1:]:
-                    if not isinstance(statement, Node):
-                        raise diag(
-                            UNKNOWN_NODE, node.path, "a statement must be a form"
-                        )
-                    self._expr(statement, env)
-        finally:
-            env.loop -= 1
+
+        def body() -> Ty:
+            # The body is inside a loop, so ``break`` and ``continue`` are
+            # legal here and return to zero as soon as the body ends: the depth
+            # is a property of the enclosing form, not of the function.
+            env.loop += 1
+            try:
+                with env.block():
+                    for statement in args[1:]:
+                        if not isinstance(statement, Node):
+                            raise diag(
+                                UNKNOWN_NODE, node.path, "a statement must be a form"
+                            )
+                        self._expr(statement, env)
+            finally:
+                env.loop -= 1
+            return Prim("void")
+
+        # One "branch": the body runs zero or more times, and a value it freed
+        # may have been released on the iteration that ran, so after the loop a
+        # binding moved in the body counts as moved (the second iteration's
+        # free is then the runtime's R0002 to catch, since the loop is checked
+        # once).
+        self._branches(env, [body])
         return Prim("void")
 
     def _loop_jump(self, node: Node, env: _Env) -> Ty:
@@ -966,9 +1033,16 @@ class _Checker:
                 f"'match' needs an integer, found {ty}",
             )
         result: Ty | None = None
+        branches: list[Callable[[], Ty]] = []
         for pattern, body in arms:
             self._pattern(pattern, ty, node)
-            arm = self._arm(body, env, expected, node)
+            branches.append(
+                lambda body=body: self._arm(body, env, expected, node)
+            )
+        # Every arm is checked from the pre-match state and the arms' moves are
+        # unioned at the join: exactly one arm runs, but which one is not known
+        # here, so a value freed in any arm is gone afterwards.
+        for arm in self._branches(env, branches):
             if result is None:
                 result = arm
             elif not compatible(result, arm):

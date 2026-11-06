@@ -1,0 +1,8 @@
+(mod sibling-set)
+
+(fn f :void ((c :bool))
+  (letmut p (alloc :i64 2))
+  (if c
+    (free p)
+    (set p (alloc :i64 1)))
+  (let x :i64 (deref p)))

@@ -107,7 +107,7 @@ def build(
         if "main" not in cm.module.fns:
             raise BuildError(f"{src_path}: no 'main' function to build")
         module = lower.lower_module(cm, debug=debug)
-        return _link(module, ll, target, opt, keep_ir)
+        return _link(module, ll, target, opt, keep_ir, debug=debug)
     except BaseException:
         _discard(ll, Path(target))
         raise
@@ -130,21 +130,33 @@ def run_test(
     try:
         cm = check_module(load(src_path))
         module = lower.lower_test(cm, test_name, debug=debug)
-        return _link(module, ll, out, opt, True)
+        return _link(module, ll, out, opt, True, debug=debug)
     except BaseException:
         _discard(ll, Path(out))
         raise
 
 
 def _link(
-    module: IrModule, ll: Path, out: str, opt: str, keep_ir: bool
+    module: IrModule,
+    ll: Path,
+    out: str,
+    opt: str,
+    keep_ir: bool,
+    *,
+    debug: bool = False,
 ) -> str:
-    """Emit ``module`` to ``ll``, then hand both it and the runtime to clang."""
+    """Emit ``module`` to ``ll``, then hand both it and the runtime to clang.
+
+    ``debug`` also defines ``LOGOS_DEBUG`` for the C runtime. That is what makes
+    the runtime quarantine a released block instead of returning it to malloc,
+    so a freed address cannot be recycled and the double-free check stays exact.
+    """
     ll.parent.mkdir(parents=True, exist_ok=True)
     ll.write_text(llvm.emit(module), encoding="utf-8")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     command = [
         CLANG,
+        *(["-DLOGOS_DEBUG=1"] if debug else []),
         opt,
         "-target",
         TRIPLE,

@@ -14,9 +14,10 @@ quote it.
 * ``R0001`` division by zero — emitted by the lowerer before every ``/`` and
   ``%`` that reaches a zero divisor.
 * ``R0002`` double free — raised by the runtime's leak tracker when a block is
-  handed back twice, or when a pointer it never allocated is freed. The message
-  is ``double free``; the path is the node that allocated the block, because a
-  pointer that has already been released no longer names anything.
+  handed back twice. The message is ``double free``; the path is the node that
+  allocated the block, because a pointer that has already been released no
+  longer names anything. It is exactly that case: a free of an address no
+  ``alloc`` ever produced is ``R0004``, not a double free.
 * ``R0003`` no match arm matched — emitted by the lowerer for a ``match`` on
   an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
   (E0600) once exhaustiveness is checked, and until then the unmatched path
@@ -26,8 +27,14 @@ quote it.
   are runtime checks that cannot be proven at compile time, and all panic with
   the node path of the operation. It is reserved for checks of that kind
   (channel state and the rest).
+* ``R0004`` free of a pointer that was never allocated — raised by the same
+  tracker when ``rt_free`` is handed an address this process never allocated.
+  The location is ``<runtime>``: no ``alloc`` node made the block, so there is
+  no node path to name.
 
-R0002 is a runtime name only: nothing in the compiler emits it.
+R0002 and R0004 are runtime names only: nothing in the compiler emits them.
+A runtime check with no node behind it prints ``<runtime>`` in the location
+field, so a panic line always starts with a location.
 """
 
 from __future__ import annotations
@@ -86,6 +93,11 @@ MATCH_NO_ARM = "R0003"
 #: The runtime check an array index outside ``0..n`` reaches. The same code as
 #: an unmatched ``match``: both are bounds that only the running program knows.
 ARRAY_BOUNDS = "R0003"
+
+#: The runtime code for ``free`` of an address no ``alloc`` produced. Like
+#: ``R0002`` it is a runtime name only; the compiler never emits it, and the
+#: location it prints is ``<runtime>`` because no node allocated the block.
+FREE_UNKNOWN = "R0004"
 
 
 class LogosError(Exception):

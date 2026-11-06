@@ -21,7 +21,7 @@ from logos.check import CheckedModule, check_module
 from logos.diag import LogosError
 from logos.parser import parse
 from logos.resolve import resolve
-from logos.types import Own, Prim, Ptr, StructRef
+from logos.types import Own, Prim, Ptr, StructRef, Ty
 
 ROOT = Path(__file__).resolve().parents[1]
 MEM = ROOT / "tests" / "mem"
@@ -243,11 +243,65 @@ class MoveCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'p'")
 
-    def test_setting_a_moved_binding_rearms_it(self):
-        checked(
+    def test_setting_a_moved_binding_is_e0300(self):
+        # A ``set`` cannot re-arm a binding whose value one path may already
+        # have released: the assignment is on this path only, while the move
+        # may have happened on another.
+        error = fail_on(
             "(mod m)(fn f :void () (letmut p (alloc :i64 2)) (free p)"
-            " (set p (alloc :i64 1)) (free p))"
+            " (set p (alloc :i64 1)))"
         )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.path, "m/f/4")
+        self.assertEqual(error.message, "set of moved binding 'p'")
+
+    def test_set_in_a_sibling_branch_cannot_rearm_a_released_binding(self):
+        # The ``then`` branch releases ``p``; the ``else`` branch assigning a
+        # fresh block must not erase that. After the join the binding is moved
+        # on one path, and reading it is a use after move at both opts.
+        error = fail_on(
+            "(mod m)(fn f :void ((c :bool))"
+            " (letmut p (alloc :i64 2))"
+            " (if c (free p) (set p (alloc :i64 1)))"
+            " (let x :i64 (deref p)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.path, "m/f/4/2")
+        self.assertEqual(error.message, "use after move of 'p'")
+
+    def test_both_branches_may_free_the_same_binding(self):
+        # Each branch starts from the pre-branch state, so the second branch
+        # does not see the first branch's move. Exactly one release runs.
+        checked(
+            "(mod m)(fn f :void ((c :bool))"
+            " (let p (alloc :i64 2))"
+            " (if c (free p) (free p)))"
+        )
+
+    def test_both_match_arms_may_free_the_same_binding(self):
+        checked(
+            "(mod m)(fn f :void ((n :i64))"
+            " (let p (alloc :i64 2))"
+            " (match n (0 (free p)) (_ (free p))))"
+        )
+
+    def test_a_free_in_one_match_arm_is_a_move_after_the_join(self):
+        error = fail_on(
+            "(mod m)(fn f :void ((n :i64))"
+            " (let p (alloc :i64 2))"
+            ' (match n (0 (free p)) (_ (println "kept")))'
+            " (free p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.path, "m/f/4")
+
+    def test_a_move_in_a_while_body_is_a_move_after_the_loop(self):
+        error = fail_on(
+            "(mod m)(fn f :void () (letmut p (alloc :i64 2))"
+            " (while true (free p)) (free p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.path, "m/f/4")
 
     def test_a_parameter_may_be_returned(self):
         cm = checked(
@@ -330,6 +384,29 @@ class MemoryLoweringTest(unittest.TestCase):
             "(fn f :void () (let p (alloc pair 3)))"
         )
         self.assertIn("mul i64 3, 16", text)
+
+    def test_str_is_eight_byte_aligned(self):
+        # ``%str = { i8*, i64 }``: two eight-byte fields, so the aggregate is
+        # eight-aligned even though it is sixteen bytes wide.
+        self.assertEqual(lower.align_of(Prim("str"), {}), 8)
+
+    def test_a_struct_with_a_str_field_is_sized_by_its_c_layout(self):
+        # { i32, %str } is 4 bytes, 4 of padding, then sixteen: twenty-four
+        # bytes, eight-aligned. The old str alignment of sixteen rounded this
+        # up to thirty-two and over-allocated every such struct.
+        structs: dict[str, tuple[tuple[str, Ty], ...]] = {
+            "record": (("tag", Prim("i32")), ("name", Prim("str")))
+        }
+        self.assertEqual(lower.sizeof_of(StructRef("record"), structs), 24)
+        self.assertEqual(lower.align_of(StructRef("record"), structs), 8)
+
+    def test_an_alloc_of_a_str_struct_asks_for_its_true_layout(self):
+        text = emitted(
+            "(mod m)(type record (struct (tag :i32) (name :str)))"
+            "(fn f :void () (let p (alloc record 2)))"
+        )
+        self.assertIn("mul i64 2, 24", text)
+        self.assertIn(", i64 8, i8* %t", text)
 
     def test_deref_is_a_typed_load(self):
         text = emitted(
@@ -460,6 +537,61 @@ class MemoryExecTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertIn(expected, done.stderr)
 
+    def test_a_zero_byte_leak_reports_zero_bytes(self):
+        # The record keeps the requested size, not the one byte the allocator
+        # was asked for so two zero-byte blocks cannot share an address.
+        case = "zero-byte-leak"
+        style = checked(LEAK.read_text(encoding="utf-8"))
+        expected = f"LEAK 0 bytes at {path_in(style, case, 'alloc')}\n"
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = self.run_test(LEAK, case, f"leak-{case}", 0, opt)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn(expected, done.stderr)
+
+    def test_a_str_struct_leak_reports_its_true_size(self):
+        # (struct (tag :i32) (name :str)) is { i32, %str }: 4 + 4 pad + 16,
+        # so twenty-four bytes. Sixteen-aligned str rounded it up to 32.
+        case = "struct-leak"
+        style = checked(LEAK.read_text(encoding="utf-8"))
+        expected = f"LEAK 24 bytes at {path_in(style, case, 'alloc')}\n"
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = self.run_test(LEAK, case, f"leak-{case}", 0, opt)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn(expected, done.stderr)
+
+    def test_a_count_that_wrapped_negative_panics_r0003(self):
+        # INT64_MAX + 1 wraps to INT64_MIN; read unsigned that is above the
+        # limit, so the guard fires at the alloc's own path.
+        case = "wrapped-count-panics"
+        style = checked(LEAK.read_text(encoding="utf-8"))
+        where = path_in(style, case, "alloc")
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = self.run_test(LEAK, case, f"leak-{case}", 0, opt)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(
+                    done.stderr,
+                    f"{where}: R0003: allocation size overflows\n",
+                )
+
+    def test_a_stale_copy_after_a_new_allocation_panics_r0002(self):
+        # The block is freed, a new one is allocated, and only then does the
+        # stale copy reach rt_free. In a debug build the freed address cannot
+        # be recycled, so the dead record is still there and the panic names
+        # the original allocation.
+        case = "stale-copy-after-reuse-panics"
+        style = checked(DOUBLE_FREE.read_text(encoding="utf-8"))
+        first = path_in(style, case, "alloc")
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = self.run_test(DOUBLE_FREE, case, f"double-free-{case}", 0, opt)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(
+                    done.stderr, f"{first}: R0002: double free\n"
+                )
+
     def test_a_release_build_says_nothing_about_leaks(self):
         source = ROOT / "build" / "mem-release.logos"
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -506,6 +638,7 @@ class RuntimeTrackerTest(unittest.TestCase):
 
     PROBE = r"""
 #include "rt.h"
+#include <stdint.h>
 #include <string.h>
 
 int main(int argc, char **argv) {
@@ -536,6 +669,27 @@ int main(int argc, char **argv) {
         rt_leak_report();
         return 0;
     }
+    if (strcmp(argv[1], "zero") == 0) {
+        void *a = rt_alloc(0, 1, "m/zero");
+        if (a == NULL) return 17;
+        rt_leak_report();
+        return 0;
+    }
+    if (strcmp(argv[1], "quarantine") == 0) {
+        void *a = rt_alloc(8, 8, "m/a");
+        void *b;
+        rt_free(a);
+        /* A debug runtime never returns a freed block to malloc, so the next
+         * block cannot land on the released address. */
+        b = rt_alloc(8, 8, "m/b");
+        if (b == a) return 14;
+        rt_free(a);
+        return 15;
+    }
+    if (strcmp(argv[1], "unknown") == 0) {
+        rt_free((void *)(uintptr_t)1);
+        return 16;
+    }
     return 92;
 }
 """
@@ -553,6 +707,10 @@ int main(int argc, char **argv) {
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                # The tracker's exactness is a debug-build promise, and the
+                # quarantine is what makes it true; test what ships in a test
+                # build, not the release fallback.
+                "-DLOGOS_DEBUG=1",
                 "-I",
                 str(ROOT / "runtime"),
                 str(source),
@@ -583,6 +741,31 @@ int main(int argc, char **argv) {
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(
             done.stderr, "LEAK 32 bytes at m/second\nLEAK 7 bytes at m/third\n"
+        )
+
+    def test_a_zero_byte_request_is_recorded_as_zero(self):
+        done = subprocess.run([self.build(), "zero"], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stderr, "LEAK 0 bytes at m/zero\n")
+
+    def test_a_freed_address_is_quarantined_so_a_stale_copy_still_panics(self):
+        # R0002 must hold through a stale copy after another allocation: the
+        # debug runtime keeps the freed block, so the new one cannot reuse its
+        # address, and the stale free finds the original (dead) record.
+        done = subprocess.run(
+            [self.build(), "quarantine"], capture_output=True, text=True
+        )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(done.stderr, "m/a: R0002: double free\n")
+
+    def test_free_of_a_never_allocated_pointer_is_r0004(self):
+        done = subprocess.run(
+            [self.build(), "unknown"], capture_output=True, text=True
+        )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(
+            done.stderr,
+            "<runtime>: R0004: free of a pointer that was never allocated\n",
         )
 
 

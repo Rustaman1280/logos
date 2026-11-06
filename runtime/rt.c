@@ -42,13 +42,15 @@ long rt_write(int fd, const void *buf, size_t len) {
 _Noreturn void rt_panic(const char *path, const char *code, const char *msg) {
     static const char sep[] = ": ";
     static const char newline[] = "\n";
+    static const char runtime[] = "<runtime>";
+    const char *where = path != NULL ? path : runtime;
 
     /* One line, exactly `path: code: message`, so the node path leads and the
-     * stable runtime code is machine-greppable between it and the prose. */
-    if (path != NULL) {
-        (void)rt_write(STDERR_FILENO, path, strlen(path));
-        (void)rt_write(STDERR_FILENO, sep, sizeof sep - 1);
-    }
+     * stable runtime code is machine-greppable between it and the prose. A
+     * check with no node behind it still names a location: the runtime itself,
+     * so the field is never empty and the line never starts with a colon. */
+    (void)rt_write(STDERR_FILENO, where, strlen(where));
+    (void)rt_write(STDERR_FILENO, sep, sizeof sep - 1);
     if (code != NULL) {
         (void)rt_write(STDERR_FILENO, code, strlen(code));
         (void)rt_write(STDERR_FILENO, sep, sizeof sep - 1);
@@ -70,9 +72,14 @@ _Noreturn void rt_panic(const char *path, const char *code, const char *msg) {
  * finite. Records are never removed — a freed block keeps its record with
  * `live` clear — which is what lets the second free report where the block was
  * allocated rather than merely that it was. The table therefore holds one
- * record per address ever allocated, not per address live; addresses are
- * reused by the allocator, so in practice that is the high-water mark of
- * distinct addresses rather than the number of allocations.
+ * record per address ever allocated, not per address live.
+ *
+ * LOGOS_DEBUG changes one thing and it is what makes the R0002 check exact:
+ * rt_free marks the record dead but does not return the block to malloc, so a
+ * freed address cannot be recycled into a fresh live block. A release build
+ * frees normally; there a recycled address overwrites the old record and a
+ * stale owner of the old block is indistinguishable from the owner of the new
+ * one. See rt.h for the limit that leaves open.
  * ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -178,11 +185,15 @@ void *rt_alloc(size_t n, size_t align, const char *path) {
         rt_panic(path, "R0003", "allocation alignment above sixteen is not supported");
     }
     if (n == 0) {
-        /* Two live blocks must have two addresses, and malloc(0) is allowed to
-         * hand back the same non-NULL pointer every time. */
-        n = 1;
+        /* malloc(0) is allowed to hand back the same non-NULL pointer every
+         * time, and two live blocks must have two addresses, so a zero-byte
+         * request takes one byte of storage. The record keeps the requested
+         * size, 0: the leak report says `LEAK 0 bytes`, which is what the
+         * program asked for. */
+        p = malloc(1);
+    } else {
+        p = malloc(n);
     }
-    p = malloc(n);
     if (p == NULL) {
         rt_panic(path, "R0003", "out of memory");
     }
@@ -196,8 +207,11 @@ void *rt_alloc(size_t n, size_t align, const char *path) {
         rt_place(p, n, path, rt_seq++, 1);
         rt_live++;
     } else {
-        /* The address was allocated once before and released: the record is
-         * reused, and the old size and path go with it. */
+        /* Only a release build can get here: it returns freed blocks to
+         * malloc, so a new block may land on an address that had a dead
+         * record. The record is reused and the old size and path go with it.
+         * A debug build quarantines every freed block, so reuse cannot happen
+         * and a stale owner always finds the original dead record. */
         if (!b->live) {
             rt_live++;
         }
@@ -217,9 +231,11 @@ void rt_free(void *p) {
     }
     b = rt_find(p);
     if (b == NULL) {
-        /* Nothing was ever allocated here, so there is no block to release and
-         * no path to blame: say what is true rather than guessing. */
-        rt_panic(NULL, "R0002", "free of a pointer that was never allocated");
+        /* Nothing was ever allocated here — not a block this process created,
+         * and not an address it released. It is not a double free: no block
+         * exists to be released twice, so it gets its own code. The runtime is
+         * the only location there is to name. */
+        rt_panic(NULL, "R0004", "free of a pointer that was never allocated");
     }
     if (!b->live) {
         /* The pointer has been released already. Naming the `alloc` that made
@@ -229,7 +245,15 @@ void rt_free(void *p) {
     }
     b->live = 0;
     rt_live--;
+#ifdef LOGOS_DEBUG
+    /* Quarantine: the block stays allocated for the life of the process. The
+     * address can then never be recycled into a fresh live block, which is
+     * what makes a stale owner's second free find this dead record instead of
+     * somebody else's live one. */
+    (void)p;
+#else
     free(p);
+#endif
 }
 
 size_t rt_leak_count(void) {

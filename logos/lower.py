@@ -134,9 +134,12 @@ instructions and the release is exactly the ``free`` the source spelled.
 
 A debug build (a test build, by default) calls ``rt_leak_report`` on every path
 out of ``main``, after the exit status is computed; a release build does not.
-The runtime, not the compiler, decides what a live block is, which is why a
-double free is caught there: a copy of a pointer the checker could not see —
-through an aggregate, or from C — still reaches ``rt_free`` twice.
+A debug build also defines ``LOGOS_DEBUG`` for the C runtime, which quarantines
+every released block instead of returning it to malloc: a freed address then
+cannot be recycled, so the double-free check in ``rt_free`` stays exact. The
+runtime, not the compiler, decides what a live block is, which is why a double
+free is caught there: a copy of a pointer the checker could not see — through
+an aggregate, or from C — still reaches ``rt_free`` twice.
 """
 
 from __future__ import annotations
@@ -908,10 +911,13 @@ class _Fn:
         """``(alloc T n)``: one block of n T, as ``rt_alloc`` returns it.
 
         The count is in elements and ``rt_alloc`` takes bytes, so the block's
-        size is one multiply by the element's layout. The multiply is guarded:
-        ``count * size`` wrapping would ask the allocator for a short block and
-        then let the program write past it, which is the one arithmetic
-        overflow in this compiler that would corrupt memory rather than wrap.
+        size is one multiply by the element's layout. The multiply is guarded
+        against a count that is already negative or too large: one unsigned
+        compare makes ``count * size`` itself unable to wrap before the
+        allocator sees it. That is the limit of the guarantee. Arithmetic that
+        produced the count may itself have wrapped before this node ran, and a
+        wrapped count can look small enough to pass; the guard bounds this
+        multiply, not every value that reaches it.
 
         ``rt_alloc`` also takes the alignment and the node path. The path is a
         compiler-generated C string, and it is what the leak report prints at
@@ -950,8 +956,12 @@ class _Fn:
     def no_overflow(self, count: str, size: int, where: str) -> None:
         """Branch to ``rt_panic`` unless ``count * size`` fits a byte count.
 
-        One unsigned compare: a negative count is above any limit once read
-        unsigned, so it fails here instead of becoming a huge ``size_t``.
+        One unsigned compare: a count that is negative — written that way, or
+        produced by arithmetic that wrapped — reads as a huge unsigned value
+        and fails here, instead of becoming a huge ``size_t``. That is all it
+        proves: this multiply cannot wrap. A count that wrapped to a small
+        positive value before this node ran passes the guard, because the
+        guard has no record of the value it used to be.
         """
         limit = (2**63 - 1) // size if size else 2**63 - 1
         self.labels += 1
@@ -1678,6 +1688,11 @@ def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
     if isinstance(ty, Prim):
         if ty.name in _FLOATS:
             return 4 if ty.name == "f32" else 8
+        if ty.name == "str":
+            # ``%str = { i8*, i64 }``: two eight-byte fields. The aggregate is
+            # sixteen bytes wide and eight-byte aligned; alignment is the
+            # largest field's, not the size.
+            return 8
         return min(_SIZES.get(ty.name, 1), 16)
     if isinstance(ty, (Ptr, Own)):
         return 8
