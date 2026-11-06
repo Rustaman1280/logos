@@ -17,7 +17,13 @@ PARSE = Path(__file__).parent / "parse"
 
 
 def resolve_src(src: str, files: dict[str, str] | None = None) -> Module:
-    """Resolve ``src`` as module ``a``, with ``files`` as the loader's store."""
+    """Resolve ``src`` with ``files`` as the loader's store.
+
+    The source is always named ``a.logos``, whatever its ``mod`` form says: the
+    resolver never compares a file name to a module name, so ``(mod math)`` in
+    ``a.logos`` is legal here. Mapping a name to the file that answers it, and
+    enforcing any name-must-equal-file rule, belongs to the loader.
+    """
     sources = dict(files or {})
 
     def loader(module: str):
@@ -25,7 +31,7 @@ def resolve_src(src: str, files: dict[str, str] | None = None) -> Module:
             raise FileNotFoundError(module)
         return parse(sources[module], f"{module}.logos")
 
-    return resolve(parse(src, "a.logos"), loader)
+    return resolve(parse(src, "a.logos"), loader, "a.logos")
 
 
 class ModuleTest(unittest.TestCase):
@@ -55,6 +61,27 @@ class ModuleTest(unittest.TestCase):
             resolve_src("(fn f :i64 () (ret 0))")
         self.assertEqual(caught.exception.code, "E0002")
         self.assertIn("mod", caught.exception.message)
+
+    def test_a_missing_module_form_is_located_by_file(self):
+        with self.assertRaises(LogosError) as caught:
+            resolve_src("(fn f :i64 () (ret 0))")
+        error = caught.exception
+        # No node stands for the absent form, so the location is the source's.
+        self.assertEqual(error.path, "")
+        self.assertEqual(error.location, "a.logos:1:1")
+        self.assertEqual(
+            error.render(), "E0002 a.logos:1:1: missing (mod ...) form"
+        )
+
+    def test_a_missing_module_form_without_a_file_name_has_no_location(self):
+        # Backward compatibility: the two-argument call is still supported and
+        # simply has no source to point at.
+        def loader(name: str):
+            raise FileNotFoundError(name)
+
+        with self.assertRaises(LogosError) as caught:
+            resolve(parse("(fn f :i64 () (ret 0))", "a.logos"), loader)
+        self.assertEqual(caught.exception.render(), "E0002: missing (mod ...) form")
 
     def test_a_module_form_needs_a_name(self):
         with self.assertRaises(LogosError) as caught:
@@ -185,6 +212,26 @@ class ImportTest(unittest.TestCase):
             resolve_src("(mod a)(use b)", {"b": "(mod c)"})
         self.assertEqual(caught.exception.code, "E0005")
         self.assertEqual(caught.exception.path, "a/0")
+
+    def test_a_use_name_that_differs_from_the_declared_name_is_not_found(self):
+        """The resolver's whole contract: the tree must declare the name asked for.
+
+        The loader supplies ``c.logos`` for ``c``, so the file name agrees with
+        the request; the tree inside declares ``d``. The resolver has no file
+        names to compare, so it reports the mismatch at the ``use`` that asked
+        for ``c``. Enforcing that a file is named after its module is the
+        loader's rule, not this pass's.
+        """
+        with self.assertRaises(LogosError) as caught:
+            resolve_src(
+                "(mod a)(use b)",
+                {"b": "(mod b)(use c)", "c": "(mod d)"},
+            )
+        error = caught.exception
+        self.assertEqual(error.code, "E0005")
+        self.assertEqual(error.path, "b/0")
+        self.assertIn("'c'", error.message)
+        self.assertIn("'d'", error.message)
 
 
 class CycleTest(unittest.TestCase):

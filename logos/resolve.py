@@ -40,13 +40,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
-from logos.diag import CIRCULAR, DUPLICATE, NOT_FOUND, UNKNOWN_NODE, diag
+from logos.diag import CIRCULAR, DUPLICATE, NOT_FOUND, UNKNOWN_NODE, LogosError, diag
 from logos.lexer import ATOM, Token
 from logos.nodes import Node
-
-#: The module-level forms the resolver understands. It is deliberately shorter
-#: than the language: the checker owns everything below a ``fn`` or a ``test``.
-MODULE_KINDS = ("mod", "use", "fn", "test", "type", "expect-error")
 
 #: ``loader(name)`` returns the parsed tree of another module.
 Loader = Callable[[str], Node]
@@ -70,19 +66,30 @@ class Module:
     imports: dict[str, "Module"] = field(default_factory=dict)
 
 
-def resolve(root: Node, loader: Loader) -> Module:
+def resolve(root: Node, loader: Loader, file: str = "") -> Module:
     """Resolve ``root`` and everything it imports.
 
     ``loader`` supplies the parsed tree of another module and is called at most
     once per module name. A name it cannot supply raises E0005; a parse
     diagnostic raised by it propagates unchanged.
+
+    The loader owns the file-name-equals-module-name rule: it decides which
+    file answers a name, and may reject a name it cannot map to a file. The
+    resolver checks the contract it is handed instead, that the tree the loader
+    returns declares the name ``(use ...)`` asked for, and raises E0005 when it
+    does not.
+
+    ``file`` names the source ``root`` was parsed from, when the caller knows
+    it. It is used only to locate a file that has no ``(mod ...)`` form at all,
+    so that diagnostic carries ``file:line:column`` instead of no location.
     """
-    return _Resolver(loader).module(root, None, "")
+    return _Resolver(loader, file).module(root, None, "")
 
 
 class _Resolver:
-    def __init__(self, loader: Loader) -> None:
+    def __init__(self, loader: Loader, file: str = "") -> None:
         self.loader = loader
+        self.file = file
         self.done: dict[str, Module] = {}
         self.active: list[str] = []
 
@@ -90,13 +97,13 @@ class _Resolver:
         """Resolve a parsed file, which must declare the expected name."""
         form = _module_form(root)
         if form is None:
-            if expected is None:
-                raise diag(UNKNOWN_NODE, origin, "missing (mod ...) form")
-            raise diag(
-                UNKNOWN_NODE,
-                origin,
-                f"module '{expected}' has no (mod ...) form",
-            )
+            if expected is not None:
+                raise diag(
+                    UNKNOWN_NODE,
+                    origin,
+                    f"module '{expected}' has no (mod ...) form",
+                )
+            raise _missing_module(root, self.file)
         declared = form.name
         if declared is None:
             raise diag(UNKNOWN_NODE, form.path, "mod needs a name")
@@ -161,6 +168,25 @@ class _Resolver:
 
         _merge(imported, defs, node.path)
         module.imports[name] = imported
+
+
+def _missing_module(root: Node, file: str) -> LogosError:
+    """The E0002 for a file that never declares a module.
+
+    The root's own position is the one location that always exists, so a caller
+    that names its source gets ``file:line:column``; a caller that does not gets
+    the bare message, as before.
+    """
+    if not file:
+        return diag(UNKNOWN_NODE, "", "missing (mod ...) form")
+    return diag(
+        UNKNOWN_NODE,
+        "",
+        "missing (mod ...) form",
+        file=file,
+        line=root.line,
+        col=root.col,
+    )
 
 
 def _module_form(root: Node) -> Node | None:
