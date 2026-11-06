@@ -1,0 +1,11 @@
+(mod fixture)
+
+(fn add :i64 ((a :i64) (b :i64))
+  (ret (+ a b)))
+
+(type point (struct (x :i64) (y :i64)))
+
+(test add-wraps
+  (expect (out "3\n")
+    (code 0))
+  (println (add 1 2)))
