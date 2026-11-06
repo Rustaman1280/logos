@@ -15,11 +15,12 @@ quote it.
   ``%`` that reaches a zero divisor.
 * ``R0002`` double free — reserved for the owning allocator; raised by the
   runtime, not by the compiler.
-* ``R0003`` failed runtime check — a runtime assertion (bounds, channel state)
-  that cannot be proven at compile time. The lowerer emits it for a ``match``
-  on an integer whose arms have no ``_``: Task 11 makes that a static
-  diagnostic (E0600) once exhaustiveness is checked, and until then the
-  unmatched path panics instead of returning a fabricated value.
+* ``R0003`` no match arm matched — emitted by the lowerer for a ``match`` on
+  an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
+  (E0600) once exhaustiveness is checked, and until then the unmatched path
+  panics instead of returning a fabricated value. The code is reserved for the
+  other runtime checks that cannot be proven at compile time (arr bounds,
+  channel state).
 
 R0002 and R0003 are runtime names only: nothing in the compiler emits R0002.
 """

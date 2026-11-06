@@ -24,6 +24,17 @@ inside a loop body would otherwise grow the frame on every iteration and a long
 loop would run out of stack; allocating once, in the block that runs once, is
 what makes a ``let`` inside a loop free.
 
+Binding visibility is block-scoped, matching the checker: the slot exists from
+the entry block, but the name is known only inside the block that declared it
+(an ``if`` branch, a ``while`` body, a ``match`` arm). Each block saves the
+binding table on entry and restores it on exit, so a branch's ``let`` cannot
+retarget a later read of the same outer name.
+
+A declared type with no LLVM layout — ``(vec T)``, ``(arr T n)``, ``(own T)``,
+``(res T E)`` and the rest — is E0002 at the node that materialises it, never a
+``ValueError`` from the printer: the type vocabulary is larger than this
+backend, and the refusal must carry a path.
+
 Control flow
 ------------
 ``if`` and ``match`` are expressions, so each writes its branch's value into a
@@ -34,9 +45,13 @@ slot back into a ``phi``.
 
 ``while`` is head/body/exit: the body branches back to the head, and the loop
 stack gives ``break`` the exit label and ``continue`` the head label of the
-innermost enclosing loop. ``match`` tests its arms' literals in source order
-and falls through to a panic when no arm matches; ``and``/``or`` short-circuit,
-so the right operand of ``(and false (println "x"))`` never runs.
+innermost enclosing loop. A condition that is the literal ``true`` branches
+straight to the body, with no head-to-exit edge: an exit block that no
+``break`` can reach is closed with ``unreachable``, so a function whose
+constant-true loop always returns is not reported as missing a ``ret``.
+``match`` tests its arms' literals in source order and falls through to a panic
+when no arm matches; ``and``/``or`` short-circuit, so the right operand of
+``(and false (println "x"))`` never runs.
 
 Names
 -----
@@ -79,10 +94,15 @@ exception: it is a NUL-terminated C string, because ``rt_panic`` reads it with
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Iterator
+
+from logos import llvm
 from logos.check import (
     BUILTINS,
     DIRECTIVES,
     CheckedModule,
+    fn_param_nodes,
     fn_shape,
     is_wildcard,
     let_shape,
@@ -155,6 +175,23 @@ _RT_PANIC = IrDecl(
 _ENTRY_RET = Prim("i32")
 
 _STDOUT = "1"
+
+
+def lowered_type(ty: Ty, path: str) -> Ty:
+    """Return ``ty`` if the printer has a layout for it, else raise E0002.
+
+    The checker's type vocabulary is larger than this backend's: a parameter,
+    binding or result may name ``(vec :i64)``, ``(arr :i64 4)``, ``(own T)`` or
+    ``(res T E)`` and still type-check. Materialising one would reach
+    :func:`logos.llvm.type_text` and escape as a bare ``ValueError`` with no
+    node path, so every place that materialises a type passes through here and
+    the refusal is a diagnostic at the node that named it.
+    """
+    try:
+        llvm.type_text(ty)
+    except ValueError:
+        raise diag(UNKNOWN_NODE, path, f"{ty} is not lowered yet") from None
+    return ty
 
 
 def lower_module(cm: CheckedModule) -> IrModule:
@@ -253,6 +290,11 @@ class _Lower:
 
     def fn(self, name: str, node: Node) -> None:
         ret, params, start = fn_shape(node, self.cm.types)
+        # The signature is the first place a declared type is materialised:
+        # refusing it here keeps the function's ``define`` line from reaching
+        # the printer with a type it cannot spell.
+        lowered_type(ret, node.path)
+        param_paths = [param.path for param in fn_param_nodes(node)]
         is_main = name == "main"
         if is_main:
             if params:
@@ -274,7 +316,7 @@ class _Lower:
                 internal=True,
             )
         builder = _Fn(self, fn, path=node.path, ret=ret, is_main=is_main)
-        builder.parameters(params)
+        builder.parameters(params, param_paths)
         builder.body(list(node.items[start:]))
         builder.finish()
         self.ir.functions.append(fn)
@@ -312,8 +354,26 @@ class _Fn:
         self.allocas: list[tuple] = []
         #: The enclosing loops, innermost last: ``(exit label, head label)``.
         self.loops: list[tuple[str, str]] = []
+        #: Exit labels some ``break`` targets, so a constant-true loop whose
+        #: exit is never broken out of can close that block as unreachable.
+        self.escapes: set[str] = set()
 
     # -- names and emission ---------------------------------------------
+
+    @contextmanager
+    def scope(self) -> Iterator[None]:
+        """Lower the form inside ``with`` as one nested binding scope.
+
+        Every slot is still allocated in ``entry``; only the name table is
+        saved and restored. A binding declared in an ``if`` branch therefore
+        cannot leave the branch's slot attached to an outer name, which is
+        what would have made a later ``set`` store into the wrong slot.
+        """
+        saved = dict(self.vars)
+        try:
+            yield
+        finally:
+            self.vars = saved
 
     def temp(self) -> str:
         """A fresh temporary. ``%t<n>`` cannot collide with ``%v.<n>``."""
@@ -326,14 +386,16 @@ class _Fn:
         self.bindings += 1
         return name
 
-    def slot(self, ty: Ty, owner: str | None = None) -> str:
+    def slot(self, ty: Ty, owner: str | None = None, *, path: str) -> str:
         """One stack slot of ``ty``, allocated in the entry block.
 
         ``owner`` is the binding name to derive the slot from, when there is
         one; a slot for a result the source never named gets a fresh number.
         The ``alloca`` itself is held back and lands in ``entry`` (see
-        :meth:`finish`), so a form inside a loop allocates once.
+        :meth:`finish`), so a form inside a loop allocates once. ``path`` is
+        the node that named the type, so a type with no layout is E0002 there.
         """
+        lowered_type(ty, path)
         name = owner if owner is not None else self.binding()
         address = f"{name}.addr"
         self.allocas.append(("alloca", address, ty))
@@ -347,10 +409,10 @@ class _Fn:
     def emit(self, instr: tuple) -> None:
         self.block.instrs.append(instr)
 
-    def parameters(self, params: list[tuple[str, Ty]]) -> None:
-        for source, ty in params:
+    def parameters(self, params: list[tuple[str, Ty]], paths: list[str]) -> None:
+        for (source, ty), path in zip(params, paths):
             safe = self.binding()
-            slot = self.slot(ty, safe)
+            slot = self.slot(ty, safe, path=path)
             self.emit(("store", ty, safe, slot))
             self.vars[source] = (ty, slot)
             self.fn.params.append((safe.lstrip("%"), ty))
@@ -404,7 +466,7 @@ class _Fn:
     def bind(self, node: Node) -> None:
         name, declared, init = let_shape(node, self.cm.types)
         ty = declared if declared is not None else self.value_type(init, node.path)
-        slot = self.slot(ty)
+        slot = self.slot(ty, path=node.path)
         self.emit(("store", ty, self.value(init, node.path), slot))
         self.vars[name] = (ty, slot)
 
@@ -425,32 +487,52 @@ class _Fn:
         self.emit(("store", ty, self.value(items[2], node.path), slot))
 
     def while_stmt(self, node: Node) -> None:
-        """``head`` tests, ``body`` repeats, ``exit`` continues after the loop."""
+        """``head`` tests, ``body`` repeats, ``exit`` continues after the loop.
+
+        A condition that is the literal ``true`` gets no head-to-exit edge: the
+        head branches straight to the body. The exit block then has no
+        predecessor unless a ``break`` names it, so it is closed with
+        ``unreachable`` — which is what lets ``(while true (ret 1))`` be a
+        function that cannot fall off its end.
+        """
         items = node.items
         if len(items) < 2:
-            raise diag(WRONG_ARITY, node.path, "while takes a condition and a body")
+            raise diag(
+                WRONG_ARITY, node.path, "while takes a condition and an optional body"
+            )
+        always = _is_true(items[1])
         self.labels += 1
         tag = f"while{self.labels}"
         head, body, exit_label = f"{tag}.head", f"{tag}.body", f"{tag}.exit"
         self.block.term = ("br", head)
         self.new_block(head)
         condition = self.value(items[1], node.path)
-        self.block.term = ("cbr", condition, body, exit_label)
+        if always:
+            self.block.term = ("br", body)
+        else:
+            self.block.term = ("cbr", condition, body, exit_label)
         self.new_block(body)
         self.loops.append((exit_label, head))
         try:
-            self.body(list(items[2:]))
+            with self.scope():
+                self.body(list(items[2:]))
         finally:
             self.loops.pop()
         if self.block.term is None:
             self.block.term = ("br", head)
         self.new_block(exit_label)
+        if always and exit_label not in self.escapes:
+            self.block.term = ("unreachable",)
 
     def jump(self, node: Node) -> None:
         """``break`` leaves the innermost loop; ``continue`` re-tests it."""
         if not self.loops:
             raise diag(UNKNOWN_NODE, node.path, f"'{node.kind}' outside a loop")
         exit_label, head = self.loops[-1]
+        if node.kind == "break":
+            # The exit block is reachable, so a constant-true loop must not
+            # close it as unreachable.
+            self.escapes.add(exit_label)
         self.block.term = ("br", exit_label if node.kind == "break" else head)
 
     def ret_stmt(self, node: Node) -> None:
@@ -716,21 +798,24 @@ class _Fn:
         self.labels += 1
         tag = f"if{self.labels}"
         then, otherwise, join = f"{tag}.then", f"{tag}.else", f"{tag}.join"
-        slot = None if _is_void(ty) else self.slot(ty)
+        slot = None if _is_void(ty) else self.slot(ty, path=node.path)
         self.block.term = ("cbr", condition, then, otherwise)
         fell = False
         for label, item in ((then, items[2]), (otherwise, items[3])):
             self.new_block(label)
-            if slot is None:
-                # A void ``if`` has statement branches, so ``(if c (break)
-                # (println "x"))`` works: each branch is lowered exactly as it
-                # would be on its own.
-                if not isinstance(item, Node):
-                    raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
-                self.statement(item)
-            else:
-                branch = self.value(item, node.path)
-                self.emit(("store", ty, branch, slot))
+            with self.scope():
+                if slot is None:
+                    # A void ``if`` has statement branches, so ``(if c (break)
+                    # (println "x"))`` works: each branch is lowered exactly as
+                    # it would be on its own.
+                    if not isinstance(item, Node):
+                        raise diag(
+                            UNKNOWN_NODE, node.path, "a statement must be a form"
+                        )
+                    self.statement(item)
+                else:
+                    branch = self.value(item, node.path)
+                    self.emit(("store", ty, branch, slot))
             if self.block.term is None:
                 self.block.term = ("br", join)
                 fell = True
@@ -769,7 +854,7 @@ class _Fn:
         self.labels += 1
         tag = f"match{self.labels}"
         join, none = f"{tag}.join", f"{tag}.none"
-        slot = None if _is_void(ty) else self.slot(ty)
+        slot = None if _is_void(ty) else self.slot(ty, path=node.path)
         wildcard = any(is_wildcard(pattern) for pattern, _ in arms)
         fell = False
         self.block.term = ("br", f"{tag}.test0")
@@ -793,7 +878,8 @@ class _Fn:
             self.block.term = ("cbr", test, f"{tag}.body{index}", following)
         for index, (_, body) in enumerate(arms):
             self.new_block(f"{tag}.body{index}")
-            arm = self.arm_value(body, node.path, statement=slot is None)
+            with self.scope():
+                arm = self.arm_value(body, node.path, statement=slot is None)
             if slot is not None and arm:
                 self.emit(("store", ty, arm, slot))
             if self.block.term is None:
@@ -971,6 +1057,16 @@ class _Fn:
 
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
+
+
+def _is_true(item: Node | Token) -> bool:
+    """Whether a loop condition is the literal ``true``, which never exits.
+
+    A ``Node`` or any other name is not constant: only the exact atom ``true``
+    lets the head skip its exit edge. ``(while flag …)`` with ``flag :bool``
+    keeps both edges, even if the flag happens to be true.
+    """
+    return isinstance(item, Token) and item.kind == ATOM and item.value == "true"
 
 
 def _is_i64(ty: Ty) -> bool:

@@ -44,10 +44,12 @@ definitions of the modules it names, never the ones they name.
 
 What a binding is
 -----------------
-Bindings are function-scoped. There is no block construct in the language yet,
-so a ``let`` inside an ``if`` or ``while`` body is visible after it, and a
-second binding of the same name in one function is a duplicate. Parameters are
-immutable; only ``letmut`` allows ``set``.
+Bindings are block-scoped. A ``let``/``letmut`` is visible only inside the
+block that declares it: a function body, an ``if`` branch, a ``while`` body or
+a ``match`` arm. Reading the name outside that block is E0005. The function's
+parameters form its outermost block, so a second binding of one name in that
+same block is a duplicate, while a nested block may shadow an outer binding.
+Parameters are immutable; only ``letmut`` allows ``set``.
 
 Literals
 --------
@@ -77,7 +79,9 @@ is invisible outside it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 
 from logos.diag import (
     CIRCULAR,
@@ -178,6 +182,16 @@ def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]]
     return ret, params, index + 1
 
 
+def fn_param_nodes(node: Node) -> list[Node]:
+    """The ``(name type)`` forms of a ``fn``, each carrying its own path.
+
+    :func:`fn_shape` returns the resolved parameter types; this returns the
+    nodes that declared them, so a pass can locate a diagnostic at the
+    parameter rather than at the whole ``fn``. The shape is read once, here.
+    """
+    return _param_nodes(_params_item(node), node.path)
+
+
 def let_shape(
     node: Node, types: dict[str, Ty]
 ) -> tuple[str, Ty | None, Node | Token]:
@@ -268,24 +282,48 @@ class _Var:
 
 
 class _Env:
-    """One function's scope: its bindings, visible functions and return type."""
+    """One function's scope: its bindings, visible functions and return type.
+
+    Bindings live in a stack of block scopes, innermost last. The first scope
+    is the function block, which holds the parameters and the bindings of the
+    body; every ``if`` branch, ``while`` body and ``match`` arm pushes one of
+    its own. A name is looked up from the innermost scope outwards, so a
+    nested block may shadow an outer binding, and a name declared inside a
+    block is gone when that block ends. That is what keeps a read after a join
+    from reaching a slot the branch never stored: scope, not liveness, decides
+    visibility.
+    """
 
     def __init__(self, fns: dict[str, FnTy], *, ret: Ty, label: str) -> None:
         self.fns = dict(fns)
-        self.vars: dict[str, _Var] = {}
+        self.scopes: list[dict[str, _Var]] = [{}]
         self.ret = ret
         self.label = label
         #: How many loops enclose the form being checked. ``break`` and
         #: ``continue`` are legal only when it is non-zero.
         self.loop = 0
 
+    @contextmanager
+    def block(self) -> Iterator[None]:
+        """Check the form inside ``with`` as one nested block."""
+        self.scopes.append({})
+        try:
+            yield
+        finally:
+            self.scopes.pop()
+
     def define(self, name: str, ty: Ty, *, mutable: bool, path: str) -> None:
-        if name in self.vars:
+        block = self.scopes[-1]
+        if name in block:
             raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
-        self.vars[name] = _Var(ty, mutable)
+        block[name] = _Var(ty, mutable)
 
     def lookup(self, name: str) -> _Var | None:
-        return self.vars.get(name)
+        for block in reversed(self.scopes):
+            var = block.get(name)
+            if var is not None:
+                return var
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,7 +362,10 @@ _EQUALITY = ("=", "!=")
 #: must be ``:bool`` and so is the result.
 _LOGICAL = ("and", "or")
 #: The only types ``=`` and ``!=`` accept: scalars, never :void or a function.
-_SCALARS = INTEGERS + FLOATS + ("bool", "str")
+#: ``:str`` is absent until the ``str-eq`` operator and its lowering land
+#: together (Task 9): a checker form the backend cannot emit is a bug, so
+#: string equality is refused here rather than compiled as a bogus ``icmp``.
+_SCALARS = INTEGERS + FLOATS + ("bool",)
 
 #: Every integer width's inclusive range, so a literal can be refused at check
 #: time instead of being truncated by the backend.
@@ -613,6 +654,17 @@ class _Checker:
                 _at(left_item, node),
                 f"'{node.kind}' needs numbers, found {left}",
             )
+        if node.kind in _EQUALITY and isinstance(left, Prim) and left.name == "str":
+            # Equality of ``:str`` is not lowered yet: comparing the aggregate
+            # with an ``eq`` would emit an ``icmp`` over ``{ i8*, i64 }``. The
+            # operator and its lowering arrive together with Task 9's
+            # ``str-eq``, so every spelling is refused for now.
+            raise diag(
+                TYPE_MISMATCH,
+                _at(left_item, node),
+                f"'{node.kind}' on :str is not lowered yet: "
+                "string comparison arrives with str-eq",
+            )
         if node.kind in _EQUALITY and not _scalar(left):
             raise diag(
                 TYPE_MISMATCH,
@@ -677,8 +729,10 @@ class _Checker:
                 _at(args[0], node),
                 f"condition must be :bool, found {condition}",
             )
-        then = self._value(args[1], env, expected, node.path)
-        otherwise = self._value(args[2], env, expected, node.path)
+        with env.block():
+            then = self._value(args[1], env, expected, node.path)
+        with env.block():
+            otherwise = self._value(args[2], env, expected, node.path)
         if not compatible(then, otherwise):
             raise diag(
                 TYPE_MISMATCH,
@@ -690,7 +744,9 @@ class _Checker:
     def _while(self, node: Node, env: _Env) -> Ty:
         args = node.items[1:]
         if not args:
-            raise diag(WRONG_ARITY, node.path, "while takes a condition and a body")
+            raise diag(
+                WRONG_ARITY, node.path, "while takes a condition and an optional body"
+            )
         condition = self._value(args[0], env, Prim("bool"), node.path)
         if not compatible(condition, Prim("bool")):
             raise diag(
@@ -703,10 +759,13 @@ class _Checker:
         # property of the enclosing form, not of the function.
         env.loop += 1
         try:
-            for statement in args[1:]:
-                if not isinstance(statement, Node):
-                    raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
-                self._expr(statement, env)
+            with env.block():
+                for statement in args[1:]:
+                    if not isinstance(statement, Node):
+                        raise diag(
+                            UNKNOWN_NODE, node.path, "a statement must be a form"
+                        )
+                    self._expr(statement, env)
         finally:
             env.loop -= 1
         return Prim("void")
@@ -793,12 +852,17 @@ class _Checker:
         expected: Ty | None,
         owner: Node,
     ) -> Ty:
-        """The type of one arm: its last item, after the statements before it."""
-        for statement in body[:-1]:
-            if not isinstance(statement, Node):
-                raise diag(UNKNOWN_NODE, owner.path, "a statement must be a form")
-            self._expr(statement, env)
-        return self._value(body[-1], env, expected, owner.path)
+        """The type of one arm: its last item, after the statements before it.
+
+        The arm is one block: a ``let`` in it is visible to the items after it
+        and to nothing outside the arm.
+        """
+        with env.block():
+            for statement in body[:-1]:
+                if not isinstance(statement, Node):
+                    raise diag(UNKNOWN_NODE, owner.path, "a statement must be a form")
+                self._expr(statement, env)
+            return self._value(body[-1], env, expected, owner.path)
 
     def _ret(self, node: Node, env: _Env) -> Ty:
         args = node.items[1:]

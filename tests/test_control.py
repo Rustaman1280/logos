@@ -167,6 +167,67 @@ class ControlFlowCheckTest(unittest.TestCase):
         )
         self.assertEqual(cm.expr_types[path_of(cm, "match")], Prim("i64"))
 
+    def test_string_equality_is_not_lowered_yet(self):
+        # A checker form with no lowering is a bug: string equality waits for
+        # Task 9's ``str-eq``, which adds the operator and the lowering together.
+        for op, source in (
+            ("=", '(mod m)(fn f :bool () (ret (= "a" "b")))'),
+            ("=", '(mod m)(fn f :bool ((s :str)) (ret (= s "a")))'),
+            ("!=", '(mod m)(fn f :bool ((s :str)) (ret (!= s "a")))'),
+        ):
+            with self.subTest(source=source):
+                error = fail_on(source)
+                self.assertEqual(error.code, "E0100")
+                self.assertEqual(
+                    error.message,
+                    f"'{op}' on :str is not lowered yet: "
+                    "string comparison arrives with str-eq",
+                )
+        self.assertEqual(
+            fail_on('(mod m)(fn f :bool () (ret (= "a" "b")))').path, "m/f/2/0"
+        )
+
+    def test_a_binding_from_an_if_branch_is_not_visible_after_the_join(self):
+        error = fail_on(
+            "(mod m)(fn f :i64 ((c :bool))"
+            " (if c (let x :i64 1) (let x :i64 2)) (ret x))"
+        )
+        self.assertEqual(error.code, "E0005")
+        self.assertEqual(error.path, "m/f/3")
+        self.assertEqual(error.message, "unknown name 'x'")
+
+    def test_a_binding_from_a_loop_body_is_not_visible_after_the_loop(self):
+        error = fail_on(
+            "(mod m)(fn f :i64 () (letmut i :i64 0)"
+            " (while (< i 1) (let x :i64 1) (set i 1)) (ret x))"
+        )
+        self.assertEqual(error.code, "E0005")
+        self.assertEqual(error.path, "m/f/4")
+        self.assertEqual(error.message, "unknown name 'x'")
+
+    def test_a_binding_from_a_match_arm_is_not_visible_after_the_match(self):
+        error = fail_on(
+            "(mod m)(fn f :i64 ((n :i64))"
+            ' (match n (0 (let x :i64 1) (println "a")) (_ (println "b")))'
+            " (ret x))"
+        )
+        self.assertEqual(error.code, "E0005")
+        self.assertEqual(error.path, "m/f/3")
+        self.assertEqual(error.message, "unknown name 'x'")
+
+    def test_a_nested_block_may_shadow_an_outer_binding(self):
+        # Shadowing is legal inside the block that declares the inner name;
+        # the outer binding is untouched when the block ends.
+        checked(
+            "(mod m)(fn f :i64 () (letmut x :i64 1)"
+            " (match 0 (0 (letmut x :i64 2) (set x 3)) (_ (set x 4)))"
+            " (ret x))"
+        )
+        checked(
+            "(mod m)(fn f :i64 () (letmut i :i64 0) (let x :i64 1)"
+            " (while (< i 1) (let x :i64 2) (set i x)) (ret x))"
+        )
+
 
 class ControlFlowLoweringTest(unittest.TestCase):
     """The IR shape: every block named, every branch explicit."""
@@ -380,6 +441,42 @@ class ControlFlowLoweringTest(unittest.TestCase):
         )
         self.assertIn("%v.1.addr = alloca i8", llvm.emit(m))
 
+    def test_a_type_with_no_layout_is_e0002_not_a_value_error(self):
+        with self.assertRaises(LogosError) as caught:
+            lower.lower_module(
+                checked("(mod m)(fn f :void ((v :(vec :i64))) (ret))")
+            )
+        error = caught.exception
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "(vec :i64) is not lowered yet")
+        self.assertEqual(error.path, "m/f/1/0")
+
+    def test_a_constant_true_loop_has_no_exit_edge(self):
+        # Nothing can leave the loop, so the head branches straight to the
+        # body and the exit block is unreachable; the function cannot fall off
+        # its end even though it returns only inside the loop.
+        m = lower.lower_module(checked("(mod m)(fn f :i64 () (while true (ret 1)))"))
+        fn = m.functions[0]
+        head = next(b for b in fn.blocks if b.label == "while1.head")
+        self.assertEqual(head.term, ("br", "while1.body"))
+        self.assertNotIn("cbr", [b.term[0] for b in fn.blocks])
+        exit_block = next(b for b in fn.blocks if b.label == "while1.exit")
+        self.assertEqual(exit_block.term, ("unreachable",))
+        llvm.emit(m)  # the printer accepts every block
+
+    def test_a_break_still_reaches_the_exit_of_a_constant_true_loop(self):
+        # A ``break`` is the only edge into the exit, so it must not be closed
+        # as unreachable when one exists.
+        m = lower.lower_module(
+            checked("(mod m)(fn f :i64 () (while true (break)) (ret 2))")
+        )
+        fn = m.functions[0]
+        head = next(b for b in fn.blocks if b.label == "while1.head")
+        self.assertEqual(head.term, ("br", "while1.body"))
+        exit_block = next(b for b in fn.blocks if b.label == "while1.exit")
+        self.assertNotEqual(exit_block.term, ("unreachable",))
+        self.assertEqual(exit_block.term, ("ret", Prim("i64"), "2"))
+
 
 class ControlFlowExecTest(unittest.TestCase):
     """Real binaries, both optimisation levels, stdout and status compared."""
@@ -516,6 +613,49 @@ class ControlFlowExecTest(unittest.TestCase):
                 driver.build(str(source), out, opt=opt)
                 done = run(out)
                 self.assertEqual(done.returncode, 255, done.stderr)  # -1
+                self.assertEqual(done.stdout, "")
+
+    def test_a_constant_true_loop_is_not_a_missing_return(self):
+        """The only way out of the loop returns, so the function cannot fall off."""
+
+        source = ROOT / "build" / "forever.logos"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "(mod forever)\n"
+            "(fn main :i64 ()\n"
+            "  (while true (ret 7)))\n",
+            encoding="utf-8",
+        )
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                out = str(ROOT / "build" / f"ctl-forever-{opt[1:]}")
+                driver.build(str(source), out, opt=opt)
+                done = run(out)
+                self.assertEqual(done.returncode, 7, done.stderr)
+                self.assertEqual(done.stdout, "")
+
+    def test_a_branch_binding_shadows_without_retargeting_the_outer_name(self):
+        """The arm's ``x`` is 2 inside the arm; the outer ``x`` is still 1."""
+
+        source = ROOT / "build" / "shadowbranch.logos"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "(mod shadowbranch)\n"
+            "(fn main :i64 ()\n"
+            "  (let x :i64 1)\n"
+            "  (letmut y :i64 0)\n"
+            "  (match 0\n"
+            "    (0 (let x :i64 2) (set y x))\n"
+            "    (_ (set y 9)))\n"
+            "  (ret (+ y x)))\n",
+            encoding="utf-8",
+        )
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                out = str(ROOT / "build" / f"ctl-shadowbranch-{opt[1:]}")
+                driver.build(str(source), out, opt=opt)
+                done = run(out)
+                self.assertEqual(done.returncode, 3, done.stderr)
                 self.assertEqual(done.stdout, "")
 
     def test_a_match_whose_arms_all_return_is_not_a_missing_return(self):

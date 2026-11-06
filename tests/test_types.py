@@ -504,7 +504,12 @@ class ComparisonTest(unittest.TestCase):
             "(mod m)(fn f :bool ((a :i64) (b :i64)) (ret (< a b)))"
         )
         self.assertEqual(checked.expr_types["m/f/2/0"], Prim("bool"))
-        check_src('(mod m)(fn f :bool ((a :str) (b :str)) (ret (= a b)))')
+        # ``:str`` equality is Task 9's: until the ``str-eq`` operator and its
+        # lowering land together, the checker refuses it.
+        error = expect_error(
+            '(mod m)(fn f :bool ((a :str) (b :str)) (ret (= a b)))', "E0100"
+        )
+        self.assertIn("str-eq", error.message)
 
     def test_a_comparison_needs_matching_types(self):
         error = expect_error(
