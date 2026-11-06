@@ -44,7 +44,7 @@ from __future__ import annotations
 import re
 
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
-from logos.types import Arr, Own, Prim, Ptr, StructRef, Ty, Vec
+from logos.types import Arr, FnTy, Own, Prim, Ptr, StructRef, Ty, Vec
 
 #: Closed primitive spelling. ``:str`` is the frozen 16-byte fat pointer the
 #: spec defines. A ``(vec T)`` is a literal three-word struct, so its layout is
@@ -124,7 +124,10 @@ def type_text(ty: Ty) -> str:
     the buffer, its length in elements and its capacity in elements. It is
     spelled as a literal rather than an identified struct so two vectors of
     different elements cannot share a name, and so the layout is read off the
-    type itself with no registry to keep in step.
+    type itself with no registry to keep in step. A ``(fn (T) R)`` is the same
+    kind of literal: two words, the environment pointer and the code pointer,
+    both opaque, so any two function values are one layout whatever they take
+    and return. The code pointer's real type is spelled only where it is called.
     """
     if isinstance(ty, Prim):
         spelled = _PRIM.get(ty.name)
@@ -134,11 +137,37 @@ def type_text(ty: Ty) -> str:
         return f"{type_text(ty.elem)}*"
     if isinstance(ty, Vec):
         return f"{{ {type_text(ty.elem)}*, i64, i64 }}"
+    if isinstance(ty, FnTy):
+        return "{ i8*, i8* }"
     if isinstance(ty, Arr):
         return f"[{ty.n} x {type_text(ty.elem)}]"
     if isinstance(ty, StructRef):
         return struct_name(ty.name)
     raise ValueError(f"no LLVM layout for type {ty}")
+
+
+def record_text(fields: "tuple[Ty, ...]") -> str:
+    """Spell a closure environment: its captured values, in capture order.
+
+    A literal struct, like a vector's descriptor: the environment belongs to
+    one closure expression, so it needs no identified name and no registry. An
+    empty environment is never spelled — a closure that captures nothing has a
+    null environment pointer — but ``{ }`` is what the loop below turns it into.
+    """
+    inner = ", ".join(type_text(field) for field in fields)
+    return f"{{ {inner} }}" if inner else "{ }"
+
+
+def fn_pointer_text(ret: Ty, params: "tuple[Ty, ...]") -> str:
+    """Spell a callable's real type: ``i64 (i8*, i64)*``.
+
+    ``params`` is the whole parameter list, environment included: a closure's
+    environment is its first parameter, and the value's two words agree with
+    the ``define`` line exactly, so no call through the pointer needs a type
+    the definition does not have.
+    """
+    spelled = ", ".join(type_text(param) for param in params)
+    return f"{type_text(ret)} ({spelled})*"
 
 
 def struct_name(name: str) -> str:
@@ -321,6 +350,52 @@ class _Text:
             )
         if op == "call":
             return self.call(instr)
+        if op == "allocarec":
+            _, dest, fields = instr
+            return f"{dest} = alloca {record_text(fields)}"
+        if op == "geprec":
+            _, dest, fields, base, index = instr
+            spelled = record_text(fields)
+            return (
+                f"{dest} = getelementptr {spelled}, {spelled}* {base}, "
+                f"i32 0, i32 {index}"
+            )
+        if op == "bitcastrec":
+            _, dest, fields, from_ty, value = instr
+            return (
+                f"{dest} = bitcast {type_text(from_ty)} {value} "
+                f"to {record_text(fields)}*"
+            )
+        if op == "bitcastout":
+            _, dest, fields, to_ty, value = instr
+            return (
+                f"{dest} = bitcast {record_text(fields)}* {value} "
+                f"to {type_text(to_ty)}"
+            )
+        if op == "faddr":
+            _, dest, symbol = instr
+            sig = self.sigs.get(symbol)
+            if sig is None:
+                raise ValueError(f"address of undefined function '@{symbol}'")
+            params, ret = sig
+            return (
+                f"{dest} = bitcast {fn_pointer_text(ret, params)} "
+                f"{_named('@', symbol)} to i8*"
+            )
+        if op == "fnptr":
+            _, dest, ret, params, value = instr
+            return f"{dest} = bitcast i8* {value} to {fn_pointer_text(ret, params)}"
+        if op == "icall":
+            _, dest, ret, params, callee, args = instr
+            if len(params) != len(args):
+                raise ValueError(
+                    f"indirect call passes {len(args)} arguments for {len(params)}"
+                )
+            spelled = ", ".join(
+                f"{type_text(ty)} {arg}" for ty, arg in zip(params, args)
+            )
+            text = f"call {type_text(ret)} {callee}({spelled})"
+            return f"{dest} = {text}" if dest else text
         raise ValueError(f"unknown IR opcode '{op}'")
 
     def call(self, instr: tuple) -> str:

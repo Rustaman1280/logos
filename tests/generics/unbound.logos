@@ -1,0 +1,14 @@
+(mod unbound)
+
+(fn empty :
+  (vec T) ()
+  (letmut out :
+    (vec T)
+    (make (vec T)))
+  (ret out))
+
+(fn main :i64 ()
+  (println 1)
+  (letmut v (empty))
+  (vec-free v)
+  (ret 0))

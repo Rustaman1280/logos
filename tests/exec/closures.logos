@@ -1,0 +1,151 @@
+(mod closures)
+
+(fn add-one :i64 ((x :i64))
+  (ret (+ x 1)))
+
+(fn id :T ((x :T))
+  (ret x))
+
+(fn first :T ((a :T) (b :U))
+  (ret a))
+
+(fn twice-by :i64 ((x :i64))
+  (ret (id (+ x x))))
+
+(fn apply :U ((f : (fn (:T) :U)) (x :T))
+  (ret (f x)))
+
+(fn map :
+  (vec U) ((v : (vec T)) (f : (fn (:T) :U)))
+  (letmut out :
+    (vec U)
+    (make (vec U)))
+  (letmut i :i64 0)
+  (while (< i (vec-len v))
+    (vec-push out (f (vec-get v i)))
+    (set i (+ i 1)))
+  (vec-free v)
+  (ret out))
+
+(test capture-one
+  (expect (out "10\n")
+    (code 0)
+    (leaks 0))
+  (let k 10)
+  (let f (fn :i64 ()
+           (ret k)))
+  (println (f)))
+
+(test capture-is-a-copy
+  (expect (out "1\n")
+    (code 0)
+    (leaks 0))
+  (letmut k 1)
+  (let f (fn :i64 ()
+           (ret k)))
+  (set k 5)
+  (println (f)))
+
+(test capture-two-bindings
+  (expect (out "30\n")
+    (code 0)
+    (leaks 0))
+  (let a 10)
+  (let b 20)
+  (let sum (fn :i64 ((n :i64))
+             (ret (+ (+ a b) n))))
+  (println (sum 0)))
+
+(test no-captures
+  (expect (out "8\n")
+    (code 0)
+    (leaks 0))
+  (let double (fn :i64 ((x :i64))
+                (ret (* x 2))))
+  (println (double 4)))
+
+(test closure-argument
+  (expect (out "50\n")
+    (code 0)
+    (leaks 0))
+  (let k 10)
+  (println (apply (fn :i64 ((n :i64))
+                    (ret (* n k))) 5)))
+
+(test named-function-value
+  (expect (out "6\n")
+    (code 0)
+    (leaks 0))
+  (println (apply add-one 5)))
+
+(test generic-calls-generic
+  (expect (out "20\n")
+    (code 0)
+    (leaks 0))
+  (println (twice-by 10)))
+
+(test two-type-parameters
+  (expect (out "1\nx\n")
+    (code 0)
+    (leaks 0))
+  (println (first 1 "x"))
+  (println (first "x" 2)))
+
+(test two-instantiations
+  (expect (out "42\n3\n")
+    (code 0)
+    (leaks 0))
+  (println (id 42))
+  (println (str-len (id "abc"))))
+
+(test map-with-a-closure
+  (expect (out "3\n20\n")
+    (code 0)
+    (leaks 0))
+  (let k 10)
+  (letmut v (make (vec :i64)))
+  (vec-push v 1)
+  (vec-push v 2)
+  (vec-push v 3)
+  (letmut w (map v (fn :i64 ((x :i64))
+                     (ret (* x k)))))
+  (println (vec-len w))
+  (println (vec-get w 1))
+  (vec-free w))
+
+(test map-over-strings
+  (expect (out "2\n3\n2\n")
+    (code 0)
+    (leaks 0))
+  (letmut v (make (vec :str)))
+  (vec-push v "abc")
+  (vec-push v "de")
+  (letmut lens (map v (fn :i64 ((s :str))
+                        (ret (str-len s)))))
+  (println (vec-len lens))
+  (println (vec-get lens 0))
+  (println (vec-get lens 1))
+  (vec-free lens))
+
+(test closure-calling-a-closure
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (let k 2)
+  (let add (fn :i64 ((n :i64))
+             (ret (+ n k))))
+  (let twice (fn :i64 ((n :i64))
+               (ret (add (add n)))))
+  (println (twice 3)))
+
+(fn add-with :T ((x :T) (f : (fn (:T) :T)))
+  (let g (fn :T ((y :T))
+           (ret (f (+ y x)))))
+  (ret (g x)))
+
+(test closure-inside-a-generic
+  (expect (out "12\n")
+    (code 0)
+    (leaks 0))
+  (println (add-with 3 (fn :i64 ((n :i64))
+                         (ret (* n 2))))))

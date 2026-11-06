@@ -1,0 +1,778 @@
+(mod limit)
+
+(type t0 (struct))
+
+(type t1 (struct))
+
+(type t2 (struct))
+
+(type t3 (struct))
+
+(type t4 (struct))
+
+(type t5 (struct))
+
+(type t6 (struct))
+
+(type t7 (struct))
+
+(type t8 (struct))
+
+(type t9 (struct))
+
+(type t10 (struct))
+
+(type t11 (struct))
+
+(type t12 (struct))
+
+(type t13 (struct))
+
+(type t14 (struct))
+
+(type t15 (struct))
+
+(type t16 (struct))
+
+(type t17 (struct))
+
+(type t18 (struct))
+
+(type t19 (struct))
+
+(type t20 (struct))
+
+(type t21 (struct))
+
+(type t22 (struct))
+
+(type t23 (struct))
+
+(type t24 (struct))
+
+(type t25 (struct))
+
+(type t26 (struct))
+
+(type t27 (struct))
+
+(type t28 (struct))
+
+(type t29 (struct))
+
+(type t30 (struct))
+
+(type t31 (struct))
+
+(type t32 (struct))
+
+(type t33 (struct))
+
+(type t34 (struct))
+
+(type t35 (struct))
+
+(type t36 (struct))
+
+(type t37 (struct))
+
+(type t38 (struct))
+
+(type t39 (struct))
+
+(type t40 (struct))
+
+(type t41 (struct))
+
+(type t42 (struct))
+
+(type t43 (struct))
+
+(type t44 (struct))
+
+(type t45 (struct))
+
+(type t46 (struct))
+
+(type t47 (struct))
+
+(type t48 (struct))
+
+(type t49 (struct))
+
+(type t50 (struct))
+
+(type t51 (struct))
+
+(type t52 (struct))
+
+(type t53 (struct))
+
+(type t54 (struct))
+
+(type t55 (struct))
+
+(type t56 (struct))
+
+(type t57 (struct))
+
+(type t58 (struct))
+
+(type t59 (struct))
+
+(type t60 (struct))
+
+(type t61 (struct))
+
+(type t62 (struct))
+
+(type t63 (struct))
+
+(type t64 (struct))
+
+(type t65 (struct))
+
+(type t66 (struct))
+
+(type t67 (struct))
+
+(type t68 (struct))
+
+(type t69 (struct))
+
+(type t70 (struct))
+
+(type t71 (struct))
+
+(type t72 (struct))
+
+(type t73 (struct))
+
+(type t74 (struct))
+
+(type t75 (struct))
+
+(type t76 (struct))
+
+(type t77 (struct))
+
+(type t78 (struct))
+
+(type t79 (struct))
+
+(type t80 (struct))
+
+(type t81 (struct))
+
+(type t82 (struct))
+
+(type t83 (struct))
+
+(type t84 (struct))
+
+(type t85 (struct))
+
+(type t86 (struct))
+
+(type t87 (struct))
+
+(type t88 (struct))
+
+(type t89 (struct))
+
+(type t90 (struct))
+
+(type t91 (struct))
+
+(type t92 (struct))
+
+(type t93 (struct))
+
+(type t94 (struct))
+
+(type t95 (struct))
+
+(type t96 (struct))
+
+(type t97 (struct))
+
+(type t98 (struct))
+
+(type t99 (struct))
+
+(type t100 (struct))
+
+(type t101 (struct))
+
+(type t102 (struct))
+
+(type t103 (struct))
+
+(type t104 (struct))
+
+(type t105 (struct))
+
+(type t106 (struct))
+
+(type t107 (struct))
+
+(type t108 (struct))
+
+(type t109 (struct))
+
+(type t110 (struct))
+
+(type t111 (struct))
+
+(type t112 (struct))
+
+(type t113 (struct))
+
+(type t114 (struct))
+
+(type t115 (struct))
+
+(type t116 (struct))
+
+(type t117 (struct))
+
+(type t118 (struct))
+
+(type t119 (struct))
+
+(type t120 (struct))
+
+(type t121 (struct))
+
+(type t122 (struct))
+
+(type t123 (struct))
+
+(type t124 (struct))
+
+(type t125 (struct))
+
+(type t126 (struct))
+
+(type t127 (struct))
+
+(type t128 (struct))
+
+(type t129 (struct))
+
+(type t130 (struct))
+
+(type t131 (struct))
+
+(type t132 (struct))
+
+(type t133 (struct))
+
+(type t134 (struct))
+
+(type t135 (struct))
+
+(type t136 (struct))
+
+(type t137 (struct))
+
+(type t138 (struct))
+
+(type t139 (struct))
+
+(type t140 (struct))
+
+(type t141 (struct))
+
+(type t142 (struct))
+
+(type t143 (struct))
+
+(type t144 (struct))
+
+(type t145 (struct))
+
+(type t146 (struct))
+
+(type t147 (struct))
+
+(type t148 (struct))
+
+(type t149 (struct))
+
+(type t150 (struct))
+
+(type t151 (struct))
+
+(type t152 (struct))
+
+(type t153 (struct))
+
+(type t154 (struct))
+
+(type t155 (struct))
+
+(type t156 (struct))
+
+(type t157 (struct))
+
+(type t158 (struct))
+
+(type t159 (struct))
+
+(type t160 (struct))
+
+(type t161 (struct))
+
+(type t162 (struct))
+
+(type t163 (struct))
+
+(type t164 (struct))
+
+(type t165 (struct))
+
+(type t166 (struct))
+
+(type t167 (struct))
+
+(type t168 (struct))
+
+(type t169 (struct))
+
+(type t170 (struct))
+
+(type t171 (struct))
+
+(type t172 (struct))
+
+(type t173 (struct))
+
+(type t174 (struct))
+
+(type t175 (struct))
+
+(type t176 (struct))
+
+(type t177 (struct))
+
+(type t178 (struct))
+
+(type t179 (struct))
+
+(type t180 (struct))
+
+(type t181 (struct))
+
+(type t182 (struct))
+
+(type t183 (struct))
+
+(type t184 (struct))
+
+(type t185 (struct))
+
+(type t186 (struct))
+
+(type t187 (struct))
+
+(type t188 (struct))
+
+(type t189 (struct))
+
+(type t190 (struct))
+
+(type t191 (struct))
+
+(type t192 (struct))
+
+(type t193 (struct))
+
+(type t194 (struct))
+
+(type t195 (struct))
+
+(type t196 (struct))
+
+(type t197 (struct))
+
+(type t198 (struct))
+
+(type t199 (struct))
+
+(type t200 (struct))
+
+(type t201 (struct))
+
+(type t202 (struct))
+
+(type t203 (struct))
+
+(type t204 (struct))
+
+(type t205 (struct))
+
+(type t206 (struct))
+
+(type t207 (struct))
+
+(type t208 (struct))
+
+(type t209 (struct))
+
+(type t210 (struct))
+
+(type t211 (struct))
+
+(type t212 (struct))
+
+(type t213 (struct))
+
+(type t214 (struct))
+
+(type t215 (struct))
+
+(type t216 (struct))
+
+(type t217 (struct))
+
+(type t218 (struct))
+
+(type t219 (struct))
+
+(type t220 (struct))
+
+(type t221 (struct))
+
+(type t222 (struct))
+
+(type t223 (struct))
+
+(type t224 (struct))
+
+(type t225 (struct))
+
+(type t226 (struct))
+
+(type t227 (struct))
+
+(type t228 (struct))
+
+(type t229 (struct))
+
+(type t230 (struct))
+
+(type t231 (struct))
+
+(type t232 (struct))
+
+(type t233 (struct))
+
+(type t234 (struct))
+
+(type t235 (struct))
+
+(type t236 (struct))
+
+(type t237 (struct))
+
+(type t238 (struct))
+
+(type t239 (struct))
+
+(type t240 (struct))
+
+(type t241 (struct))
+
+(type t242 (struct))
+
+(type t243 (struct))
+
+(type t244 (struct))
+
+(type t245 (struct))
+
+(type t246 (struct))
+
+(type t247 (struct))
+
+(type t248 (struct))
+
+(type t249 (struct))
+
+(type t250 (struct))
+
+(type t251 (struct))
+
+(type t252 (struct))
+
+(type t253 (struct))
+
+(type t254 (struct))
+
+(type t255 (struct))
+
+(type t256 (struct))
+
+(fn tag :i64 ((x :T))
+  (ret 0))
+
+(fn main :i64 ()
+  (tag (make t0))
+  (tag (make t1))
+  (tag (make t2))
+  (tag (make t3))
+  (tag (make t4))
+  (tag (make t5))
+  (tag (make t6))
+  (tag (make t7))
+  (tag (make t8))
+  (tag (make t9))
+  (tag (make t10))
+  (tag (make t11))
+  (tag (make t12))
+  (tag (make t13))
+  (tag (make t14))
+  (tag (make t15))
+  (tag (make t16))
+  (tag (make t17))
+  (tag (make t18))
+  (tag (make t19))
+  (tag (make t20))
+  (tag (make t21))
+  (tag (make t22))
+  (tag (make t23))
+  (tag (make t24))
+  (tag (make t25))
+  (tag (make t26))
+  (tag (make t27))
+  (tag (make t28))
+  (tag (make t29))
+  (tag (make t30))
+  (tag (make t31))
+  (tag (make t32))
+  (tag (make t33))
+  (tag (make t34))
+  (tag (make t35))
+  (tag (make t36))
+  (tag (make t37))
+  (tag (make t38))
+  (tag (make t39))
+  (tag (make t40))
+  (tag (make t41))
+  (tag (make t42))
+  (tag (make t43))
+  (tag (make t44))
+  (tag (make t45))
+  (tag (make t46))
+  (tag (make t47))
+  (tag (make t48))
+  (tag (make t49))
+  (tag (make t50))
+  (tag (make t51))
+  (tag (make t52))
+  (tag (make t53))
+  (tag (make t54))
+  (tag (make t55))
+  (tag (make t56))
+  (tag (make t57))
+  (tag (make t58))
+  (tag (make t59))
+  (tag (make t60))
+  (tag (make t61))
+  (tag (make t62))
+  (tag (make t63))
+  (tag (make t64))
+  (tag (make t65))
+  (tag (make t66))
+  (tag (make t67))
+  (tag (make t68))
+  (tag (make t69))
+  (tag (make t70))
+  (tag (make t71))
+  (tag (make t72))
+  (tag (make t73))
+  (tag (make t74))
+  (tag (make t75))
+  (tag (make t76))
+  (tag (make t77))
+  (tag (make t78))
+  (tag (make t79))
+  (tag (make t80))
+  (tag (make t81))
+  (tag (make t82))
+  (tag (make t83))
+  (tag (make t84))
+  (tag (make t85))
+  (tag (make t86))
+  (tag (make t87))
+  (tag (make t88))
+  (tag (make t89))
+  (tag (make t90))
+  (tag (make t91))
+  (tag (make t92))
+  (tag (make t93))
+  (tag (make t94))
+  (tag (make t95))
+  (tag (make t96))
+  (tag (make t97))
+  (tag (make t98))
+  (tag (make t99))
+  (tag (make t100))
+  (tag (make t101))
+  (tag (make t102))
+  (tag (make t103))
+  (tag (make t104))
+  (tag (make t105))
+  (tag (make t106))
+  (tag (make t107))
+  (tag (make t108))
+  (tag (make t109))
+  (tag (make t110))
+  (tag (make t111))
+  (tag (make t112))
+  (tag (make t113))
+  (tag (make t114))
+  (tag (make t115))
+  (tag (make t116))
+  (tag (make t117))
+  (tag (make t118))
+  (tag (make t119))
+  (tag (make t120))
+  (tag (make t121))
+  (tag (make t122))
+  (tag (make t123))
+  (tag (make t124))
+  (tag (make t125))
+  (tag (make t126))
+  (tag (make t127))
+  (tag (make t128))
+  (tag (make t129))
+  (tag (make t130))
+  (tag (make t131))
+  (tag (make t132))
+  (tag (make t133))
+  (tag (make t134))
+  (tag (make t135))
+  (tag (make t136))
+  (tag (make t137))
+  (tag (make t138))
+  (tag (make t139))
+  (tag (make t140))
+  (tag (make t141))
+  (tag (make t142))
+  (tag (make t143))
+  (tag (make t144))
+  (tag (make t145))
+  (tag (make t146))
+  (tag (make t147))
+  (tag (make t148))
+  (tag (make t149))
+  (tag (make t150))
+  (tag (make t151))
+  (tag (make t152))
+  (tag (make t153))
+  (tag (make t154))
+  (tag (make t155))
+  (tag (make t156))
+  (tag (make t157))
+  (tag (make t158))
+  (tag (make t159))
+  (tag (make t160))
+  (tag (make t161))
+  (tag (make t162))
+  (tag (make t163))
+  (tag (make t164))
+  (tag (make t165))
+  (tag (make t166))
+  (tag (make t167))
+  (tag (make t168))
+  (tag (make t169))
+  (tag (make t170))
+  (tag (make t171))
+  (tag (make t172))
+  (tag (make t173))
+  (tag (make t174))
+  (tag (make t175))
+  (tag (make t176))
+  (tag (make t177))
+  (tag (make t178))
+  (tag (make t179))
+  (tag (make t180))
+  (tag (make t181))
+  (tag (make t182))
+  (tag (make t183))
+  (tag (make t184))
+  (tag (make t185))
+  (tag (make t186))
+  (tag (make t187))
+  (tag (make t188))
+  (tag (make t189))
+  (tag (make t190))
+  (tag (make t191))
+  (tag (make t192))
+  (tag (make t193))
+  (tag (make t194))
+  (tag (make t195))
+  (tag (make t196))
+  (tag (make t197))
+  (tag (make t198))
+  (tag (make t199))
+  (tag (make t200))
+  (tag (make t201))
+  (tag (make t202))
+  (tag (make t203))
+  (tag (make t204))
+  (tag (make t205))
+  (tag (make t206))
+  (tag (make t207))
+  (tag (make t208))
+  (tag (make t209))
+  (tag (make t210))
+  (tag (make t211))
+  (tag (make t212))
+  (tag (make t213))
+  (tag (make t214))
+  (tag (make t215))
+  (tag (make t216))
+  (tag (make t217))
+  (tag (make t218))
+  (tag (make t219))
+  (tag (make t220))
+  (tag (make t221))
+  (tag (make t222))
+  (tag (make t223))
+  (tag (make t224))
+  (tag (make t225))
+  (tag (make t226))
+  (tag (make t227))
+  (tag (make t228))
+  (tag (make t229))
+  (tag (make t230))
+  (tag (make t231))
+  (tag (make t232))
+  (tag (make t233))
+  (tag (make t234))
+  (tag (make t235))
+  (tag (make t236))
+  (tag (make t237))
+  (tag (make t238))
+  (tag (make t239))
+  (tag (make t240))
+  (tag (make t241))
+  (tag (make t242))
+  (tag (make t243))
+  (tag (make t244))
+  (tag (make t245))
+  (tag (make t246))
+  (tag (make t247))
+  (tag (make t248))
+  (tag (make t249))
+  (tag (make t250))
+  (tag (make t251))
+  (tag (make t252))
+  (tag (make t253))
+  (tag (make t254))
+  (tag (make t255))
+  (tag (make t256))
+  (ret 0))

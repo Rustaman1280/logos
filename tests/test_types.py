@@ -364,18 +364,32 @@ class SignatureTest(unittest.TestCase):
         error = expect_error("(mod m)(fn f :i64 (ret 0))", "E0002")
         self.assertEqual(error.path, "m/f")
 
-    def test_a_type_variable_is_rejected_for_now(self):
+    def test_a_type_variable_in_a_signature_is_a_generic_parameter(self):
+        # Task 10 replaces Task 4's refusal: a single capital letter in a
+        # signature is a type parameter, and the body waits for a call to fix
+        # it (see ``tests/test_generics.py`` for the substitution itself).
+        checked = check_src("(mod m)(fn id :T ((a :T)) (ret a))")
+        self.assertEqual(
+            checked.fn_sigs["id"], FnTy((TypeVar("T"),), TypeVar("T"))
+        )
+        self.assertEqual(checked.generic, frozenset({"id"}))
+        self.assertEqual(checked.instances, {})
+
+    def test_a_generic_body_is_checked_per_instantiation(self):
+        # ``(ret a)`` is only wrong in the copy where T is ``:str``: the
+        # signature promises ``:i64``, so the copy returns the wrong type.
         error = expect_error(
             '(mod m)(fn id :i64 ((a T)) (ret a))(fn f :i64 () (ret (id "s")))',
-            "E0101",
+            "E0100",
         )
-        self.assertEqual(error.path, "m/id/1/0")
-        self.assertIn("type variable T", error.message)
+        self.assertEqual(error.path, "m/id/2")
+        self.assertEqual(error.message, "function 'id$str' returns :i64, found :str")
 
-    def test_a_type_variable_in_a_body_is_rejected_too(self):
+    def test_a_type_variable_in_a_body_is_unbound(self):
         error = expect_error(
-            "(mod m)(fn f :i64 ((a :i64)) (let b T a) (ret b))", "E0101"
+            "(mod m)(fn f :i64 ((a :i64)) (let b T a) (ret b))", "E0501"
         )
+        self.assertEqual(error.path, "m/f/2")
         self.assertIn("type variable T", error.message)
 
     def test_a_definition_name_may_not_start_with_a_colon(self):

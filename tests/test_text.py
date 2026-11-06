@@ -20,7 +20,7 @@ from logos.check import CheckedModule, check_module
 from logos.diag import LogosError
 from logos.parser import parse
 from logos.resolve import resolve
-from logos.types import Arr, Prim, Vec
+from logos.types import Arr, FnTy, Prim, TypeVar, Vec
 
 ROOT = Path(__file__).resolve().parents[1]
 EXEC = ROOT / "tests" / "exec"
@@ -292,12 +292,15 @@ class VecCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0104")
         self.assertEqual(error.message, "cannot free immutable binding 'v'")
 
-    def test_a_vector_of_a_type_variable_is_still_e0101(self):
-        # Generics arrive in Task 10: a type variable has no substitution yet,
-        # so ``(vec T)`` is an unknown type rather than a wildcard.
-        error = fail_on("(mod m)(fn f :void ((v (vec T))) (ret))")
-        self.assertEqual(error.code, "E0101")
-        self.assertEqual(error.message, "type variable T is not available yet")
+    def test_a_vector_of_a_type_variable_is_a_generic_signature(self):
+        # A type variable is what makes a definition generic: ``(vec T)`` is a
+        # vector of whatever a call site fixes, and nothing inside the body is
+        # checked until one does.
+        checked_ = checked("(mod m)(fn f :void ((v (vec T))) (ret))")
+        self.assertEqual(
+            checked_.fn_sigs["f"], FnTy((Vec(TypeVar("T")),), Prim("void"))
+        )
+        self.assertEqual(checked_.generic, frozenset({"f"}))
 
     def test_a_vector_of_void_is_refused(self):
         error = fail_on_lower("(mod m)(fn f :void ((v (vec :void))) (ret))")

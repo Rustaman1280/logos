@@ -32,6 +32,13 @@ Opcode                     Tuple
 ``phi``                    ``(dest, ty, ((value, label), ...))``
 ``trunc``                  ``(dest, from_ty, to_ty, value)``
 ``call``                   ``(dest, callee, (arg, ...))``
+``allocarec``              ``(dest, fields)`` — a stack slot of a literal struct
+``geprec``                 ``(dest, fields, base, index)`` — address of one field
+``bitcastrec``             ``(dest, fields, from_ty, value)`` — value to record ``*``
+``bitcastout``             ``(dest, fields, to_ty, value)`` — record ``*`` to value
+``faddr``                  ``(dest, symbol)`` — a function's address as ``i8*``
+``fnptr``                  ``(dest, ret, params, value)`` — ``i8*`` to a callable
+``icall``                  ``(dest, ret, params, callee, (arg, ...))``
 =========================  ===================================================
 
 Terminators:

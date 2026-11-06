@@ -4,7 +4,7 @@ Every diagnostic code lives in ``CODES``. Passes import the code they report
 instead of spelling a literal, so ``E0001`` cannot mean two different things in
 two modules. ``E0001``-``E0006`` are the read-only passes (lexing, parsing,
 resolution); ``E01xx`` is the type checker, ``E02xx`` struct fields, ``E03xx``
-ownership, and ``E04xx`` the string and vector operations.
+ownership, ``E04xx`` the string and vector operations and ``E05xx`` generics.
 
 Runtime codes
 -------------
@@ -65,6 +65,8 @@ CODES = {
     "E0400": "index type mismatch",
     "E0401": "string not a str",
     "E0402": "vector value not copyable",
+    "E0500": "instantiation limit reached",
+    "E0501": "unbound type variable",
 }
 
 UNBALANCED = "E0001"
@@ -88,6 +90,15 @@ MOVE_IMMUTABLE = "E0302"
 INDEX_TYPE = "E0400"
 NOT_A_STR = "E0401"
 VEC_MOVE = "E0402"
+
+#: More distinct instantiations of generic functions than the compiler will
+#: monomorphise. 256 copies is the documented ceiling: a program that asks for
+#: a 257th is refused rather than allowed to grow the binary without bound.
+INSTANTIATION_LIMIT = "E0500"
+
+#: A type variable that nothing binds: a call whose arguments fix no type for
+#: it, or an annotation that names one the enclosing definition never declared.
+UNBOUND_TYPE_VAR = "E0501"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

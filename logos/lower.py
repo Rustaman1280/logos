@@ -180,6 +180,41 @@ cannot be recycled, so the double-free check in ``rt_free`` stays exact. The
 runtime, not the compiler, decides what a live block is, which is why a double
 free is caught there: a copy of a pointer the checker could not see — through
 an aggregate, or from C — still reaches ``rt_free`` twice.
+
+Generics
+--------
+A generic function has no body of its own here: the checker's copies do. Each
+``Instance`` is lowered as its own function at ``lg.<module>.<name>$<type
+arguments>`` — ``lg.m.map$i64$i64`` — with the copy's concrete parameters and
+return type, and its own type record, so one source path can mean ``:i64`` in
+one copy and ``:str`` in the next. A call site's copy is the one the checker
+recorded for that path; anything else would be a second, silent instantiation
+the checker never verified. A generic that no call reaches is not emitted at
+all: there is no type to emit it at.
+
+Closures
+--------
+``(fn :R ((p :T)...) body...)`` becomes a function of its own plus a value of
+two words, ``{ i8*, i8* }``: the environment and the code. The code's address
+is taken with ``faddr`` and the environment's with ``allocarec``/``geprec`` —
+one stack slot holding a copy of each captured binding, written where the
+expression appears and read through the pointer inside the closure. Stack, not
+heap, because the language allocates nothing the source did not spell, and a
+copy at creation is what "capture by value" means: a later ``set`` of the outer
+binding reaches the binding, not the copy.
+
+The environment therefore lives exactly as long as the frame that created it;
+nothing here frees it, and nothing extends it. A closure that outlives its
+creating function — returned, or stored where a later frame can call it — reads
+a dead slot. Task 10 does not detect that, and the language has no region or
+borrow rule that could; the one copy per expression per frame is also why a
+closure made in a loop shares its environment with the iteration that follows.
+
+Calling one is indirect: the value is loaded, its two words are extracted, the
+code pointer is ``bitcast`` to its real type — ``R (i8*, T...)``, the
+environment first — and the call passes the environment ahead of the declared
+arguments. A named function used as a value is the same pair with a null
+environment, so both cross the boundary the same way.
 """
 
 from __future__ import annotations
@@ -192,7 +227,10 @@ from logos.check import (
     BUILTINS,
     DIRECTIVES,
     CheckedModule,
+    Closure,
+    Instance,
     PRINTABLE,
+    Types,
     fn_param_nodes,
     fn_shape,
     is_wildcard,
@@ -226,7 +264,7 @@ from logos.ir import (
 )
 from logos.lexer import ATOM, NUMBER, STRING, Token
 from logos.nodes import Node
-from logos.types import INTEGERS, Arr, Own, Prim, Ptr, StructRef, Ty, Vec
+from logos.types import INTEGERS, Arr, FnTy, Own, Prim, Ptr, StructRef, Ty, Vec
 
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
@@ -396,6 +434,19 @@ def _unlowered(
         if _is_void(ty.elem):
             return ty.elem, None
         return _unlowered(ty.elem, structs, stack)
+    if isinstance(ty, FnTy):
+        # A function value is two opaque words, but the type it is called
+        # through is spelled at the call: every parameter and the result must
+        # have a layout, or the indirect call would print a type clang refuses.
+        for param in ty.params:
+            if _is_void(param):
+                # A parameter is a storage location, and no ``void`` value
+                # exists to put in it.
+                return param, None
+            bad, cycle = _unlowered(param, structs, stack)
+            if bad is not None or cycle is not None:
+                return bad, cycle
+        return _unlowered(ty.ret, structs, stack)
     try:
         llvm.type_text(ty)
     except ValueError:
@@ -425,10 +476,17 @@ def lower_module(cm: CheckedModule, *, debug: bool = False) -> IrModule:
     report at the exit of ``main``; a release build runs without the tracker's
     output, because a program that leaks is a program the author has decided
     to run as it is.
+
+    A generic definition has no body here — only the copies the checker made
+    for its call sites do, and they are lowered after every ordinary function.
     """
     lowering = _Lower(cm, debug=debug)
     for name, node in cm.module.fns.items():
+        if name in cm.generic:
+            continue
         lowering.fn(name, node)
+    for instance in cm.instances.values():
+        lowering.instance(instance)
     return lowering.close()
 
 
@@ -456,9 +514,11 @@ def lower_test(cm: CheckedModule, test_name: str, *, debug: bool = True) -> IrMo
     lowering = _Lower(cm, debug=debug)
     lowering.symbols.pop("main", None)
     for name, fn_node in cm.module.fns.items():
-        if name == "main":
+        if name == "main" or name in cm.generic:
             continue
         lowering.fn(name, fn_node)
+    for instance in cm.instances.values():
+        lowering.instance(instance)
     fn = IrFn("main", [], _ENTRY_RET, [IrBlock("entry")], symbol="main")
     builder = _Fn(lowering, fn, path=node.path, ret=Prim("void"), is_main=True)
     builder.body(
@@ -491,12 +551,24 @@ class _Lower:
         #: this backend cannot spell, and a module should not fail to build
         #: over a struct it never touched.
         self.structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        #: The type record shared by everything that is not a copy: the
+        #: module's own functions and its tests.
+        self.body = Types(cm.expr_types, cm.call_targets, cm.closures, cm.declared)
         #: Every source function this module can call, mapped to its symbol.
         #: Built before any body is lowered, so source order is irrelevant and
-        #: a call to a name that is not here is E0103 in the lowerer.
+        #: a call to a name that is not here is E0103 in the lowerer. A generic
+        #: definition is left out: it has no body of its own, and calling it
+        #: goes through the copy the checker recorded for the call site.
         self.symbols: dict[str, str] = {
-            name: self.symbol(name) for name in cm.module.fns
+            name: self.symbol(name)
+            for name in cm.module.fns
+            if name not in cm.generic
         }
+        #: The ``$lambda$<n>`` names closures have been given so far.
+        self.lambdas = 0
+        self.lambda_names: set[str] = set()
+        #: The wrapper each named function used as a value got, by source name.
+        self.wrappers: dict[str, str] = {}
 
     def symbol(self, name: str) -> str:
         """The linker-visible symbol for a program function.
@@ -560,6 +632,27 @@ class _Lower:
             llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
         elif isinstance(ty, (Arr, Ptr, Own, Vec)):
             self._collect(ty.elem, stack)
+        elif isinstance(ty, FnTy):
+            for param in ty.params:
+                self._collect(param, stack)
+            self._collect(ty.ret, stack)
+
+    def next_name(self, prefix: str) -> str:
+        """A fresh source-level name for a generated function: ``$lambda$1``.
+
+        ``$`` and the counter keep it apart from any ordinary definition, and
+        the loop skips a source name that happens to spell the same thing.
+        """
+        while True:
+            self.lambdas += 1
+            name = f"{prefix}${self.lambdas}"
+            if name not in self.symbols and name not in self.lambda_names:
+                self.lambda_names.add(name)
+                return name
+
+    def next_lambda(self) -> str:
+        """A fresh name for one closure's function."""
+        return self.next_name("$lambda")
 
     def fn(self, name: str, node: Node) -> None:
         ret, params, start = fn_shape(node, self.cm.types)
@@ -594,6 +687,44 @@ class _Lower:
         builder.finish()
         self.ir.functions.append(fn)
 
+    def instance(self, instance: Instance) -> None:
+        """Lower one monomorphised copy of a generic function.
+
+        The copy's parameters and return type are the checker's, not the
+        signature's: the signature still names type variables, and the copy has
+        none. Its body is lowered from the same source node as the original,
+        but its type record is the copy's, so every path resolves to the types
+        this instantiation fixed.
+        """
+        node = self.cm.module.fns[instance.fn]
+        _, params, start = fn_shape(node, self.cm.types)
+        self.use_type(instance.ret, node.path)
+        for param_ty in instance.params:
+            self.use_type(param_ty, node.path)
+        fn = IrFn(
+            instance.name,
+            [],
+            instance.ret,
+            [IrBlock("entry")],
+            symbol=self.symbol(instance.name),
+            internal=True,
+        )
+        builder = _Fn(
+            self,
+            fn,
+            path=node.path,
+            ret=instance.ret,
+            is_main=False,
+            body=instance.body,
+        )
+        builder.parameters(
+            [(name, ty) for (name, _), ty in zip(params, instance.params)],
+            [param.path for param in fn_param_nodes(node)],
+        )
+        builder.body(list(node.items[start:]))
+        builder.finish()
+        self.ir.functions.append(fn)
+
     def close(self) -> IrModule:
         """Finish the module: its struct definitions, then its declarations."""
         self.ir.structs = [
@@ -612,7 +743,14 @@ class _Fn:
     """
 
     def __init__(
-        self, lowering: _Lower, fn: IrFn, *, path: str, ret: Ty, is_main: bool
+        self,
+        lowering: _Lower,
+        fn: IrFn,
+        *,
+        path: str,
+        ret: Ty,
+        is_main: bool,
+        body: Types | None = None,
     ) -> None:
         self.lowering = lowering
         self.cm = lowering.cm
@@ -620,6 +758,7 @@ class _Fn:
         self.path = path
         self.ret = ret
         self.is_main = is_main
+        self.record = body if body is not None else lowering.body
         self.block = fn.blocks[0]
         self.count = 0
         self.bindings = 0
@@ -756,8 +895,13 @@ class _Fn:
             self.value(node, node.path)
 
     def bind(self, node: Node) -> None:
-        name, declared, init = let_shape(node, self.cm.types)
-        ty = declared if declared is not None else self.value_type(init, node.path)
+        name, declared, init = let_shape(node, self.cm.types, None)
+        # The binding's type is the checker's: inside a copy, an annotation
+        # ``:T`` is already the concrete type this instantiation fixed, so the
+        # lowerer never substitutes a second time.
+        ty = self.record.declared.get(node.path)
+        if ty is None:
+            ty = declared if declared is not None else self.value_type(init, node.path)
         slot = self.slot(ty, path=node.path)
         self.emit(("store", ty, self.value(init, node.path), slot))
         self.vars[name] = (ty, slot)
@@ -1639,8 +1783,16 @@ class _Fn:
             return self.ptr_form(item)
         if kind == "ptr-add":
             return self.ptr_add(item)
+        if kind == "fn":
+            return self.closure(item)
         if kind in _STATEMENTS:
             raise diag(UNKNOWN_NODE, item.path, f"'{kind}' is a statement, not a value")
+        # A binding of a function type is called through its value, whether the
+        # checker found it there or in the function namespace; the checker
+        # resolves in that order, so this pass reads it the same way.
+        binding = self.vars.get(kind)
+        if binding is not None and isinstance(binding[0], FnTy):
+            return self.indirect_call(item, binding[0])
         # A module-level ``fn`` shadows a builtin: the checker resolves
         # ``env.fns`` before ``BUILTINS``, so the lowerer must agree or a user
         # ``print`` would check as their own function and lower as the builtin.
@@ -1667,6 +1819,10 @@ class _Fn:
         if token.kind == ATOM:
             if token.value in ("true", "false"):
                 return token.value
+            if token.value not in self.vars and token.value in self.cm.fn_sigs:
+                # A function's name is a value: its code address with no
+                # environment, which is what a closure with no captures has.
+                return self.fn_value(token.value, where)
             return self.load(token.value, where)
         raise diag(UNKNOWN_NODE, where, f"a {token.kind.lower()} is not a value")
 
@@ -1696,8 +1852,8 @@ class _Fn:
         return dest
 
     def type_of(self, node: Node) -> Ty:
-        """The type the checker recorded for ``node``."""
-        ty = self.cm.expr_types.get(node.path)
+        """The type the checker recorded for ``node`` in this body."""
+        ty = self.record.expr_types.get(node.path)
         if ty is None:
             raise diag(UNKNOWN_NODE, node.path, "the checker recorded no type here")
         return ty
@@ -2073,6 +2229,26 @@ class _Fn:
         return result
 
     def call(self, node: Node) -> str:
+        """A direct call: to a copy the checker chose, or to a definition.
+
+        A generic call site has a recorded target — the copy the checker made
+        and verified for these argument types. Falling back to the source name
+        would call a function this module never emitted, or emit a second copy
+        the checker never saw, so the record is the only source of truth here.
+        """
+        target = self.record.call_targets.get(node.path)
+        if target is not None:
+            instance = self.cm.instances.get(target)
+            if instance is None:
+                raise diag(
+                    UNKNOWN_FUNCTION,
+                    node.path,
+                    f"no monomorphised copy named '{target}' was checked",
+                )
+            args = tuple(self.value(arg, node.path) for arg in node.items[1:])
+            dest = "" if _is_void(instance.ret) else self.temp()
+            self.emit(("call", dest, self.lowering.symbol(target), args))
+            return dest
         symbol = self.lowering.symbols.get(node.kind)
         if symbol is None:
             raise diag(
@@ -2086,6 +2262,183 @@ class _Fn:
         dest = "" if _is_void(sig.ret) else self.temp()
         self.emit(("call", dest, symbol, args))
         return dest
+
+    # -- closures ---------------------------------------------------------
+
+    def indirect_call(self, node: Node, sig: FnTy) -> str:
+        """A call through a function value: extract both words, then ``icall``.
+
+        The environment is passed ahead of the declared arguments, which is the
+        one ABI a closure and a named function share. The code pointer is
+        opaque in the value, so it is ``bitcast`` to the signature the checker
+        gave the call — never called through an untyped pointer.
+        """
+        callee = self.load(node.kind, node.path)
+        env = self.temp()
+        self.emit(("extractvalue", env, sig, _VOID_PTR, callee, 0))
+        code = self.temp()
+        self.emit(("extractvalue", code, sig, _VOID_PTR, callee, 1))
+        params = (_VOID_PTR, *sig.params)
+        pointer = self.temp()
+        self.emit(("fnptr", pointer, sig.ret, params, code))
+        args = (env, *(self.value(arg, node.path) for arg in node.items[1:]))
+        dest = "" if _is_void(sig.ret) else self.temp()
+        self.emit(("icall", dest, sig.ret, params, pointer, args))
+        return dest
+
+    def fn_value(self, name: str, where: str) -> str:
+        """A named function as a value: a wrapper's address, null environment.
+
+        The value's ABI is always ``R (i8*, T...)``, but a definition takes
+        ``(T...)``: calling one through the other's type would hand the
+        environment pointer to the first parameter. A one-line wrapper per used
+        function makes the two agree, so a named function and a closure are
+        interchangeable values.
+        """
+        sig = self.cm.fn_sigs[name]
+        wrapper = self.lowering.wrappers.get(name)
+        if wrapper is None:
+            symbol = self.lowering.symbols.get(name)
+            if symbol is None:
+                raise diag(
+                    UNKNOWN_FUNCTION,
+                    where,
+                    f"cannot take the address of '{name}': no lowered definition",
+                )
+            helper = self.lowering.next_name("$fnvalue")
+            fn = IrFn(
+                helper,
+                [],
+                sig.ret,
+                [IrBlock("entry")],
+                symbol=self.lowering.symbol(helper),
+                internal=True,
+            )
+            builder = _Fn(
+                self.lowering,
+                fn,
+                path=self.path,
+                ret=sig.ret,
+                is_main=False,
+                body=self.record,
+            )
+            builder.parameters(
+                [
+                    ("env", _VOID_PTR),
+                    *[(f"p{index}", ty) for index, ty in enumerate(sig.params)],
+                ],
+                [self.path] * (len(sig.params) + 1),
+            )
+            args = tuple(
+                builder.load(f"p{index}", self.path) for index in range(len(sig.params))
+            )
+            dest = "" if _is_void(sig.ret) else builder.temp()
+            builder.emit(("call", dest, symbol, args))
+            if dest:
+                builder.block.term = ("ret", sig.ret, dest)
+            else:
+                builder.block.term = ("ret", Prim("void"), None)
+            builder.finish()
+            self.lowering.ir.functions.append(fn)
+            wrapper = self.lowering.symbol(helper)
+            self.lowering.wrappers[name] = wrapper
+        code = self.temp()
+        self.emit(("faddr", code, wrapper))
+        return self.fn_pair(sig, "null", code)
+
+    def fn_pair(self, sig: FnTy, env: str, code: str) -> str:
+        """The two-word value ``{ environment, code }`` for a function type."""
+        partial = self.temp()
+        self.emit(("insertvalue", partial, sig, "undef", _VOID_PTR, env, 0))
+        whole = self.temp()
+        self.emit(("insertvalue", whole, sig, partial, _VOID_PTR, code, 1))
+        return whole
+
+    def closure(self, node: Node) -> str:
+        """``(fn ...)``: build the environment, take the code's address.
+
+        The environment is one stack slot per closure expression, holding a
+        copy of each captured value. It is written where the expression
+        appears, so a ``set`` of the outer binding afterwards reaches the
+        binding and not the copy. A closure that captures nothing passes a null
+        environment: there is nothing to point at.
+        """
+        info = self.record.closures.get(node.path)
+        if info is None:
+            raise diag(
+                UNKNOWN_NODE, node.path, "the checker recorded no closure here"
+            )
+        name = self.lowering.next_lambda()
+        symbol = self.lowering.symbol(name)
+        env = self.environment(info, node.path)
+        code = self.temp()
+        self.emit(("faddr", code, symbol))
+        value = self.fn_pair(FnTy(info.params, info.ret), env, code)
+        self.lambda_fn(info, node, name, symbol)
+        return value
+
+    def environment(self, info: Closure, path: str) -> str:
+        """The closure's environment as an ``i8*``, or ``null`` when empty."""
+        if not info.captures:
+            return "null"
+        fields = tuple(ty for _, ty in info.captures)
+        slot = f"{self.binding()}.addr"
+        self.allocas.append(("allocarec", slot, fields))
+        for index, (captured, ty) in enumerate(info.captures):
+            self.lowering.use_type(ty, path)
+            address = self.temp()
+            self.emit(("geprec", address, fields, slot, index))
+            self.emit(("store", ty, self.load(captured, path), address))
+        env = self.temp()
+        self.emit(("bitcastout", env, fields, _VOID_PTR, slot))
+        return env
+
+    def lambda_fn(self, info: Closure, node: Node, name: str, symbol: str) -> None:
+        """Lower one closure body as a function of its own.
+
+        The environment arrives as the first parameter. Each captured name is
+        bound to the address of its field inside it, so a read of ``k`` inside
+        the body is the same ``load`` a parameter's read is — and there is no
+        slot to write to, which is why a capture cannot be assigned.
+        """
+        fn = IrFn(
+            name,
+            [],
+            info.ret,
+            [IrBlock("entry")],
+            symbol=symbol,
+            internal=True,
+        )
+        builder = _Fn(
+            self.lowering,
+            fn,
+            path=node.path,
+            ret=info.ret,
+            is_main=False,
+            body=self.record,
+        )
+        builder.captures(info, node.path)
+        builder.parameters(
+            list(zip(info.names, info.params)),
+            [node.path] * len(info.params),
+        )
+        builder.body(list(node.items[_closure_body_start(node) :]))
+        builder.finish()
+        self.lowering.ir.functions.append(fn)
+
+    def captures(self, info: Closure, path: str) -> None:
+        """Bind each captured name to its field inside the environment."""
+        self.fn.params.append(("env", _VOID_PTR))
+        if not info.captures:
+            return
+        fields = tuple(ty for _, ty in info.captures)
+        base = self.temp()
+        self.emit(("bitcastrec", base, fields, _VOID_PTR, "%env"))
+        for index, (name, ty) in enumerate(info.captures):
+            self.lowering.use_type(ty, path)
+            address = self.temp()
+            self.emit(("geprec", address, fields, base, index))
+            self.vars[name] = (ty, address)
 
     def builtin(self, node: Node) -> str:
         """``print``/``println``: format one value, then end the line.
@@ -2222,6 +2575,9 @@ def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
         return _SIZES.get(ty.name, 1)
     if isinstance(ty, (Ptr, Own)):
         return 8
+    if isinstance(ty, FnTy):
+        # ``{ i8*, i8* }``: the environment and the code pointer.
+        return 16
     if isinstance(ty, Vec):
         # ``{ T*, i64, i64 }``: a buffer pointer and two counts.
         return 24
@@ -2253,6 +2609,9 @@ def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
         return min(_SIZES.get(ty.name, 1), 16)
     if isinstance(ty, (Ptr, Own)):
         return 8
+    if isinstance(ty, FnTy):
+        # Two pointers: the alignment is the pointer's, not the size.
+        return 8
     if isinstance(ty, Vec):
         # A pointer and two counts: the alignment is the pointer's.
         return 8
@@ -2267,6 +2626,16 @@ def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
 def _is_marker(item: Node | Token) -> bool:
     """Whether ``item`` is the ``:`` in front of a composite type."""
     return isinstance(item, Token) and item.kind == ATOM and item.value == ":"
+
+
+def _closure_body_start(node: Node) -> int:
+    """The first statement of a ``(fn ...)`` expression, after its signature.
+
+    ``(fn :i64 ((a :i64)) ...)`` puts the body at index three; a composite
+    return type is written behind the marker, ``(fn :(i64) ...)`` — the marker
+    and the list are two items — so the body moves to index four.
+    """
+    return 4 if len(node.items) > 1 and _is_marker(node.items[1]) else 3
 
 
 def _is_true(item: Node | Token) -> bool:

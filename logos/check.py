@@ -138,6 +138,45 @@ Test bodies are checked too, because they are ordinary grammar. ``expect`` and
 ``expect-leak`` are harness directives, not expressions, so their children are
 left alone; a helper ``fn`` inside a test is checked in that test's scope and
 is invisible outside it.
+
+Generics
+--------
+A single capital letter in a signature is a type variable, and a definition
+whose signature mentions one is generic:
+``(fn map :(vec U) ((a :(vec T)) (f :(fn (T) U))) ...)`` is a function of two
+type parameters, read off the signature in the order they first appear.
+Nothing is checked inside a generic body until a call fixes its variables: a
+call unifies each parameter with the argument beside it, and the copy that
+results is checked once per concrete instantiation (monomorphisation). The
+copy's name spells its type arguments, ``map$i64$i64``, so two instantiations
+of one source function never share a symbol.
+
+Instantiations are discovered by a worklist over call sites, not by recursion
+through the checker: a call records what it needs and the body is checked after
+the enclosing body finishes, so a generic that calls another generic — or
+itself — terminates on the memo key ``(name, type arguments)``. 256 distinct
+copies is the ceiling (E0500), and a type variable that no argument binds is
+E0501: at the call that cannot fix it, or at an annotation that names a
+variable the enclosing definition never declared.
+
+Closures
+--------
+``(fn :R ((p :T)...) body...)`` is a value of type ``(fn (T) R)``: the same
+signature spelling as a definition, without the name. It captures by value
+every outer binding its body reads, and the checker records that list so the
+lowerer can build the environment. Capturing copies, so an owning value — an
+``(own T)`` or anything holding a ``(vec T)`` — is refused: its environment has
+no single owner to release it. A captured name is a fresh, immutable binding
+inside the closure, which is why ``set`` on one is E0104 and why a change to
+the outer binding after the closure was made is invisible to it.
+
+A captured value is copied into the frame that created the closure, not onto
+the heap: the language allocates nothing the source did not spell. That frame
+is therefore the closure's lifetime, and a closure returned from the function
+that made it — or stored where a later frame can call it — reads a slot that no
+longer exists. Nothing here detects that: the language has no region or borrow
+rule that could yet, and allocating the environment behind the source's back
+would break the rule that every allocation is visible.
 """
 
 from __future__ import annotations
@@ -152,6 +191,7 @@ from logos.diag import (
     FIELD_TYPE_MISMATCH,
     FREE_NON_OWN,
     INDEX_TYPE,
+    INSTANTIATION_LIMIT,
     LITERAL_RANGE,
     MISSING_RETURN,
     MOVE_IMMUTABLE,
@@ -159,6 +199,7 @@ from logos.diag import (
     NOT_FOUND,
     NOT_MUTABLE,
     TYPE_MISMATCH,
+    UNBOUND_TYPE_VAR,
     UNKNOWN_FIELD,
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
@@ -189,9 +230,73 @@ from logos.types import (
     TypeVar,
     Vec,
     compatible,
+    has_typevar,
     holds_vector,
     parse_type,
+    substitute,
+    typevars,
 )
+
+
+@dataclass(slots=True)
+class Types:
+    """Everything the checker recorded for one body.
+
+    A module's own functions and its tests share one of these; every
+    monomorphised copy has its own, because the same node path is a different
+    type in each copy — ``(ret x)`` is ``:i64`` in ``id$i64`` and ``:str`` in
+    ``id$str``. The four maps are parallel to :attr:`CheckedModule`'s, and the
+    lowerer reads whichever one belongs to the body it is lowering.
+
+    ``declared`` holds each ``let``/``letmut``'s binding type, after
+    substitution, because a generic body's annotation names a variable the
+    lowerer would otherwise have to substitute a second time.
+    """
+
+    expr_types: dict[str, Ty] = field(default_factory=dict)
+    call_targets: dict[str, str] = field(default_factory=dict)
+    closures: dict[str, "Closure"] = field(default_factory=dict)
+    declared: dict[str, Ty] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class Closure:
+    """One ``(fn ...)`` expression: its signature and what it captured.
+
+    ``captures`` holds the outer bindings the body read, by name and with the
+    type copied into the environment, in first-use order. The lowerer builds
+    the environment from exactly this list, so the closure body and its
+    creation cannot disagree about which slots exist. ``names`` is the
+    parameter list's names, in order, as the copy's ``define`` line spells them.
+    """
+
+    params: tuple[Ty, ...]
+    names: tuple[str, ...]
+    ret: Ty
+    captures: tuple[tuple[str, Ty], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Instance:
+    """One monomorphised copy of a generic function.
+
+    ``name`` is already mangled — ``map$i64$i64`` — and is the source-level
+    name of the copy: the lowerer mangles it exactly as it mangles any other
+    function, so no user name can collide with a copy of another instantiation.
+    ``body`` is the type record for this copy alone.
+    """
+
+    name: str
+    fn: str
+    args: tuple[Ty, ...]
+    params: tuple[Ty, ...]
+    ret: Ty
+    body: Types
+
+
+#: The ceiling on distinct monomorphised copies in one program. A 257th
+#: instantiation is E0500 rather than an ever-growing binary.
+MAX_INSTANCES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +310,12 @@ class CheckedModule:
     scope analysis. ``structs`` holds each visible struct's fields in
     declaration order, the layout the backend needs and that the checker has
     already validated.
+
+    ``call_targets`` names the monomorphised copy a call site selected, and
+    ``closures`` records each ``(fn ...)`` expression's captures; both are keyed
+    by node path, like ``expr_types``. ``instances`` holds the copies
+    themselves, in the order the checker discovered them, and ``generic`` names
+    the source functions that have no body of their own to lower.
     """
 
     module: Module
@@ -212,6 +323,71 @@ class CheckedModule:
     fn_sigs: dict[str, FnTy]
     expr_types: dict[str, Ty]
     structs: dict[str, tuple[tuple[str, Ty], ...]] = field(default_factory=dict)
+    call_targets: dict[str, str] = field(default_factory=dict)
+    closures: dict[str, Closure] = field(default_factory=dict)
+    declared: dict[str, Ty] = field(default_factory=dict)
+    instances: dict[str, Instance] = field(default_factory=dict)
+    generic: frozenset[str] = frozenset()
+
+
+def mangle_instance(name: str, args: tuple[Ty, ...]) -> str:
+    """The name of one copy: ``map$i64$i64``.
+
+    Each type argument is spelled by :func:`mangle_type`, and the pieces are
+    joined with ``$`` — a character no primitive, no type form and no escaped
+    named type produces, so two different argument lists can never spell one
+    name. A copy of ``(fn id :T ...)`` at ``:i64`` is therefore ``id$i64``
+    beside the source ``id``, and the lowerer's usual ``lg.<module>.`` mangle
+    puts the two apart.
+    """
+    return name + "".join("$" + mangle_type(arg) for arg in args)
+
+
+def mangle_type(ty: Ty) -> str:
+    """One type argument as a readable, unambiguous name fragment.
+
+    Primitives keep their own spelling (``i64``, ``str``); named types are
+    prefixed so a struct called ``i64`` could never be mistaken for the
+    primitive; composites spell their form around their parts. A name is
+    escaped to ``_xHH`` for every byte outside ``[A-Za-z0-9_]``, which is what
+    keeps the whole fragment one LLVM identifier.
+    """
+    if isinstance(ty, Prim):
+        return ty.name
+    if isinstance(ty, StructRef):
+        return "s:" + _escape_name(ty.name)
+    if isinstance(ty, EnumRef):
+        return "e:" + _escape_name(ty.name)
+    if isinstance(ty, Ptr):
+        return f"ptr({mangle_type(ty.elem)})"
+    if isinstance(ty, Own):
+        return f"own({mangle_type(ty.elem)})"
+    if isinstance(ty, Vec):
+        return f"vec({mangle_type(ty.elem)})"
+    if isinstance(ty, Arr):
+        return f"arr({mangle_type(ty.elem)},{ty.n})"
+    if isinstance(ty, Opt):
+        return f"opt({mangle_type(ty.elem)})"
+    if isinstance(ty, Shared):
+        return f"shared({mangle_type(ty.elem)})"
+    if isinstance(ty, Res):
+        return f"res({mangle_type(ty.ok)},{mangle_type(ty.err)})"
+    if isinstance(ty, FnTy):
+        params = ",".join(mangle_type(param) for param in ty.params)
+        return f"fn({params}){mangle_type(ty.ret)}"
+    return "T:" + _escape_name(ty.name)
+
+
+def _escape_name(name: str) -> str:
+    """Spell ``name`` with one ``_xHH`` escape per character outside the grammar."""
+    if all(char.isascii() and (char.isalnum() or char == "_") for char in name):
+        return name
+    return "".join(
+        char
+        if char.isascii() and (char.isalnum() or char == "_")
+        else f"_x{ord(char):02x}"
+        for char in name
+    )
 
 
 def check_module(m: Module) -> CheckedModule:
@@ -268,7 +444,7 @@ def fn_param_nodes(node: Node) -> list[Node]:
 
 
 def let_shape(
-    node: Node, types: dict[str, Ty]
+    node: Node, types: dict[str, Ty], bindings: dict[str, Ty] | None = None
 ) -> tuple[str, Ty | None, Node | Token]:
     """A binding's name, its declared type and the item holding its initialiser.
 
@@ -276,6 +452,12 @@ def let_shape(
     are ``(let x v)``, ``(let x :i64 v)`` and ``(let x :(vec :i64) v)``; the
     third splits into a marker, a list and the initialiser, which is why the
     initialiser's index is not fixed.
+
+    ``bindings`` is the type variables an annotation may name, already
+    substituted: the checker passes the enclosing definition's, so a generic
+    body's ``:T`` reads as the concrete type of the copy being checked. The
+    lowerer passes the same mapping, or ``None`` when it is reading a signature
+    that defines its variables rather than using them.
     """
     items = node.items
     shape = f"{node.kind} {_LET_SHAPE}"
@@ -289,7 +471,7 @@ def let_shape(
         return name, None, items[2]
     if not _is_type_slot(items[2]):
         raise diag(WRONG_ARITY, node.path, shape)
-    declared, index = _read_type_at(items, 2, types, node.path)
+    declared, index = _read_type_at(items, 2, types, node.path, bindings)
     if len(items) != index + 1:
         raise diag(WRONG_ARITY, node.path, shape)
     return name, declared, items[index]
@@ -423,9 +605,30 @@ class _Env:
     block is gone when that block ends. That is what keeps a read after a join
     from reaching a slot the branch never stored: scope, not liveness, decides
     visibility.
+
+    ``outer`` is set on a closure's environment. A name the closure's own
+    scopes do not hold is looked up there, and finding one *captures* it: the
+    closure gets a fresh copy of the binding, and the capture list grows by
+    that name. A copy is what makes capture by value visible in the types —
+    the closure may read the name for as long as it exists, but nothing it does
+    to the copy reaches the binding outside.
+
+    ``tvars`` is the substitution the enclosing definition's type variables
+    stand for: empty outside a generic, the concrete arguments inside an
+    instantiation. ``structs`` is the layout namespace, so a captured value
+    that holds a ``(vec T)`` is recognised as one.
     """
 
-    def __init__(self, fns: dict[str, FnTy], *, ret: Ty, label: str) -> None:
+    def __init__(
+        self,
+        fns: dict[str, FnTy],
+        *,
+        ret: Ty,
+        label: str,
+        outer: "_Env | None" = None,
+        tvars: dict[str, Ty] | None = None,
+        structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    ) -> None:
         self.fns = dict(fns)
         self.scopes: list[dict[str, _Var]] = [{}]
         self.ret = ret
@@ -433,6 +636,11 @@ class _Env:
         #: How many loops enclose the form being checked. ``break`` and
         #: ``continue`` are legal only when it is non-zero.
         self.loop = 0
+        self.outer = outer
+        self.tvars = dict(tvars or {})
+        self.structs = structs or {}
+        #: The names this closure copied out of ``outer``, in first-use order.
+        self.captures: list[tuple[str, Ty]] = []
 
     @contextmanager
     def block(self) -> Iterator[None]:
@@ -451,12 +659,40 @@ class _Env:
             raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
         block[name] = _Var(ty, mutable, param=param)
 
-    def lookup(self, name: str) -> _Var | None:
+    def lookup(self, name: str, where: str = "") -> _Var | None:
+        """The binding ``name`` stands for, capturing it if this is a closure.
+
+        ``where`` locates the diagnostic a refused capture raises. A capture is
+        a copy, so an owning value cannot be one: the environment would be a
+        second owner of a block nothing could release, and reading the outer
+        binding afterwards would name memory two environments own.
+        """
         for block in reversed(self.scopes):
             var = block.get(name)
             if var is not None:
                 return var
-        return None
+        if self.outer is None:
+            return None
+        found = self.outer.lookup(name, where)
+        if found is None:
+            return None
+        if found.moved:
+            raise diag(USE_AFTER_MOVE, where, f"use after move of '{name}'")
+        if isinstance(found.ty, Own) or holds_vector(found.ty, self.structs):
+            # A closure environment holds copies. An owning value has no copy,
+            # and an environment no statement can name could never release the
+            # one it would otherwise share.
+            code = VEC_MOVE if holds_vector(found.ty, self.structs) else TYPE_MISMATCH
+            raise diag(
+                code,
+                where,
+                f"cannot capture '{name}' of type {found.ty} in a closure: "
+                "its environment holds copies",
+            )
+        copy = _Var(found.ty, mutable=False, param=True)
+        self.scopes[0][name] = copy
+        self.captures.append((name, found.ty))
+        return copy
 
     def snapshot(self) -> list[tuple[_Var, bool]]:
         """The moved flag of every visible binding, outermost first.
@@ -544,25 +780,53 @@ class _Checker:
     def __init__(self, module: Module) -> None:
         self.module = module
         self.expr_types: dict[str, Ty] = {}
+        self.call_targets: dict[str, str] = {}
+        self.closures: dict[str, Closure] = {}
+        self.declared: dict[str, Ty] = {}
         self._types: dict[str, Ty] = {}
         self._structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
         self._seen: dict[str, _Visible] = {}
         self._active: list[str] = []
+        #: Which body's record the checker is writing: the module's own, or one
+        #: instantiation's. Swapped around each copy's body, because the same
+        #: node path is a different type in each.
+        self._record = Types(
+            self.expr_types, self.call_targets, self.closures, self.declared
+        )
+        #: The source functions a call may instantiate. Only this module's own
+        #: definitions, because a copy's body is emitted from here; a generic
+        #: reached through an import has no body this module can lower.
+        self._bodies: dict[str, Node] = {}
+        #: The copy each (name, type arguments) pair made, in discovery order.
+        self._instances: dict[str, Instance] = {}
+        #: Copies discovered but not yet checked. A worklist rather than
+        #: recursion, so a generic that calls another (or itself) terminates on
+        #: memoisation instead of nesting one body check per call site.
+        self._pending: list[str] = []
+        #: Each generic's type parameters, in signature order.
+        self._params: dict[str, tuple[str, ...]] = {}
 
     def run(self) -> CheckedModule:
         visible = self._visible(self.module)
         self._types = visible.types
         self._structs = visible.structs
+        self._bodies = {name: node for name, node in self.module.fns.items()}
         for node in self.module.fns.values():
             self._check_fn(node, visible.fns)
         for node in self.module.tests.values():
             self._check_test(node, visible.fns)
+        self._drain(visible.fns)
         return CheckedModule(
             self.module,
             dict(visible.types),
             dict(visible.fns),
             self.expr_types,
             dict(visible.structs),
+            self.call_targets,
+            self.closures,
+            self.declared,
+            dict(self._instances),
+            frozenset(self._params),
         )
 
     # -- namespaces ------------------------------------------------------
@@ -623,10 +887,34 @@ class _Checker:
         return visible
 
     def _signature(self, node: Node, types: dict[str, Ty]) -> FnTy:
-        if node.name is None or node.name.startswith(":"):
+        """A ``fn``'s type, and its type parameters when it has any.
+
+        A type variable in a signature is what declares it: there is no
+        separate parameter list, so the signature is read with every variable
+        accepted, and the ones it mentions — return type first, then the
+        parameters left to right — become the copy's type arguments.
+        """
+        name = node.name
+        if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
         ret, params, _ = fn_shape(node, types)
-        return FnTy(tuple(ty for _, ty in params), ret)
+        sig = FnTy(tuple(ty for _, ty in params), ret)
+        order = typevars(ret)
+        for param in sig.params:
+            for var in typevars(param):
+                if var not in order:
+                    order.append(var)
+        if order:
+            if name == "main":
+                # The entry point is called by the system with no arguments, so
+                # nothing could ever fix its type variables.
+                raise diag(
+                    UNKNOWN_TYPE,
+                    node.path,
+                    "main cannot have type variables: nothing fixes them",
+                )
+            self._params[name] = tuple(order)
+        return sig
 
     # -- bodies ----------------------------------------------------------
 
@@ -637,7 +925,16 @@ class _Checker:
         sig = fns.get(name)
         if sig is None:
             raise diag(UNKNOWN_NODE, node.path, f"no signature for '{name}'")
-        env = _Env(fns, ret=sig.ret, label=f"function '{name}'")
+        if name in self._params:
+            # A generic body has no single type: it is checked once per copy,
+            # after a call has fixed its type arguments (see ``_instantiate``).
+            return
+        env = _Env(
+            fns,
+            ret=sig.ret,
+            label=f"function '{name}'",
+            structs=self._structs,
+        )
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
             env.define(
@@ -653,7 +950,9 @@ class _Checker:
         name = node.name
         if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "test needs a name")
-        env = _Env(fns, ret=Prim("void"), label=f"test '{name}'")
+        env = _Env(
+            fns, ret=Prim("void"), label=f"test '{name}'", structs=self._structs
+        )
         for item in node.items[2:]:
             if not isinstance(item, Node):
                 raise diag(UNKNOWN_NODE, node.path, "a test body must be a form")
@@ -673,7 +972,13 @@ class _Checker:
             raise diag(DUPLICATE, node.path, f"duplicate definition '{name}'")
         sig = self._signature(node, self._types)
         env.fns[name] = sig
-        inner = _Env(env.fns, ret=sig.ret, label=f"function '{name}'")
+        inner = _Env(
+            env.fns,
+            ret=sig.ret,
+            label=f"function '{name}'",
+            tvars=env.tvars,
+            structs=self._structs,
+        )
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
             inner.define(
@@ -683,18 +988,37 @@ class _Checker:
                 path=param.path,
                 param=True,
             )
+        if name in self._params:
+            # A generic helper's body is checked per copy like any other, but a
+            # copy of a helper has nowhere to be emitted — helpers are not
+            # module functions — so a call to one is refused (E0103) rather
+            # than accepted and then refused by the backend.
+            return
         self._body(node, _body_start(node), inner)
 
     def _body(self, node: Node, start: int, env: _Env) -> None:
         statements = node.items[start:]
+        self._statements(statements, env, node.path)
+
+    def _statements(
+        self,
+        statements: tuple[Node | Token, ...] | list[Node | Token],
+        env: _Env,
+        path: str,
+    ) -> None:
+        """Check a run of statements, and require a ``ret`` when one is owed.
+
+        Shared by a function body, a test helper and a closure body: all three
+        are a block of forms whose last promise is the declared return type.
+        """
         for item in statements:
             if not isinstance(item, Node):
-                raise diag(UNKNOWN_NODE, node.path, "a statement must be a form")
+                raise diag(UNKNOWN_NODE, path, "a statement must be a form")
             self._expr(item, env)
         if env.ret != Prim("void") and not _contains_ret(statements):
             raise diag(
                 MISSING_RETURN,
-                node.path,
+                path,
                 f"{env.label} must return {env.ret} but has no 'ret'",
             )
 
@@ -702,7 +1026,7 @@ class _Checker:
 
     def _expr(self, node: Node, env: _Env, expected: Ty | None = None) -> Ty:
         ty = self._dispatch(node, env, expected)
-        self.expr_types[node.path] = ty
+        self._record.expr_types[node.path] = ty
         return ty
 
     def _dispatch(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
@@ -729,8 +1053,10 @@ class _Checker:
             return self._while(node, env)
         if kind == "match":
             return self._match(node, env, expected)
-        if kind in ("break", "continue"):
+        if kind == "break" or kind == "continue":
             return self._loop_jump(node, env)
+        if kind == "fn":
+            return self._closure(node, env)
         if kind == "ret":
             return self._ret(node, env)
         if kind == "make":
@@ -797,7 +1123,7 @@ class _Checker:
         if token.kind == ATOM:
             if token.value.startswith(":"):
                 raise diag(UNKNOWN_NODE, where, f"type name '{token.value}' is not a value")
-            var = env.lookup(token.value)
+            var = env.lookup(token.value, where)
             if var is not None:
                 if var.moved:
                     # The binding is empty: whatever it used to own has been
@@ -809,6 +1135,20 @@ class _Checker:
                 return var.ty
             if token.value in ("true", "false"):
                 return Prim("bool")
+            bare = env.fns.get(token.value)
+            if bare is not None:
+                # A function's name is a value of its own type: passing one
+                # needs no closure, and a copy of the environment pointer is
+                # what the callee calls through.
+                if has_typevar(bare.ret) or any(
+                    has_typevar(param) for param in bare.params
+                ):
+                    raise diag(
+                        UNBOUND_TYPE_VAR,
+                        where,
+                        f"{token.value} is generic: a call fixes its type variables",
+                    )
+                return bare
             raise diag(NOT_FOUND, where, f"unknown name '{token.value}'")
         raise diag(UNKNOWN_NODE, where, "expected a value")
 
@@ -892,7 +1232,7 @@ class _Checker:
         return Prim("bool")
 
     def _let(self, node: Node, env: _Env, *, mutable: bool) -> Ty:
-        name, declared, init = let_shape(node, self._types)
+        name, declared, init = let_shape(node, self._types, env.tvars)
         self._transfer(init, env, node.path)
         ty = self._value(init, env, declared, node.path)
         if declared is not None and not compatible(declared, ty):
@@ -915,9 +1255,13 @@ class _Checker:
             # neither is a value that contains a vector: the initialiser's
             # value moves here, and the old name is empty.
             self._consume(init, env, node.path)
+        bound = declared if declared is not None else ty
+        # The binding's type, after substitution: a generic body's annotation
+        # names a type variable, and the lowerer must not read the variable.
+        self._record.declared[node.path] = bound
         env.define(
             name,
-            declared if declared is not None else ty,
+            bound,
             mutable=mutable,
             path=node.path,
         )
@@ -928,7 +1272,7 @@ class _Checker:
         if len(items) != 3:
             raise diag(WRONG_ARITY, node.path, "set takes a name and a value")
         name = _name(items[1], node.path, "set")
-        var = env.lookup(name)
+        var = env.lookup(name, node.path)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
@@ -1209,7 +1553,7 @@ class _Checker:
         items = node.items
         if len(items) < 2:
             raise diag(WRONG_ARITY, node.path, "make takes a type and its fields")
-        ty, index = _read_type_at(items, 1, self._types, node.path)
+        ty, index = _read_type_at(items, 1, self._types, node.path, env.tvars)
         values = items[index:]
         if isinstance(ty, Vec):
             # A vector is born empty. There is no ``make``-with-elements form
@@ -1309,7 +1653,7 @@ class _Checker:
                 "set-field takes a mutable name, a field and a value",
             )
         name = _name(items[1], node.path, "set-field")
-        var = env.lookup(name)
+        var = env.lookup(name, node.path)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
@@ -1375,7 +1719,7 @@ class _Checker:
                 "arr-set takes a mutable name, an index and a value",
             )
         name = _name(items[1], node.path, "arr-set")
-        var = env.lookup(name)
+        var = env.lookup(name, node.path)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
@@ -1508,7 +1852,7 @@ class _Checker:
         if not isinstance(items[1], Token) or items[1].kind != ATOM:
             raise diag(WRONG_ARITY, node.path, shape)
         name = _name(items[1], node.path, node.kind)
-        var = env.lookup(name)
+        var = env.lookup(name, node.path)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if var.moved:
@@ -1622,7 +1966,7 @@ class _Checker:
             raise diag(
                 WRONG_ARITY, node.path, "alloc takes a type and an element count"
             )
-        elem, _ = _read_type_at(items, 1, self._types, node.path)
+        elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
         if _is_void(elem):
             raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
         count = self._value(items[2], env, None, node.path)
@@ -1776,7 +2120,7 @@ class _Checker:
         """
         if not (isinstance(item, Token) and item.kind == ATOM):
             return
-        var = env.lookup(item.value)
+        var = env.lookup(item.value, where)
         if var is None or var.moved:
             return
         vector = holds_vector(var.ty, self._structs)
@@ -1805,7 +2149,7 @@ class _Checker:
         """
         if not (isinstance(item, Token) and item.kind == ATOM):
             return
-        var = env.lookup(item.value)
+        var = env.lookup(item.value, where)
         if var is None or not var.moved:
             return
         if holds_vector(var.ty, self._structs):
@@ -1841,21 +2185,32 @@ class _Checker:
         return Prim("void")
 
     def _call(self, node: Node, env: _Env) -> Ty:
+        """A call: through a binding's ``(fn ...)`` type, or by name.
+
+        A name that a binding shadows is that binding — a function value called
+        indirectly. A name in the function namespace is a definition; when its
+        signature mentions a type variable the call is an instantiation, and
+        when it does not it is the plain direct call it always was.
+        """
         name = node.kind
-        var = env.lookup(name)
+        var = env.lookup(name, node.path)
         if var is not None:
             if not isinstance(var.ty, FnTy):
                 raise diag(
                     TYPE_MISMATCH, node.path, f"'{name}' is not a function: found {var.ty}"
                 )
-            sig = var.ty
-        else:
-            found = env.fns.get(name)
-            if found is None:
-                if name in PRINTERS:
-                    return self._printer(node, env)
-                raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
-            sig = found
+            return self._arguments(node, env, name, var.ty)
+        found = env.fns.get(name)
+        if found is None:
+            if name in PRINTERS:
+                return self._printer(node, env)
+            raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
+        if name in self._params:
+            return self._generic_call(node, env, name, found)
+        return self._arguments(node, env, name, found)
+
+    def _arguments(self, node: Node, env: _Env, name: str, sig: FnTy) -> Ty:
+        """Check one call's arguments against ``sig`` and return its type."""
         args = node.items[1:]
         if len(args) != len(sig.params):
             raise diag(
@@ -1893,6 +2248,293 @@ class _Checker:
                 self._consume(arg, env, node.path)
         return sig.ret
 
+    # -- generics ---------------------------------------------------------
+
+    def _generic_call(
+        self, node: Node, env: _Env, name: str, sig: FnTy
+    ) -> Ty:
+        """One call to a generic: unify the arguments, then name the copy.
+
+        Unification is what "resolved per call site" means: each parameter is
+        matched against the argument beside it, binding every type variable it
+        meets. A parameter that mentions no variable is checked exactly as a
+        direct call's is, so the error a non-generic call would give is the
+        error this one gives.
+        """
+        args = node.items[1:]
+        if len(args) != len(sig.params):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                f"function '{name}' takes {_count(len(sig.params), 'argument')}, "
+                f"got {len(args)}",
+            )
+        bindings: dict[str, Ty] = {}
+        for index, (arg, param) in enumerate(zip(args, sig.params), start=1):
+            if holds_vector(param, self._structs):
+                # The parameter is ``(vec T)`` or a vector-holding type however
+                # T ends up bound, so the transfer rules apply before the call
+                # is instantiated.
+                if not (isinstance(arg, Token) and arg.kind == ATOM):
+                    raise diag(
+                        VEC_MOVE, _at(arg, node), "a vector argument must be a name"
+                    )
+                self._transfer(arg, env, node.path)
+            hint = None if has_typevar(param) else param
+            ty = self._value(arg, env, hint, node.path)
+            trial = dict(bindings)
+            if _is_void(ty) or not _unify(param, ty, trial):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(arg, node),
+                    f"argument {index} of '{name}' expects "
+                    f"{substitute(param, bindings)}, found {ty}",
+                )
+            bindings = trial
+            concrete = substitute(param, bindings)
+            if isinstance(concrete, Own) or holds_vector(concrete, self._structs):
+                self._consume(arg, env, node.path)
+        target = self._instantiate(node, name, bindings)
+        self._record.call_targets[node.path] = target.name
+        return target.ret
+
+    def _instantiate(
+        self, node: Node, name: str, bindings: dict[str, Ty]
+    ) -> Instance:
+        """The copy of ``name`` for ``bindings``, checking it the first time.
+
+        The memo key is the mangled name, so a second call with the same type
+        arguments reuses the copy; a new one is recorded and queued, and the
+        worklist checks its body after the enclosing body is done. The ceiling
+        is checked here, where a new copy is about to be made: 256 copies exist
+        before the 257th is asked for, and that one is E0500 rather than a
+        program whose binary grows with every call site.
+        """
+        order = self._params[name]
+        missing = [var for var in order if var not in bindings]
+        if missing:
+            # Nothing in the arguments fixed this variable, so there is no one
+            # type the copy could be made at.
+            raise diag(
+                UNBOUND_TYPE_VAR,
+                node.path,
+                f"type variable {missing[0]} of '{name}' is not bound by this call",
+            )
+        args = tuple(bindings[var] for var in order)
+        target = mangle_instance(name, args)
+        found = self._instances.get(target)
+        if found is not None:
+            return found
+        if target in self._params:
+            # A source definition that already spells this copy's name would
+            # give both the same symbol, so the copy cannot be named.
+            raise diag(
+                UNKNOWN_FUNCTION,
+                node.path,
+                f"cannot name a copy of '{name}': '{target}' is already defined",
+            )
+        body = self._bodies.get(name)
+        if body is None:
+            raise diag(
+                UNKNOWN_FUNCTION,
+                node.path,
+                f"cannot instantiate '{name}': only module functions are "
+                f"monomorphised, not test helpers or imports",
+            )
+        if len(self._instances) >= MAX_INSTANCES:
+            raise diag(
+                INSTANTIATION_LIMIT,
+                node.path,
+                f"more than {MAX_INSTANCES} instantiations of generic functions",
+            )
+        subst = {var: bindings[var] for var in order}
+        sig = self._fn_sig(name)
+        instance = Instance(
+            target,
+            name,
+            args,
+            tuple(substitute(param, subst) for param in sig.params),
+            substitute(sig.ret, subst),
+            Types(),
+        )
+        self._instances[target] = instance
+        self._pending.append(target)
+        return instance
+
+    def _fn_sig(self, name: str) -> FnTy:
+        """A generic definition's signature, with its type variables in place."""
+        return self._visible(self.module).fns[name]
+
+    def _drain(self, fns: dict[str, FnTy]) -> None:
+        """Check every queued copy, oldest first, until the queue is empty.
+
+        A copy's body can name further copies, which append themselves to the
+        queue; draining it in creation order is what makes a generic that calls
+        another generic — or itself — terminate, and makes the order of the
+        emitted copies a function of the source alone.
+        """
+        while self._pending:
+            target = self._pending.pop(0)
+            self._check_instance(self._instances[target], fns)
+
+    def _check_instance(self, instance: Instance, fns: dict[str, FnTy]) -> None:
+        """Check one copy's body under its own substitution and type record."""
+        node = self._bodies[instance.fn]
+        _, _, start = fn_shape(node, self._types)
+        subst = dict(zip(self._params[instance.fn], instance.args))
+        env = _Env(
+            fns,
+            ret=instance.ret,
+            label=f"function '{instance.name}'",
+            tvars=subst,
+            structs=self._structs,
+        )
+        for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
+            param_name, _ = _param_parts(param)
+            env.define(
+                param_name,
+                instance.params[index],
+                mutable=False,
+                path=param.path,
+                param=True,
+            )
+        saved = self._record
+        self._record = instance.body
+        try:
+            self._body(node, start, env)
+        finally:
+            self._record = saved
+
+    # -- closures ---------------------------------------------------------
+
+    def _closure(self, node: Node, env: _Env) -> Ty:
+        """``(fn :R ((p :T)...) body...)``: a value of ``(fn (T) R)``.
+
+        The body is a function of its own: parameters, a return type and its
+        own loop depth, checked in a fresh scope whose outer environment is the
+        one the expression appeared in. A name the body reads from there is
+        captured on first use — the lookup copies it — so the capture list the
+        lowerer builds the environment from is exactly the set of names the
+        body could not resolve for itself.
+        """
+        ret, params, start = closure_shape(node, self._types, env.tvars)
+        inner = _Env(
+            env.fns,
+            ret=ret,
+            label="closure",
+            outer=env,
+            tvars=env.tvars,
+            structs=self._structs,
+        )
+        for (param_name, param_ty), param_node in zip(
+            params, _param_nodes(_closure_params(node), node.path)
+        ):
+            inner.define(
+                param_name,
+                param_ty,
+                mutable=False,
+                path=param_node.path,
+                param=True,
+            )
+        self._statements(node.items[start:], inner, node.path)
+        self._record.closures[node.path] = Closure(
+            tuple(ty for _, ty in params),
+            tuple(name for name, _ in params),
+            ret,
+            tuple(inner.captures),
+        )
+        return FnTy(tuple(ty for _, ty in params), ret)
+
+
+def closure_shape(
+    node: Node, types: dict[str, Ty], bindings: dict[str, Ty] | None = None
+) -> tuple[Ty, list[tuple[str, Ty]], int]:
+    """A ``(fn ...)`` expression's return type, parameters and body start.
+
+    The spelling is a definition's without the name: ``(fn :i64 ((a :i64))
+    (ret a))``. ``bindings`` is the enclosing definition's substitution, so a
+    closure inside a generic body may name its type variables.
+    """
+    if len(node.items) < 3:
+        raise diag(
+            UNKNOWN_NODE,
+            node.path,
+            "a closure needs a return type and a parameter list",
+        )
+    ret, index = _read_type_at(node.items, 1, types, node.path, bindings)
+    if index >= len(node.items):
+        raise diag(UNKNOWN_NODE, node.path, "a closure needs a parameter list")
+    params: list[tuple[str, Ty]] = []
+    names: set[str] = set()
+    for param in _param_nodes(node.items[index], node.path):
+        name, item = _param_parts(param)
+        if name in names:
+            raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
+        names.add(name)
+        ty = _read_type(item, types, param.path, bindings)
+        if compatible(ty, Prim("void")):
+            raise diag(
+                TYPE_MISMATCH, param.path, f"parameter '{name}' cannot be :void"
+            )
+        params.append((name, ty))
+    return ret, params, index + 1
+
+
+def _closure_params(node: Node) -> Node | Token:
+    """The parameter list of a ``(fn ...)`` expression, wherever it sits."""
+    index = 3 if len(node.items) > 1 and _marker(node.items[1]) else 2
+    if index >= len(node.items):
+        raise diag(UNKNOWN_NODE, node.path, "a closure needs a parameter list")
+    return node.items[index]
+
+
+def _unify(param: Ty, actual: Ty, bindings: dict[str, Ty]) -> bool:
+    """Bind every type variable in ``param`` so that it matches ``actual``.
+
+    The result is what makes a call site's types concrete: matching ``(vec T)``
+    against ``(vec :i64)`` binds ``T`` to ``:i64``, and a later match of the
+    same variable must agree with the first. A variable never binds another
+    variable — that would only postpone the choice — and an already-bound one
+    compares with equality, so ``(fn same :T ((a :T) (b :T)))`` accepts two
+    ``:i64`` and refuses an ``:i64`` beside a ``:str``. ``bindings`` is updated
+    on success only; the caller passes a copy so a mismatched argument leaves
+    no half-bound state behind.
+    """
+    if isinstance(param, TypeVar):
+        bound = bindings.get(param.name)
+        if bound is None:
+            if isinstance(actual, TypeVar):
+                return False
+            bindings[param.name] = actual
+            return True
+        return compatible(bound, actual)
+    if isinstance(param, (Ptr, Own, Opt, Shared, Vec)):
+        return isinstance(actual, type(param)) and _unify(
+            param.elem, actual.elem, bindings
+        )
+    if isinstance(param, Arr):
+        return (
+            isinstance(actual, Arr)
+            and param.n == actual.n
+            and _unify(param.elem, actual.elem, bindings)
+        )
+    if isinstance(param, Res):
+        return (
+            isinstance(actual, Res)
+            and _unify(param.ok, actual.ok, bindings)
+            and _unify(param.err, actual.err, bindings)
+        )
+    if isinstance(param, FnTy):
+        if not isinstance(actual, FnTy) or len(param.params) != len(actual.params):
+            return False
+        if not all(
+            _unify(one, other, bindings)
+            for one, other in zip(param.params, actual.params)
+        ):
+            return False
+        return _unify(param.ret, actual.ret, bindings)
+    return compatible(param, actual)
+
 
 def _operand_message(kind: str, ty: Ty, operand: Ty) -> str:
     """The E0100 text for an arithmetic operand that is not ``ty``."""
@@ -1915,10 +2557,15 @@ def _declared(name: str, node: Node) -> Ty:
     raise diag(UNKNOWN_NODE, body.path, f"unknown type body '{body.kind}'")
 
 
-def _read_type(item: Node | Token, types: dict[str, Ty], fallback: str) -> Ty:
+def _read_type(
+    item: Node | Token,
+    types: dict[str, Ty],
+    fallback: str,
+    bindings: dict[str, Ty] | None = None,
+) -> Ty:
     """Read one type item and resolve its names, locating errors at it."""
     path = item.path if isinstance(item, Node) and item.path else fallback
-    return resolve_type(parse_type(item, path=path), types, path)
+    return resolve_type(parse_type(item, path=path), types, path, bindings)
 
 
 def _read_type_at(
@@ -1926,6 +2573,7 @@ def _read_type_at(
     start: int,
     types: dict[str, Ty],
     fallback: str,
+    bindings: dict[str, Ty] | None = None,
 ) -> tuple[Ty, int]:
     """Read the type at ``items[start]``, returning it and the next index.
 
@@ -1938,26 +2586,42 @@ def _read_type_at(
             raise diag(UNKNOWN_TYPE, fallback, "expected a type after ':'")
         item = items[start + 1]
         start += 1
-    return _read_type(item, types, fallback), start + 1
+    return _read_type(item, types, fallback, bindings), start + 1
 
 
-def resolve_type(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
+def resolve_type(
+    ty: Ty,
+    types: dict[str, Ty],
+    path: str,
+    bindings: dict[str, Ty] | None = None,
+) -> Ty:
     """Resolve every named reference in ``ty`` against ``types``.
 
     A ``StructRef`` becomes the declared type, which turns it into an
     ``EnumRef`` when the name is an enum. An undeclared name is E0101. The
     lookup is total: an absent name is a diagnostic, never a ``KeyError``.
 
+    ``bindings`` decides what a type variable means. ``None`` is a signature
+    reading the variables it *declares*, so each one stays as it is; a mapping
+    is a body inside a definition, where a variable is replaced by the concrete
+    type it stands for and one the mapping does not hold is E0501 — an
+    annotation naming a variable nothing bound.
+
     Public because the lowerer needs the same answer for a type annotation it
     reads from the tree: the checker proves the annotation resolves, and the
     backend must not guess a second time.
     """
     if isinstance(ty, TypeVar):
-        raise diag(
-            UNKNOWN_TYPE,
-            path,
-            f"type variable {ty.name} is not available yet",
-        )
+        if bindings is None:
+            return ty
+        bound = bindings.get(ty.name)
+        if bound is None:
+            raise diag(
+                UNBOUND_TYPE_VAR,
+                path,
+                f"type variable {ty.name} is not bound here",
+            )
+        return bound
     if isinstance(ty, Prim):
         return ty
     if isinstance(ty, (StructRef, EnumRef)):
@@ -1966,23 +2630,28 @@ def resolve_type(ty: Ty, types: dict[str, Ty], path: str) -> Ty:
             raise diag(UNKNOWN_TYPE, path, f"unknown type '{ty.name}'")
         return declared
     if isinstance(ty, Ptr):
-        return Ptr(resolve_type(ty.elem, types, path))
+        return Ptr(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Own):
-        return Own(resolve_type(ty.elem, types, path))
+        return Own(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Opt):
-        return Opt(resolve_type(ty.elem, types, path))
+        return Opt(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Shared):
-        return Shared(resolve_type(ty.elem, types, path))
+        return Shared(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Vec):
-        return Vec(resolve_type(ty.elem, types, path))
+        return Vec(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Res):
-        return Res(resolve_type(ty.ok, types, path), resolve_type(ty.err, types, path))
+        return Res(
+            resolve_type(ty.ok, types, path, bindings),
+            resolve_type(ty.err, types, path, bindings),
+        )
     if isinstance(ty, FnTy):
-        params = tuple(resolve_type(param, types, path) for param in ty.params)
-        return FnTy(params, resolve_type(ty.ret, types, path))
+        params = tuple(
+            resolve_type(param, types, path, bindings) for param in ty.params
+        )
+        return FnTy(params, resolve_type(ty.ret, types, path, bindings))
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
-    elem = resolve_type(ty.elem, types, path)
+    elem = resolve_type(ty.elem, types, path, bindings)
     if holds_vector(elem):
         # Same reason a vector field is refused: an element of a fixed array
         # is not a place this language can name, so a vector stored there
@@ -2106,7 +2775,7 @@ def _scalar(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name in _SCALARS
 
 
-def _contains_ret(items: tuple[Node | Token, ...]) -> bool:
+def _contains_ret(items: tuple[Node | Token, ...] | list[Node | Token]) -> bool:
     """Whether any statement in ``items`` is or contains a ``ret``."""
     for item in items:
         if isinstance(item, Node):

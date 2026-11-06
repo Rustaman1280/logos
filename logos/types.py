@@ -5,13 +5,17 @@ nominal for ``StructRef``/``EnumRef``, which compare by name. There is no
 subtyping and no conversion: :func:`compatible` answers "is this the same
 type", never "can this become that", so a width or a signedness never changes
 under it. A ``TypeVar`` is not a wildcard: it compares by name like any other
-type, and the checker rejects it outright until substitution exists, because a
-wildcard would silently convert a value from one kind to another.
+type. Generics do not make it one — the checker *unifies* a parameter against
+an argument to bind the variable, and :func:`substitute` replaces each bound
+variable by the one concrete type the call chose. Equality itself stays exact,
+so a value never changes kind under it.
 
 Named types are written bare and primitives are written with a colon, matching
 ``(res :i64 parse-error)``: the colon marks the closed built-in vocabulary, so
 ``:point`` is an unknown primitive, not a reference to ``point``. An atom that
-is a single capital letter names a type variable.
+is a single capital letter names a type variable, and so does the same letter
+behind the colon: ``T`` and ``:T`` are one type, because a single capital is
+the one word in the primitive vocabulary that is not a primitive.
 
 :func:`parse_type` is pure syntax. It validates primitives, because that list
 is closed and needs no module to know, but it leaves a bare name as a
@@ -230,9 +234,9 @@ def parse_type(node: "Node | Token", *, path: str = "") -> Ty:
 def compatible(a: Ty, b: Ty) -> bool:
     """Whether ``a`` and ``b`` are the same type, with no widening.
 
-    A ``TypeVar`` compares by name and nothing else. It is deliberately not a
-    wildcard: generics have no substitution yet, so matching a type variable
-    against any type would let a value of one kind stand in for another.
+    A ``TypeVar`` compares by name and nothing else: it is a placeholder the
+    checker substitutes, never a pattern that matches any type, so a value of
+    one kind can never stand in for another through it.
     Everything else must match exactly, including integer width, array length
     and the name of a named type.
     """
@@ -269,6 +273,70 @@ def compatible(a: Ty, b: Ty) -> bool:
             return False
         return compatible(a.ret, b.ret)
     return False
+
+
+def substitute(ty: Ty, bindings: dict[str, Ty]) -> Ty:
+    """Replace every bound type variable in ``ty`` by the type it stands for.
+
+    A variable with no binding is left in place: only the caller knows whether
+    that is an error (an unbound variable at a call site, E0501) or simply a
+    part of a signature that is not being instantiated yet. Substitution is
+    total over the vocabulary, so a variable nested inside a vector, an array,
+    a pointer or a function type is replaced the same way as a bare one.
+    """
+    if isinstance(ty, TypeVar):
+        return bindings.get(ty.name, ty)
+    if isinstance(ty, Prim):
+        return ty
+    if isinstance(ty, (Ptr, Own, Opt, Shared, Vec)):
+        return type(ty)(substitute(ty.elem, bindings))
+    if isinstance(ty, Arr):
+        return Arr(substitute(ty.elem, bindings), ty.n)
+    if isinstance(ty, Res):
+        return Res(
+            substitute(ty.ok, bindings), substitute(ty.err, bindings)
+        )
+    if isinstance(ty, FnTy):
+        return FnTy(
+            tuple(substitute(param, bindings) for param in ty.params),
+            substitute(ty.ret, bindings),
+        )
+    return ty
+
+
+def typevars(ty: Ty) -> list[str]:
+    """Every type variable in ``ty``, in the order it first appears.
+
+    Order matters because it is the order a monomorphised copy spells its type
+    arguments in: ``(fn map :(vec U) ((a :(vec T)) ...))`` names its copies
+    ``map$T$U`` order, read from the return type first and then the
+    parameters left to right.
+    """
+    found: list[str] = []
+
+    def walk(node: Ty) -> None:
+        if isinstance(node, TypeVar):
+            if node.name not in found:
+                found.append(node.name)
+        elif isinstance(node, (Ptr, Own, Opt, Shared, Vec)):
+            walk(node.elem)
+        elif isinstance(node, Arr):
+            walk(node.elem)
+        elif isinstance(node, Res):
+            walk(node.ok)
+            walk(node.err)
+        elif isinstance(node, FnTy):
+            for param in node.params:
+                walk(param)
+            walk(node.ret)
+
+    walk(ty)
+    return found
+
+
+def has_typevar(ty: Ty) -> bool:
+    """Whether ``ty`` mentions a type variable anywhere."""
+    return bool(typevars(ty))
 
 
 def holds_vector(
@@ -311,13 +379,19 @@ def _atom(token: Token, where: str) -> Ty:
     if token.kind != ATOM:
         raise diag(UNKNOWN_TYPE, where, f"expected a type, found {token.kind.lower()}")
     value = token.value
+    if len(value) == 1 and "A" <= value <= "Z":
+        return TypeVar(value)
     if value.startswith(":"):
         name = value[1:]
+        if len(name) == 1 and "A" <= name <= "Z":
+            # ``:T`` is the variable ``T``: the colon marks a primitive, and a
+            # single capital is the one name in that vocabulary that is not
+            # one. Both spellings read the same, so a signature may write
+            # either.
+            return TypeVar(name)
         if name in PRIMITIVES:
             return Prim(name)
         raise diag(UNKNOWN_TYPE, where, f"unknown type '{value}'")
-    if len(value) == 1 and "A" <= value <= "Z":
-        return TypeVar(value)
     return StructRef(value)
 
 
