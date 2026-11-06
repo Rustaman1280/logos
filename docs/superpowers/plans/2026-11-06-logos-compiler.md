@@ -208,7 +208,7 @@ def test_call_arity():
 - [ ] **Step 3: Check every expression node records its type**
 
 Run: `python3 -m unittest tests.test_types -v`
-Expected: PASS, and a test asserts `expr_types["m/f/body/0/1"] == Prim("i64")` for `(+ a 1)`.
+Expected: PASS, and a test asserts `expr_types["m/f/2/0"] == Prim("i64")` for `(+ a 1)` in `(fn f :i64 ((a :i64)) (ret (+ a 1)))`, under the positional path rule.
 
 - [ ] **Step 4: Commit**
 

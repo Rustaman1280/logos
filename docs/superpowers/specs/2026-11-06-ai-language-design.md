@@ -180,11 +180,21 @@ threads and formatting all arrive this way.
 
 ### Addressing and tooling
 
-Every node has a path of the form `module/fn-name/body/2`. The compiler
-prints that path in every diagnostic. `logosc show <path>` prints one
+Every node has a path built only from names and child indexes:
+`module/fn-name/<index>/<index>`. A named definition inserts its own name
+(`math`, `math/add`); every other node appends its position among its
+parent's children, counting the head. So the third child of `add` is
+`math/add/2`, and its first child is `math/add/2/0`. Paths depend on
+position alone, never on a node's shape, so editing one child never moves
+another. A test node inserts `test/<name>`, so a test and a function may
+share a name.
+
+Every diagnostic prints a location: a node path when one exists, otherwise
+`file:line:column`. The compiler prints that location in every diagnostic. `logosc show <path>` prints one
 subtree. `logosc patch <path>` accepts a replacement subtree and rewrites
-only that node, then reformats. `logosc fmt` prints the canonical form, so
-any file an AI produces normalises to one shape.
+only that node, then reformats. `logosc fmt FILE...` rewrites each file to
+the canonical form in place, and `logosc fmt -` prints it to stdout, so any
+file an AI produces normalises to one shape.
 
 ## Compiler
 
