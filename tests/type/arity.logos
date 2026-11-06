@@ -1,0 +1,7 @@
+(mod m)
+
+(fn g :i64 ((a :i64))
+  (ret a))
+
+(fn f :i64 ()
+  (ret (g)))

@@ -2,7 +2,8 @@
 
 Every diagnostic code lives in ``CODES``. Passes import the code they report
 instead of spelling a literal, so ``E0001`` cannot mean two different things in
-two modules. Task 3 extends the table with the resolver's codes.
+two modules. ``E0001``-``E0006`` are the read-only passes (lexing, parsing,
+resolution); ``E01xx`` is the type checker.
 """
 
 from __future__ import annotations
@@ -16,6 +17,11 @@ CODES = {
     "E0004": "circular import",
     "E0005": "name not found",
     "E0006": "lexical error",
+    "E0100": "type mismatch",
+    "E0101": "unknown type",
+    "E0102": "wrong arity",
+    "E0103": "unknown function",
+    "E0104": "not mutable",
 }
 
 UNBALANCED = "E0001"
@@ -24,6 +30,11 @@ DUPLICATE = "E0003"
 CIRCULAR = "E0004"
 NOT_FOUND = "E0005"
 LEXICAL = "E0006"
+TYPE_MISMATCH = "E0100"
+UNKNOWN_TYPE = "E0101"
+WRONG_ARITY = "E0102"
+UNKNOWN_FUNCTION = "E0103"
+NOT_MUTABLE = "E0104"
 
 
 class LogosError(Exception):

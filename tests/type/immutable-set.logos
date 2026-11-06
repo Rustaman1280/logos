@@ -1,0 +1,6 @@
+(mod m)
+
+(fn f :i64 ()
+  (let x :i64 0)
+  (set x 1)
+  (ret x))

@@ -1,0 +1,10 @@
+(mod m)
+
+(fn id64 :i64 ((x :i64))
+  (ret x))
+
+(fn take32 :i32 ((a :i32))
+  (ret a))
+
+(fn f :i64 ()
+  (ret (take32 (id64 1))))
