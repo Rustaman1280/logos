@@ -687,10 +687,12 @@ def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None],
 
     A variant is ``(name)`` or ``(name T)``. A repeated name is E0003, a
     malformed variant is E0002, and an unresolvable type is E0101, each at the
-    variant's own path. A ``:void`` payload has no storage (E0100) and a
-    payload that is or contains a ``(vec T)`` is E0002: a vector is released
+    variant's own path. A ``:void`` payload has no storage (E0100), a payload
+    that is or contains a ``(vec T)`` is E0002: a vector is released
     through its descriptor and an enum has no place expression, so such a
-    variant could never free its buffer.
+    variant could never free its buffer. An owning payload is E0002 too, at
+    the type that spelled it: a payload is copied where it is built, so an
+    owner in one would be two owners of one block.
 
     The reserved names are E0003 here: ``ok``, ``err``, ``some``, ``none`` and
     ``try`` build and propagate a result or an optional, and ``print`` and
@@ -735,6 +737,17 @@ def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None],
             raise diag(
                 UNKNOWN_NODE, variant.path, "vector payloads are not supported yet"
             )
+        if isinstance(ty, Own):
+            # A payload is copied where the variant is built, and an owner has
+            # no copy: the source and the payload would both own one block, so
+            # freeing either would leave the other dangling. Moving a value
+            # through a payload is a later task.
+            raise diag(
+                UNKNOWN_NODE,
+                type_item.path if isinstance(type_item, Node) and type_item.path
+                else variant.path,
+                "owning enum payloads are not supported yet",
+            )
         if _stored_result(ty):
             raise diag(
                 UNKNOWN_NODE, variant.path, "result payloads are not supported yet"
@@ -743,6 +756,55 @@ def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None],
     if not variants:
         raise diag(UNKNOWN_NODE, node.path, "an enum needs at least one variant")
     return tuple(variants)
+
+
+def enum_contains_itself(
+    name: str,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]],
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+) -> bool:
+    """Whether enum ``name`` holds itself by value, directly or indirectly.
+
+    An enum has no finite size if one of its payloads leads back to it, and
+    the lowerer measures the payload area by walking exactly that graph. The
+    walk here is by value only — a pointer, an owning pointer or a vector
+    breaks the chain — and a name already on the path is not entered again,
+    so a cycle between two other types terminates. The checker refuses the
+    declaration before any layout is computed, instead of letting
+    ``enum_words``/``sizeof_of`` recurse until Python's stack runs out.
+    """
+    seen: set[tuple[str, str]] = set()
+
+    def walk(ty: Ty) -> bool:
+        if isinstance(ty, EnumRef):
+            if ty.name == name:
+                return True
+            if ("enum", ty.name) in seen:
+                return False
+            variants = enums.get(ty.name)
+            if not variants:
+                return False
+            seen.add(("enum", ty.name))
+            return any(payload is not None and walk(payload) for _, payload in variants)
+        if isinstance(ty, StructRef):
+            if ("struct", ty.name) in seen:
+                return False
+            fields = structs.get(ty.name)
+            if not fields:
+                return False
+            seen.add(("struct", ty.name))
+            return any(walk(field) for _, field in fields)
+        if isinstance(ty, (Arr, Opt)):
+            return walk(ty.elem)
+        if isinstance(ty, Res):
+            return walk(ty.ok) or walk(ty.err)
+        return False
+
+    variants = enums.get(name)
+    if not variants:
+        return False
+    seen.add(("enum", name))
+    return any(payload is not None and walk(payload) for _, payload in variants)
 
 
 def pattern_variant(
@@ -1210,6 +1272,14 @@ class _Checker:
             structs.update(own_structs)
             enums = dict(inherited_enums)
             enums.update(own_enums)
+            for name, node in module.types.items():
+                if name in own_enums and enum_contains_itself(name, enums, structs):
+                    # An enum payload area is sized by measuring its payloads,
+                    # so a payload that leads back here would be measured
+                    # forever. Refused at the declaration, before any layout.
+                    raise diag(
+                        UNKNOWN_NODE, node.path, f"enum '{name}' contains itself"
+                    )
             own_fns: dict[str, FnTy] = {}
             for name, node in module.fns.items():
                 if name.startswith("rt_"):
@@ -1686,6 +1756,15 @@ class _Checker:
                 TYPE_MISMATCH,
                 _at(items[2], node),
                 f"cannot set '{name}' of type {var.ty} to {value}",
+            )
+        if isinstance(var.ty, Res) and not var.handled:
+            # The old value's error slot is this binding's obligation, and an
+            # assignment would overwrite it: the caller must have looked at it
+            # before there is a new one to look at.
+            raise diag(
+                UNHANDLED_RESULT,
+                node.path,
+                f"cannot overwrite '{name}': its result was never handled",
             )
         if isinstance(var.ty, Own) or holds_vector(var.ty, self._structs):
             if var.moved:
@@ -2615,6 +2694,14 @@ class _Checker:
             # The pointee outlives this frame; a capturing closure written
             # through a pointer is the clearest way to call it after return.
             raise diag(CLOSURE_ESCAPE, _at(items[2], node), _CLOSURE_ESCAPE)
+        if _stored_result(got):
+            # A pointee is storage with no name of its own: the error slot
+            # would be dropped, exactly as in a field or an element.
+            raise diag(
+                UNHANDLED_RESULT,
+                _at(items[2], node),
+                "this result cannot be stored through a pointer: handle it first",
+            )
         if not compatible(elem, got):
             raise diag(
                 TYPE_MISMATCH,
@@ -2863,15 +2950,23 @@ class _Checker:
             var.handled = True
 
     def _refuse_carried(self, ty: Ty, item: Node | Token, node: Node, what: str) -> None:
-        """Refuse a vector or a result carried inside a tagged value.
+        """Refuse a closure, vector or result carried inside a tagged value.
 
-        A tagged value is copied where it is built, and a vector's descriptor
-        has no copy: the enum's payload or the result's slot would be a second
-        owner of a buffer nothing could release. A result inside one would be
-        an obligation with no name to discharge it, which is E0602 — the value
-        its error slot exists for, hidden one level down. Both are refused at
-        the construction, where the source still names the inner value.
+        A tagged value is copied where it is built, and neither a capturing
+        closure's environment nor a vector's descriptor has a copy: the enum's
+        payload or the result's slot would point at a stack slot or a buffer
+        that dies with the construction, and nothing could release the second
+        owner. A result inside one would be an obligation with no name to
+        discharge it, which is E0602 — the value its error slot exists for,
+        hidden one level down. All three are refused at the construction, where
+        the source still names the inner value — the same check a struct field
+        already makes.
         """
+        if _escapes(ty):
+            # The environment is a slot in this frame; a tagged value is
+            # storage that outlives the expression that built it, so a
+            # capturing closure in it would be called after this frame is gone.
+            raise diag(CLOSURE_ESCAPE, _at(item, node), _CLOSURE_ESCAPE)
         if holds_vector(ty, self._structs):
             raise diag(
                 VEC_MOVE,
@@ -2935,6 +3030,7 @@ class _Checker:
                     _at(args[0], node),
                     f"variant '{name}' holds {payload}, found {value}",
                 )
+            self._refuse_carried(value, args[0], node, f"enum '{enum}'")
         return EnumRef(enum)
 
     def _printer(self, node: Node, env: _Env) -> Ty:
@@ -3490,8 +3586,9 @@ def resolve_type(
         if not isinstance(err, EnumRef):
             # The error slot is a declared enum and nothing else: `try` needs
             # one identity to compare, and a primitive or a struct has none.
+            # E0100, not E0101: the type is known, it is just the wrong kind.
             raise diag(
-                UNKNOWN_TYPE,
+                TYPE_MISMATCH,
                 path,
                 f"the error type of a result must be a declared enum, found {err}",
             )

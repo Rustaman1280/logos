@@ -744,13 +744,23 @@ class _Lower:
         if isinstance(ty, EnumRef):
             if ty.name in stack:
                 return
+            finished = self.enum_widths.get(ty.name)
+            if finished is not None:
+                # Measured already: re-walking the payloads would be the same
+                # answer, and a payload graph that reached back here would
+                # never finish (the checker refuses such an enum, but the
+                # lowerer must not depend on that to terminate).
+                llvm.register_enum(ty.name, finished)
+                return
             variants = self.cm.enums.get(ty.name)
             if variants is None:
                 return
             for _, payload in variants:
                 if payload is not None:
                     self._register_enums(payload, stack + (ty.name,))
-            words = enum_words(ty.name, self.cm.enums, self.cm.structs)
+            words = enum_words(
+                ty.name, self.cm.enums, self.cm.structs, self.enum_widths
+            )
             llvm.register_enum(ty.name, words)
             self.enum_widths[ty.name] = words
         elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt)):
@@ -3025,32 +3035,45 @@ def enum_words(
     name: str,
     enums: dict[str, tuple[tuple[str, Ty | None], ...]],
     structs: dict[str, tuple[tuple[str, Ty], ...]],
+    memo: dict[str, int] | None = None,
 ) -> int:
     """How many eight-byte words an enum's payload area must hold.
 
     The largest variant decides it: every value of the enum is one LLVM type,
     so the area is sized for the widest payload any variant carries. An enum
     with no payloads needs none, and its type is ``{ i32, [0 x i64] }``.
+
+    ``memo`` is the caller's name-to-width table. An enum reached twice — as
+    two variants' payload, or through a struct — is measured once, and the
+    lookups a repeated one would make cannot walk a cycle a second time.
     """
+    if memo is not None:
+        done = memo.get(name)
+        if done is not None:
+            return done
     size = 0
     for _, payload in enums.get(name, ()):
         if payload is not None:
-            size = max(size, sizeof_of(payload, structs, enums))
-    return (size + 7) // 8
+            size = max(size, sizeof_of(payload, structs, enums, memo))
+    words = (size + 7) // 8
+    if memo is not None:
+        memo[name] = words
+    return words
 
 
 def _fields_size(
     fields: "tuple[Ty, ...]",
     structs: dict[str, tuple[tuple[str, Ty], ...]],
     enums: dict[str, tuple[tuple[str, Ty | None], ...]],
+    memo: dict[str, int] | None = None,
 ) -> int:
     """C layout for one field list: each field padded to its own alignment."""
     offset = 0
     align = 1
     for field in fields:
-        field_align = align_of(field, structs, enums)
+        field_align = align_of(field, structs, enums, memo)
         offset = (offset + field_align - 1) // field_align * field_align
-        offset += sizeof_of(field, structs, enums)
+        offset += sizeof_of(field, structs, enums, memo)
         align = max(align, field_align)
     return (offset + align - 1) // align * align
 
@@ -3059,6 +3082,7 @@ def sizeof_of(
     ty: Ty,
     structs: dict[str, tuple[tuple[str, Ty], ...]],
     enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    memo: dict[str, int] | None = None,
 ) -> int:
     """The size in bytes of one ``ty``, as LLVM lays it out.
 
@@ -3085,18 +3109,18 @@ def sizeof_of(
         # ``{ T*, i64, i64 }``: a buffer pointer and two counts.
         return 24
     if isinstance(ty, Arr):
-        return ty.n * sizeof_of(ty.elem, structs, enums)
+        return ty.n * sizeof_of(ty.elem, structs, enums, memo)
     if isinstance(ty, EnumRef):
         # The tag, then the payload area: ``{ i32, [K x i64] }`` pads the i32
         # out to the array's alignment, so the tag costs one word.
-        return 8 + 8 * enum_words(ty.name, enums, structs)
+        return 8 + 8 * enum_words(ty.name, enums, structs, memo)
     if isinstance(ty, Opt):
-        return _fields_size((Prim("bool"), ty.elem), structs, enums)
+        return _fields_size((Prim("bool"), ty.elem), structs, enums, memo)
     if isinstance(ty, Res):
-        return _fields_size((Prim("bool"), ty.ok, ty.err), structs, enums)
+        return _fields_size((Prim("bool"), ty.ok, ty.err), structs, enums, memo)
     if isinstance(ty, StructRef):
         fields = structs.get(ty.name, ())
-        return _fields_size(tuple(field for _, field in fields), structs, enums)
+        return _fields_size(tuple(field for _, field in fields), structs, enums, memo)
     return 1
 
 
@@ -3104,6 +3128,7 @@ def align_of(
     ty: Ty,
     structs: dict[str, tuple[tuple[str, Ty], ...]],
     enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    memo: dict[str, int] | None = None,
 ) -> int:
     """The alignment in bytes of one ``ty``: what ``rt_alloc`` is asked for."""
     enums = enums or {}
@@ -3129,14 +3154,18 @@ def align_of(
         # and so is the tag.
         return 8
     if isinstance(ty, Arr):
-        return align_of(ty.elem, structs, enums)
+        return align_of(ty.elem, structs, enums, memo)
     if isinstance(ty, Opt):
-        return max(1, align_of(ty.elem, structs, enums))
+        return max(1, align_of(ty.elem, structs, enums, memo))
     if isinstance(ty, Res):
-        return max(1, align_of(ty.ok, structs, enums), align_of(ty.err, structs, enums))
+        return max(
+            1,
+            align_of(ty.ok, structs, enums, memo),
+            align_of(ty.err, structs, enums, memo),
+        )
     if isinstance(ty, StructRef):
         fields = structs.get(ty.name, ())
-        return max([align_of(field, structs, enums) for _, field in fields] or [1])
+        return max([align_of(field, structs, enums, memo) for _, field in fields] or [1])
     return 1
 
 

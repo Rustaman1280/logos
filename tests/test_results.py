@@ -121,11 +121,44 @@ class EnumDeclarationTest(unittest.TestCase):
         error = fail_on("(mod m)(type e (enum (a T)))")
         self.assertEqual(error.code, "E0501")
 
+    def test_a_self_containing_enum_is_e0002(self):
+        # Review finding 2: the payload area is measured by walking the
+        # payloads, so a payload that leads back to the enum must be refused
+        # at the declaration — not surface as a Python RecursionError.
+        error = fail_on("(mod m)(type tree (enum (leaf :i64) (node tree)))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.path, "m/tree")
+        self.assertEqual(error.message, "enum 'tree' contains itself")
+
+    def test_a_mutually_recursive_enum_is_e0002(self):
+        error = fail_on("(mod m)(type a (enum (x b)))(type b (enum (y a)))")
+        self.assertEqual(error.code, "E0002")
+        self.assertIn("enum 'a' contains itself", error.message)
+
+    def test_an_enum_reaching_itself_through_a_struct_is_e0002(self):
+        error = fail_on(
+            "(mod m)(type box (struct (t tree)))"
+            "(type tree (enum (leaf :i64) (node box)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertIn("enum 'tree' contains itself", error.message)
+
+    def test_an_enum_reached_through_a_pointer_is_not_recursive(self):
+        checked("(mod m)(type tree (enum (leaf :i64) (next (ptr tree))))")
+
+    def test_an_owning_payload_is_e0002(self):
+        # Review finding 3: a payload is copied where the variant is built, so
+        # an owner in one would be two owners of one block.
+        error = fail_on("(mod m)(type e (enum (held (own :i64))))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning enum payloads are not supported yet")
+
 
 class ResultTypeTest(unittest.TestCase):
     def test_the_error_slot_must_be_a_declared_enum(self):
         error = fail_on("(mod m)(fn f :(res :i64 :i64) () (ret (ok 1)))")
-        self.assertEqual(error.code, "E0101")
+        # The type is known, it is just the wrong kind: E0100, not E0101.
+        self.assertEqual(error.code, "E0100")
         self.assertIn("must be a declared enum", error.message)
 
     def test_a_res_of_a_vector_is_refused(self):
@@ -200,6 +233,36 @@ class ResultTypeTest(unittest.TestCase):
                         " (letmut v (vec :i64) (make (vec :i64)))"
                         " (let r :(res (vec :i64) e) (ok v)) (println 1))")
         self.assertIn(error.code, ("E0002", "E0402"))
+
+    def test_a_capturing_closure_cannot_be_carried_in_a_result(self):
+        # Review finding 1: `(ok f)` copies f into the result's slot, and the
+        # environment f points at dies with this frame — E0502 where it is
+        # built, the same refusal a struct field gives.
+        error = fail_on(
+            "(mod m)(type err (enum (eof)))"
+            "(fn f :void () (let n 1) (let h (fn :i64 () (ret n)))"
+            " (let r :(res (fn () :i64) err) (ok h)) (ret))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_a_capturing_closure_cannot_be_carried_in_an_optional(self):
+        error = fail_on(
+            "(mod m)(fn f :void () (let n 1) (let h (fn :i64 () (ret n)))"
+            " (let o (some h)) (ret))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_a_non_capturing_closure_may_be_carried_in_a_result(self):
+        checked("(mod m)(type err (enum (eof)))"
+                "(fn f :void ()"
+                " (let r :(res (fn () :i64) err) (ok (fn :i64 () (ret 1))))"
+                " (match r ((ok g) (println (g))) ((err e) (println 0))))")
 
 
 class TryTest(unittest.TestCase):
@@ -362,6 +425,43 @@ class UnhandledResultTest(unittest.TestCase):
         self.assertEqual(error.code, "E0602")
         self.assertIn("cannot be carried in an optional", error.message)
 
+    def test_a_result_stored_through_a_pointer_is_e0602(self):
+        # Review finding 4: the pointee is a nameless slot, so the obligation
+        # cannot be discharged there.
+        error = fail_on("(mod m)" + ERR +
+                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn f :void () (let p (alloc (res :i64 err) 1))"
+                        " (set-deref (ptr p) (g)) (ret))")
+        self.assertEqual(error.code, "E0602")
+        self.assertEqual(
+            error.message,
+            "this result cannot be stored through a pointer: handle it first",
+        )
+
+    def test_a_set_over_an_unhandled_result_is_e0602(self):
+        # Review finding 5: assignment replaces the first value, so its error
+        # slot would be dropped silently.
+        error = fail_on("(mod m)" + ERR +
+                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn f :void () (letmut r (g)) (set r (g)))")
+        self.assertEqual(error.code, "E0602")
+        self.assertEqual(error.path, "m/f/3")
+        self.assertEqual(
+            error.message, "cannot overwrite 'r': its result was never handled"
+        )
+
+    def test_a_set_after_the_old_result_is_handled_rearms_the_obligation(self):
+        error = fail_on("(mod m)" + ERR +
+                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn f :void () (letmut r (g))"
+                        " (match r ((ok v) (println v)) ((err e) (println 0)))"
+                        " (set r (g)))")
+        # The old obligation is discharged; the new value is the one reported,
+        # at the end of the block.
+        self.assertEqual(error.code, "E0602")
+        self.assertIn("'r'", error.message)
+        self.assertNotIn("cannot overwrite", error.message)
+
     def test_the_corpus_case_reports_e0602(self):
         case = ROOT / "tests" / "type" / "unhandled-result.logos"
         expected = case.with_suffix(".expect").read_text(encoding="utf-8").strip()
@@ -521,6 +621,15 @@ class ResultLoweringTest(unittest.TestCase):
                        "(fn f e ((x :i64)) (ret (bad x)))")
         self.assertIn("{ i32, [1 x i64] }", text)
         self.assertIn("bitcast [1 x i64]*", text)
+
+    def test_a_two_word_struct_payload_sizes_the_area(self):
+        # Review finding 7: a struct payload widest in two words must give a
+        # two-word area, so the constructor's bitcast is to [2 x i64]*.
+        text = emitted("(mod m)(type pair (struct (a :i64) (b :i64)))"
+                       "(type e (enum (p pair) (empty)))"
+                       "(fn f e () (ret (p (make pair 1 2))))")
+        self.assertIn("{ i32, [2 x i64] }", text)
+        self.assertIn("bitcast [2 x i64]*", text)
 
     def test_a_match_over_an_optional_tests_the_tag(self):
         module = lowered("(mod m)(fn f :i64 ((o :(opt :i64)))"
