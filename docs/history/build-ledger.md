@@ -1,0 +1,270 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-11-06-logos-compiler.md
+
+## Preflight scan (2026-11-06)
+Cross-task interface pairs checked:
+- T2 -> T3: Node(kind, items, path, line, col) and path rule — T3 resolve() consumes root Node and walks .path. CONSISTENT.
+- T3 -> T4: Module(name, root, types, fns, tests) produced by resolve, consumed by check_module. CONSISTENT.
+- T4 -> T5: CheckedModule.module/types/fn_sigs/expr_types consumed by lower_module. CONSISTENT.
+- T5 -> T6..T12: driver.build(src_path, out, opt, keep_ir) and IrModule shape unchanged; later tasks add IR nodes only. CONSISTENT.
+- T8 -> T9,T12: runtime symbols rt_alloc/rt_free/rt_leak_count defined once, reused. CONSISTENT.
+- T5 -> T13: driver.run_test(src_path, test_name, out) named in T5, consumed by tester in T13. CONSISTENT.
+- T6 -> T13: (expect (code N) (err-prefix S)) directive used by T6 test, implemented by T13. AMENDMENT: T6 needs a temporary runner until T13; ruling below.
+- T13 -> T14: categories include diff; run_diff.sh owns the C twins. CONSISTENT.
+Per-task self-consistency:
+- T1 tests main(["version"]); code step implements exactly that. OK.
+- T2 tests paths + fmt idempotency; parser is grammar-agnostic, resolver owns grammar. OK.
+- T4 test example references (deref p) before T8 defines deref. AMENDMENT: ruling below.
+- T9 directives use --opt -O0 -O2 before T13 implements it. AMENDMENT: ruling below.
+Rulings:
+- Ruling: Task 6 runs its exec directives through a minimal runner added in T6 (run_test already exists from T5); T13 later absorbs it. Why: the harness arrives after the features that need it. Cost if wrong: small refactor of tester.py.
+- Ruling: T4's widening test is rewritten to use a call returning :i64 against a :i32 parameter, not (deref p); deref arrives in T8. Cost if wrong: one test edit.
+- Ruling: T9's --opt flag is implemented in T5's driver CLI and honoured by the T6 runner; T13 formalises it. Cost if wrong: one CLI flag move.
+
+## Task 1
+- Review: SPEC PASS, QUALITY CHANGES REQUESTED (4 Important).
+- Ruling: rt_panic gains a code argument: rt_panic(path, code, msg), all three compiler-generated literals, documented in rt.h. Amends plan. Cost if wrong: signature touch in Tasks 6, 8, 9.
+- Ruling: pyproject requires-python >=3.10, not 3.14, because the mandated host ships 3.10.12. Cost if wrong: none, code is 3.10-clean.
+- Deferred minors: no-subcommand help exit code; version string in two places; Makefile clean gaps; test coverage beyond flag parsing.
+- Task 1: fix round 1/5 (4 addressed, 0 open; commits 9029a59..92511d9)
+- Task 1: complete (commits e59a8db..92511d9, review clean)
+- Ruling: fmt CLI arity (bare `logosc fmt` and multi-file) and patch arity belong to Task 2, not Task 14. Why: Task 2 owns fmt. Cost if wrong: a CLI tweak in Task 14.
+- Deferred minor: `python3 -m logos.cli` is a silent no-op after the entry-point cleanup.
+- Ruling: `(test name ...)` extends node paths as `module/test/<name>`, because a test and a function may share a name. Cost if wrong: path strings change in tests.
+- Ruling: `logosc fmt FILE...` rewrites each file in place; `logosc fmt -` writes canonical text to stdout. Why: multi-file concatenated output has no separator and cannot satisfy Task 14 idempotency. Cost if wrong: one CLI branch.
+- Review Task 2: SPEC FAIL, QUALITY CHANGES REQUESTED. Fix round 1 dispatched.
+- Ruling A: node paths are strictly positional (no `body` segment, no shape heuristic). Why: paths must not move when a sibling changes shape. Cost if wrong: path strings in diagnostics and tests change; plan Task 4 assertion amended to m/f/2/0.
+- Ruling B: test nodes are `module/test/<name>`.
+- Ruling C: diagnostics print a node path when one exists, else file:line:column. Cost if wrong: render format churn in Task 3.
+- Ruling D: `fmt FILE...` rewrites in place, `fmt -` writes stdout, repeated `-` exits 2.
+- Ruling E: an empty file renders as the empty string, pinned by a test.
+- Spec updated for A, B, C, D; plan Task 4 assertion updated for A.
+- Task 2: fix round 1/5 (8 targeted, commit 82dcf0b; scoped re-review dispatched)
+- Deferred minor: multi-file fmt diagnostics name the node path only, not the file; in-place write is non-atomic; conditional deferral to Task 14 if it bites.
+- Ruling: directory `fmt` may recurse into *.logos; Task 14's repo-wide idempotency check depends on it. Cost if wrong: none.
+- Task 2: fix round 1/5 (8 addressed, 0 open; commits c088394..82dcf0b)
+- Task 2: complete (commits 92511d9..82dcf0b, review clean)
+- Controller doc pass: plan path examples and fmt verification updated; task-3 brief regenerated at e73e5dd.
+- Deferred minors carried: nested test/fn nodes would lose their test/<name> segment (unreachable, tests are module-level); fmt churns mtimes of unchanged files; lone '(' gives path "0".
+## Task 3
+- Review: SPEC PASS, QUALITY APPROVED; 2 Important + 1 Minor taken into fix round 1 anyway, because both were cheap and interface-bound.
+- Ruling: `resolve` gains an optional `file` argument so the missing-mod diagnostic can print file:line:column. Cost if wrong: one optional parameter.
+- Ruling: the loader owns 'file name equals module name'; the resolver only checks the import name it was asked for. Task 4 must walk Module.imports, because fns/types hold own definitions only.
+- Task 3: fix round 1/5 (3 addressed, 0 open; commits 2a0ba3f..50ddd26)
+- Task 3: complete (commits e73e5dd..50ddd26, review clean)
+## Task 4
+- Implemented: types.py, check.py, 78 tests. Added E0104 (not mutable) beyond the four planned checker codes; unbound name reuses E0005, duplicate binding E0003.
+- Ruling: type spelling is `:prim(i)` for closed primitives, bare names for declared types and type variables, `:(vec :i64)` for composites. Matches lexer tokenisation. Cost if wrong: parse_type plus every test literal.
+- Review Task 4: SPEC FAIL, 2 Critical (missing %, TypeVar wildcard), 2 Important. Fix round 1 dispatched.
+- Ruling A: type variables are rejected with E0101 until Task 10 implements substitution. Why: a wildcard silently converts between kinds, the one thing the spec forbids. Cost if wrong: generics tests change in Task 10.
+- Ruling B: `=`/`!=` are scalar-only.
+- Ruling C: new code E0105 `missing return` for a non-void body with no ret.
+- Ruling D: known name that is not a function gives E0100, not E0103.
+- Ruling E: definition names may not start with `:`.
+- Ruling: test helpers may not shadow module functions (E0003). Deferred minor; final review sees it.
+- Task 4: fix round 1/5 (7 targeted, 1 incomplete, 1 regression; commit a6348a4)
+- Task 4: fix round 2/5 (2 addressed per fix report; commit d03f2f1; scoped re-review dispatched)
+- Task 4: fix round 2/5 (2 addressed, 0 open; commits a6348a4..d03f2f1)
+- Task 4: complete (commits 50ddd26..d03f2f1, review clean)
+- Deferred minors (Task 4): E0105 is presence-only, so a ret inside a maybe-false branch satisfies it; test helper may not shadow a module function; `%` message reads backwards for a float literal.
+- Spec addition: integer literals never promote to float (reverses nothing, records current behaviour).
+## Task 5
+- First native ELF verified by the controller: `python3 -m logos build examples/hello.logos -o build/hello_v` gives an x86-64 PIE that prints hello, exit 0; build/hello.ll is 16 lines.
+- Ruling: typed pointers (`i8*`) not opaque `ptr`, because clang 14 does not enable opaque-pointers. Why: the plan's declare example is wrong for this toolchain. Cost if wrong: textual declare edits only.
+- Ruling: `print`/`println` are :str -> :void builtins for now; numeric printing arrives with the runtime formatter in Task 9. Cost if wrong: Task 6's division test needs the integer printer earlier than planned.
+- Deferred: test-local fn helpers are checked but not lowered (Task 13 needs them); unsigned div/rem emitted as signed; no symbol mangling across imports.
+- Review Task 5: SPEC PASS, 2 Critical (UB division, libc interposition), 5 Important. Fix round 1 dispatched.
+- Ruling R1: `/` and `%` are checked; divisor 0 calls rt_panic with runtime code R0001; INT_MIN/-1 wraps without dividing; unsigned uses udiv/urem. Cost if wrong: codegen branch per division.
+- Ruling R2: program functions are internal and mangled lg.<module>.<name>; rt_ names reserved. Why: `(fn write ...)` interposed libc write and printing silently produced nothing. Cost if wrong: symbol names in the IR only.
+- Ruling R3: the lowerer owns callee existence; no ValueError escapes; run_test lowers module functions too.
+- Ruling R4: E0106 literal out of range for its type.
+- Ruling R5: let bindings are %v.<ordinal>, so no source name reaches the IR unquoted.
+- Ruling R6: a failed build removes that output binary and its .ll.
+- Ruling R7: main may be :i64 (exit status) or :void (0); CLI --opt default is -O2 like driver.build.
+- Plan Task 6 division test amended to err-prefix "R0001: division by zero".
+- Task 5: fix round 1/5 (all 7 targeted; commit b8adbe7; scoped re-review dispatched)
+- Ruling: the panic line is `path: code: message`. rt.c changes in Task 6, and Task 6's err-prefix expectation matches R0001. Cost if wrong: one runtime printf.
+- Note: run_test now lowers every module function, so a test build fails if any module fn uses a construct that is not lowered yet. Task 6 must lower if/while/match before test files can include them.
+- Task 5: fix round 2/5 (2 addressed, 0 open; commits b8adbe7..e622d6d)
+- Task 5: complete (commits d41291f..e622d6d, review clean)
+- Deferred minor (Task 5): rt.h comment about panic args is stale; one vacuous assertNotIn("panic") assertion; shadowing print with a :str param reports E0002 at the call site until Task 9.
+- Ruling: err-prefix directive renamed err-contains, because the panic line starts with the node path. Task 13 implements err-contains. Cost if wrong: directive rename.
+## Task 6
+- Implemented if/while/match/break/continue, comparisons, short-circuit and/or/not, minimal :str aggregate lowering. 257 tests.
+- Ruling: match arms use `(pat body...)` nested form; the plan's flat arm list was stale. Cost if wrong: test source rewrite.
+- Ruling: a match with no matching arm panics R0003 at run time until Task 11 adds exhaustiveness. Cost if wrong: Task 11 removes the panic path for enums only.
+- Note: allocas hoist to the entry block. Required for loop stack safety.
+- Review Task 6: SPEC PASS, 1 Critical (str equality emitted invalid IR), 2 Important. Fix round 1 dispatched.
+- Ruling R2: bindings are block-scoped. Why: function scoping let a binding declared in a branch be read after the join, which loads LLVM undef. Cost if wrong: authors must hoist a binding they wanted after an if.
+- Ruling R1: str equality returns in Task 9 with str-eq, operator and lowering together.
+- Ruling R3: a declared type with no LLVM layout is E0002 at the node, never a ValueError.
+- Carry forward: Tasks 7-12 must assume block scoping.
+- Task 6: fix round 1/5 (6 addressed, 0 open; commits 3b628a3..2f9c0b3)
+- Task 6: complete (commits 0f2d6b7..2f9c0b3, review clean)
+- Deferred minor (Task 6): `(fn f :i64 () (while true))` still E0105 from presence-only ret check; float ordering accepted by checker and refused at lower time with E0002 (Task 7 scope).
+## Task 7
+- Implemented structs (make/get/set-field) with C layout, fixed arrays with bounds-checked access (R0003), generalised (make (arr T n) ...). 317 tests.
+- Concern carried: struct and array values cross Logos function boundaries as LLVM aggregates, not the SysV C ABI, so extern with struct arguments is not ready.
+- Task 7: fix round 1/5 (3 addressed per fix report; commits 7d42d37..29bb65a; scoped re-review dispatched)
+- Deferred (Task 7): set-field/arr-set cannot target a parameter (E0104), consistent with set; internal aggregate ABI for structs across Logos functions only.
+- Task 7: fix round 1/5 (3 addressed, 1 vacuous regression test noted; commits 7d42d37..29bb65a)
+- Task 7: complete (commits 2f9c0b3..29bb65a, review clean, 1 parked minor)
+- Ruling: the pointer-path E0002 gap (a struct behind a pointer whose field has no layout raises ValueError during emit) is folded into Task 8 rather than a Task 7 fix round. Why: Task 8 rewrites the same lowering paths. Cost if wrong: a stray traceback survives one task longer.
+## Task 8
+- Implemented alloc/free/ptr/deref/set-deref/ptr-add, (own T), moves with E0300-E0302, leak tracker keyed by pointer, R0002 double free. 382 tests.
+- Ruling: (set-deref p v) takes no index; the plan's sample (set-deref p 0 7) is stale, use (ptr-add p 2). Cost if wrong: test source edit.
+- Carry forward: the tracker is not thread safe; Task 12 must settle it before adding threads.
+- Review Task 8: SPEC FAIL (use-after-free accepted after a branch join), 1 Critical, 2 Important. Fix round 1 dispatched.
+- Ruling R1: branch joins merge moved=OR, each branch checked from the pre-branch state. Cost if wrong: rejects a program that reassigns after freeing in the other branch.
+- Ruling R2: debug builds quarantine freed blocks so an address is never recycled; a stale owner therefore always trips R0002. Cost if wrong: debug memory grows with every free.
+- Ruling R3: rt_panic with a NULL path prints `<runtime>`; R0004 is a free of a never-allocated pointer.
+- Ruling R4-R6: :str alignment is 8, zero-byte allocations record 0, a negative wrapped count panics R0003.
+- Task 8: fix round 1/5 (7 addressed, 0 open; commits 6627082..bc05431)
+- Task 8: complete (commits 29bb65a..bc05431, review clean)
+- Ruling accepted: `(free p) (set p (alloc …))` in straight-line code is now E0300; realloc loops must use set-then-free order. Cost if wrong: author restructuring.
+- Deferred minor (Task 8): `set` on a live owning binding silently leaks the old block; a small-positive wrapped count evades the size guard; the stale-copy fixture does not actually exercise address reuse (the C probe does).
+## Task 9
+- Implemented str-len/str-concat/str-eq/str-slice (slice is a view, no allocation), `=`/`!=` on :str via length test + memcmp (R1 satisfied), (vec T) as `{ T*, i64, i64 }` with make/push/len/get/set/free, and println over :i64 :u64 :f64 :bool :str. 463 tests.
+- Ruling R1 (Task 9): a (vec T) is a three-word value; push/set/free take a letmut binding, so a vector parameter is readable but not growable (E0104). Cost if wrong: a program that wants to fill a vector must pass the descriptor back.
+- Ruling R2 (Task 9): vector growth is rt_alloc + memcpy + rt_free with capacity 2*cap+4 and a strict-increase guard, so the leak tracker sees every buffer; no realloc.
+- Ruling R3 (Task 9): runtime-built strings (concat, from_i64) are untracked process-lifetime mallocs — :str owns nothing, so tracking them would report a leak no program can fix. Vectors tracked, strings not.
+- Ruling R4 (Task 9): rt_str_concat returns the pointer and writes the length through an out param (no 24-byte struct return across the C ABI). rt_str_eq exists as runtime API but the lowering emits length+memcmp inline.
+- Carry forward: vec descriptors are copied by value, so a vector of vectors shares buffers and has no ownership rule yet. Runtime strings never free. No float arithmetic, no :f32/:i32 printing until a cast exists.
+## Task 9
+- Implemented str-len/concat/eq/slice, (vec T) with push/len/get/set/free, println over i64/u64/f64/bool/str, string equality lowering. 463 tests.
+- Ruling: runtime-built strings are process-lifetime mallocs and deliberately untracked, because :str owns nothing; vector buffers go through rt_alloc so leaks are visible. Cost if wrong: a leak report cannot see a concatenated string.
+- Review Task 9: SPEC PASS, 0 Critical, 3 Important. Fix round 1 dispatched.
+- Ruling R1: a (vec T), and any type containing one, moves instead of copying. Why: two bindings sharing a buffer gave a release build a silent read of a reallocated block. Cost if wrong: code must clone explicitly once clone exists.
+- Ruling R2: vector struct fields and array elements are refused (E0002) until place expressions exist. Why: the buffer could never be released. Cost if wrong: a struct-holding-vector waits a task.
+- Ruling R3: runtime-built strings stay untracked; recorded as a deliberate deviation from 'every allocation is tracked', because :str owns nothing and slices are views.
+- Task 9: fix round 1/5 (3 findings + 2 minors; commit 7632ead)
+- Ruling R4: vec-push/vec-set/vec-free accept a parameter as a place; `set` still refuses parameters. Why: the callee owns a moved vector and must be able to release it. Cost if wrong: an asymmetry to remember.
+- Ruling R5: pushing a vector into a vector of vectors moves the argument. Cost if wrong: author writes a clone-to-push.
+- Task 9: fix round 2/5 dispatched for those two gaps.
+- Task 9: fix round 2/5 (2 gaps closed; commit 55d71e3)
+- Scoped re-review: all 8 items addressed, but R4 introduced one NEW Important UAF (a vec-get element passed to a vector parameter). Fix round 3 dispatched.
+- Ruling R6: vector arguments to vector parameters must be names (E0402). Cost if wrong: callers bind to a temporary first.
+- Ruling R7: a vector-typed if/match result is E0402 until form-moves exist. Cost if wrong: no conditional vector selection yet.
+- Task 9: fix round 3/5 (R6, R7, loop pin all addressed; commits 55d71e3..5b2cd55)
+- Task 9: complete (commits bc05431..5b2cd55, review clean)
+- Deferred (Task 9): a nested vector's buffer cannot be released (element is not a place); release builds still lack quarantine, so a loop-move double free is UB there; R6 refuses a fresh temporary argument, so callers bind first.
+## Task 10
+- Implemented monomorphised generics (cap 256, E0500/E0501), closures capturing by value with indirect calls. 541 tests.
+- Known hazard flagged by the implementer: a closure environment is a stack slot in the creating frame, so returning a closure or keeping one past its creator reads a dead slot. Ruling deferred until the review reports.
+- Review Task 10: SPEC FAIL, 2 Critical (generics bypass the vector name rule; escaping closures are UB), 3 Important. Fix round 1 dispatched.
+- Ruling R9: a capturing closure may not leave its function (E0502); a non-capturing closure is a plain function pointer and may escape. Why: the environment is a stack slot in the creating frame. Cost if wrong: no closure factory returning an adder.
+- Ruling R8: vector rules re-apply after unification, so a generic is never a way around them.
+- Ruling R10: instantiation symbols are collision-free against every visible definition and the type encoding is injective.
+- Ruling R11: a type variable in a field or array element is E0501.
+- Task 10: fix round 1/5 (8 findings; commit 3144d65). Disclosed residual: a capturing closure could still escape through a parameter that returns FnTy.
+- Ruling R12: a function type records whether it captures; a capturing closure is confined to a direct call or a local binding inside its own function. Cost if wrong: no callback factories until environments are heap-allocated.
+- Task 10: fix round 2/5 dispatched for that hole.
+- Task 10: fix round 2/5 (relay hole closed via FnTy capture flag; commit c56fe04)
+- Task 10: complete (commits 5b2cd55..c56fe04, review clean)
+- Deferred (Task 10): E0103 says 'module boundary' for a test-local helper; a T-param bound to a vector reports E0300 where a (vec T) param reports E0402 (both refuse).
+## Task 11
+- Implemented (res T E), (opt T), ok/err/some/none/try, enum payloads, match exhaustiveness, E0600/E0601/E0602. 644 tests.
+- Ruling: ok/err need a concrete result type in context; no inference of the error enum. Cost if wrong: an extra annotation.
+- Ruling: a result stored in an aggregate is refused (E0002) rather than tracked; a struct cannot carry a result yet.
+- Review Task 11: SPEC FAIL, 3 Critical (closure escapes in a tagged value; recursive enum crashes the compiler; own payload copied), 2 Important. Fix round 1 dispatched.
+- Ruling: capturing closures are refused inside ok/some/enum payloads, same as struct fields.
+- Ruling: recursive enums are E0002, checked before any size computation.
+- Ruling: (own T) enum payloads are refused until payloads move.
+- Ruling: a result may not be stored through set-deref, and assigning over an unhandled result is E0602.
+- Task 11: fix round 1/5 (7 findings; commit 863ffa5). Scoped re-review: PASS, but two real gaps proven by execution.
+- Ruling R6: move-only semantics extend to any type containing an (own T) at any depth, at every construction and transfer site. Why: `(let o (some p)) (free p)` double-frees today, and a struct holding an owner can be copied, which is UB in release. Cost if wrong: more values resist copying.
+- Task 11: fix round 2/5 dispatched (nested-owner double free; missing enum-payload closure test).
+- Task 11: fix round 2/5 (R6 applied across transfer and construction sites; commit 30d3741, 667 tests). Residual: reading an owner out of a place still copies.
+- Ruling R7: an owner lives only in a direct binding or a parameter. Owning fields, owning array elements and reading an owner out of a place (get/vec-get/arr-get/deref) are E0402/E0002. Why: a place read copies the pointer, so two owners exist and a double free follows. Cost if wrong: no owner inside an aggregate, so a struct cannot hold heap data.
+- Task 11: fix round 3/5 dispatched.
+- Task 11: fix round 3/5 (R7 applied; commit 8211901, 671 tests). Residual: (vec (own T)) remains spellable and leaks by construction.
+- Ruling R8: a container whose element type contains an owner is E0002. Why: elements can be neither read nor released, so the program leaks and nothing can fix it.
+- Task 11: fix round 4/5 dispatched.
+- Task 11: fix round 4/5 (R8 containers of owners; commit be5132d, 675 tests)
+- Scoped re-review (863ffa5..be5132d): PASS on R6/R7/R8; two items remain — match and generic owner guards have no killing test, and alloc can build an unspellable nested owner type. Round 5 dispatched (final round before the breaker).
+- Task 11: fix round 5/5 (commit 277e395, 678 tests). Loop capped.
+- Adjudication at the cap: the two round-5 items were test-only plus one refusal, and the implementer reproduced the reviewer's own mutation method (deleting each guard fails its named test), so I accept without a further re-review.
+- Task 11: complete (commits 0c1e6f4..277e395, review clean at cap, 1 parked minor)
+- Parked minor: `(ptr (own T))` remains spellable; both deref and set-deref through it are refused, so it is inert. Ruling: leave it.
+## Task 12
+- Implemented spawn/join/mutex/channel/atomics, (shared T) with E0700, thread-safe leak tracker, join releases handles. 721 tests; eight-threads stress 1000/1000.
+- Ruling: spawn copies its arguments, so a vector or owner cannot cross a thread boundary (E0402). Cost if wrong: share through a pointer or message through a channel instead.
+- Ruling: mutexes, channels and atomics are process-lifetime and untracked; only thread handles are tracked and freed by join.
+- Review Task 12: SPEC PASS, 0 Critical, 1 Important (E0700 does not descend into aggregates). Fix round 1 dispatched.
+- Ruling: E0700 descends into structs, enums, arrays and optionals, so a struct carrying a raw pointer with no (shared ...) marker is refused at the spawn.
+- Ruling (documented limit): a mutex held by a dead thread blocks forever; an unjoined thread's leak report is a snapshot; a racy (shared T) may differ between -O0 and -O2, so the parity gate applies to race-free programs only.
+- Task 12: fix round 1/5 (E0700 aggregate descent + 4 minors; commit 2f69d72). Scoped re-review APPROVED, but found the same marker hole on channel element types.
+- Ruling R2: the E0700 rule covers every thread crossing, so a channel element type is checked with the same aggregate walk.
+- Task 12: fix round 2/5 dispatched.
+- Task 12: fix round 2/5 (channel element marker; commit b6c8426, 734 tests). Loop closed by adjudication: the remaining channel-inside-struct nesting gap is unreachable (such a channel cannot be constructed) and the final whole-branch review will see it.
+- Task 12: complete (commits 277e395..b6c8426, review approved, 1 parked minor)
+- Parked minor: a channel type spelled inside a struct field is checked shallowly at declaration time; unreachable crossing.
+## Task 13
+- Implemented the harness: directive parsing, 8 categories, -O0/-O2 parity, timeouts, baseline, `python3 -m logos test`. 765 unittest + 131 harness cases.
+- Controller verification: `python3 -m logos test` -> 131 passed, 0 failed, 10 leaked, 0 regressions, exit 0.
+- Ruling: new cases fail until --update-baseline, by design, so a silent addition cannot pass.
+- Review Task 13: SPEC PASS, 0 Critical, 4 Important (filtered baseline truncates; whole category can vanish; leak total does not gate; one bad fixture aborts the run). Fix round 1 dispatched.
+- Ruling R1: --update-baseline merges, never truncates.
+- Ruling R2: a baseline case absent from a full run is a regression even if its category directory is gone.
+- Ruling R3: the suite leak total gates the verdict and is baselined.
+- Ruling R4: a corrupt baseline line or a non-UTF-8 fixture is a failing case naming the path, exit 1, never a usage exit.
+- Task 13: fix round 1/5 (R1-R4 + 4 minors; commit 1ee90c2). Scoped re-review PASS, three minors remain (stale merged line, nested-subdir baseline, single-level leak total).
+- Ruling: those three harness minors fold into Task 14, which already owns the harness's last polish and the acceptance script.
+- Task 13: complete (commits b6c8426..1ee90c2, review clean, 3 minors carried)
+- Ruling: the differential oracle uses gcc, installed with apt, because our backend is clang and a shared compiler family would weaken the check.
+## Task 14
+- Delivered wc/json/matrix examples, tests/diff oracle vs gcc (3 cases x 2 opt levels), tools/accept.sh (7 sections), and the three harness fixes. 786 unittests, 133 harness cases.
+- Controller verification: `bash tools/accept.sh` -> 7/7 sections PASS, exit 0, 200 functions compile in 645 ms.
+- Ruling: the oracle uses gcc, not clang, so the check does not share a backend with our compiler.
+- Ruling: `(read-all)` is a temporary builtin for the examples; extern-based I/O replaces it later.
+- Review Task 14: SPEC PASS, 0 Critical, 3 Important (diff corpus has no floor; a baseline without OPTS disables the leak gate; wc disagrees with GNU on Unicode spaces). Fix round 1 dispatched.
+- Ruling R1: every gate has a floor, so deleting cases can never turn a gate green.
+- Ruling R2: a baseline without an OPTS header refuses comparison rather than failing open.
+- Ruling R3: wc counts Unicode space separators, because the host locale is C.UTF-8.
+- Task 14: fix round 1/5 (3 Important + 4 minors; commit e0a9fa2). Controller re-verified: harness 133/133 + 10 leaked, accept.sh 7/7 PASS, tree clean.
+- Ruling: the final whole-branch review covers this last fix, so I skipped a separate scoped re-review. Why: the final review sees the same diff plus the whole branch. Cost if wrong: one unreviewed 20-line harness change.
+- Task 14: complete (commits 1ee90c2..e0a9fa2, review clean, 2 deferred minors)
+
+## Final whole-branch review (e59a8db..e0a9fa2)
+- Verdict: NOT READY TO MERGE. 4 Critical (loop-carried use-after-free; vector descriptor copy out of a place; uninitialised typed alloc reads incl. a segfaulting fn pointer; release builds have no quarantine, so R0002 is debug-only), plus contract gaps (imports/helpers lowered, extern absent, cast/floats/shifts missing, main falloff, reserved names callable, show/patch stubs, regress category empty, parity not compared, unused names unchecked, install packaging broken, thread handles unmarked, zero-size channels, generic chan/atomic).
+- Rulings S1-S11 dispatched as one fix wave: loop-move rule, place reads of move-only values, alloc only of invariant-free types, :thread as shared state, zero-size channels refused, imported calls and test helpers refused at check time, reserved names refused, every non-void function must terminate, parity actually compared, closure paths positional.
+- Wave B (not yet dispatched): cast, float arithmetic and comparison, shifts, show/patch, a real regress corpus, unused-name check, package data for runtime/rt.c, and spec amendments for extern and the deliberate-leak baseline.
+
+## Memory-safety wave (S1-S11, dispatched after the whole-branch review)
+- Implemented S1-S11 in one commit: `fix: close memory-safety holes found by the whole-branch review`.
+- S1: E0303 added (diag.py). `_consume` refuses a move or release of a binding whose `decl_loop < env.loop`; `_vec_free` refuses the same. Cost accepted: release goes after the loop.
+- S2: `_Checker._refuse_place_copy` is the one entrance for `get`, `arr-get`, `vec-get` and `deref`; it raises E0402 for any move-only place type, with a vector-specific sentence. `(get b f)` and `(arr-get a i)` of a vector stay unreachable because such fields and elements are already E0002; the rule is stated once anyway.
+- S3: `_invariant_free` (module level) is the alloc guard; `(alloc T n)` of a vector, result, optional, function, `:str`, owner-holding or `(ptr T)` type is E0002. Allowed: scalars, `:bool`, structs/enums of those, arrays of those.
+- S4: `:thread` added to `_shareable`, `_shared_state` and `_unmarked_share`; `(shared :thread)` is spellable, a bare handle at a spawn or channel crossing is E0700.
+- S5: `_zero_sized` refuses a channel of an empty struct or a `(arr T 0)` element with E0002.
+- S6: `_call` refuses a name that is not in `_bodies` with E0103 `imported functions are not lowered yet: 'name'` at the call. `_spawn` keeps its own variant for the same rule.
+- S7: `_check_test` refuses a `fn` node with E0002; `_check_helper` deleted. Nothing emits helper definitions, so the old "checked but not lowered" state is gone.
+- S8: `RESERVED_FORMS` + `RESERVED_PREFIXES` + `reserved_name`; enforced in `_signature` and on module type names. Types count too, per the ruling, so the test corpus' error enum `err` is now `eof-error`.
+- S9: `_terminates`/`_all_terminate`/`_breaks_out` replace `_contains_ret`. A `while true` terminates unless its body can `break` (a reachable break means a reachable fall-through; the lowerer would otherwise emit a live `unreachable`). `main :i64` is covered by the non-void rule; `main :void` may still fall off, matching R7.
+- S10: `_execute` returns the observation; `_run_case` compares -O0 against -O2 (stdout, exit code, stderr) through `_disagreement` and fails the case on any difference.
+- S11: `Node.name` ignores a `:type` second item, so a closure is unnamed and `_assign` numbers from its return type: `.../0`, `.../1`, `.../2`.
+- Fixtures adjusted where they relied on a hole: `tests/exec/vec.logos` (`nested`, `nested-buffer-is-stranded` no longer read a vector out of an element; `loop-move-panics-on-second-iteration` removed and replaced by `loop-release-after-the-loop`, which is the legal shape), `tests/mem/leak.logos` (`record` is now `{i32,i64,i64}` because a `:str`-bearing struct cannot be allocated). Unit tests for printer/form shadowing, test helpers, imported calls and the alloc ownership message were rewritten to the new refusals.
+- New harness negatives: `tests/type/loop-move` (E0303), `vec-get-place` (E0402), `alloc-fn`, `alloc-result` (E0002). Suite: 137 cases, 0 failed, 10 leaked; 817 unittests; accept 7/7.
+- Baseline regenerated by a full `--update-baseline` run, which is the only path that drops the removed case.
+- Deferred: no `regress/` corpus entries for these four probes (Wave B owns the category), and `(shared :thread)` has no unwrap, so a marked handle can only be held.
+- Wave A landed (commit b3526e2): S1-S11 closed, 817 unittests, 137 harness cases, acceptance 7/7. Fixtures that relied on a hole were adjusted; baseline regenerated by a full update.
+- Wave B dispatched: floats, shifts, cast, real show/patch, 12-case regress corpus, unused-name check, pip packaging with runtime as package data, extern declarations, and spec amendments for the deliberate-leak baseline, the release quarantine limit, cross-module calls and test helpers.
+- Wave B (single dispatch) FAILED with no changes: the child exhausted its output budget and wrote nothing; tree stayed at b3526e2, 817 tests green.
+- Ruling: split Wave B into three smaller dispatches with a short-reply contract and incremental commits, because one oversized task produced nothing.
+- B1 (numeric: floats, shifts, cast) dispatched.
+- Wave B1 landed (commits a326502, fd06786, 42903f1): floats, shifts, cast. 819 unittests, 164 cases. Controller spot check: a program doing 1.5+2.25, cast :i64 of 6.0, shl 1 10 prints 3.75 / 6 / 1024 and exits 0.
+- Wave B2 dispatched: show/patch on real node paths, E0107 unused binding with `_` opt-out, pip packaging that ships runtime/rt.c, with a rerunnable verification script.
+- Wave B2 landed (commits 72e82d0, 5fa8281, db699c6, ed7a85a): show/patch on node paths, E0107 unused bindings, pip packaging. 832 tests, 164 cases.
+- Controller verification: `show examples/hello.logos hello/main/2` prints exactly `(println "hello")` and exits 0; a bad path exits 1; tools/verify_install.sh PASS.
+- Wave B3 dispatched: extern with the C ABI, a 12-case regress corpus, and five spec amendments.
+- Wave B3 landed (commits 23f0710 extern, 8c1871c regress, 505452d json E0107 fix, 51dfc67 spec amendments). 848 unittests, 180 harness cases.
+- Controller verification of the whole branch: harness 180 passed / 0 failed / 10 deliberate leaks / 0 regressions; accept.sh 7/7 PASS; 848 unittests OK.
+- Re-review of waves A+B dispatched: re-probe the four Criticals independently and give a merge-readiness verdict.
+- Re-review of waves A+B: NOT READY. C2 (descriptor copies), S4-S11, extern, cast, shifts, E0107 and packaging all confirmed honest. Re-opened: the `while` condition is checked outside the loop depth (S1 did not cover it, proven double free in release); enum alloc accepted though the tag has an invariant (parity divergence); float-literal comparisons emit invalid IR.
+- Ruling: the loop condition is part of the loop, so the loop depth rises before the condition is checked.
+- Ruling: alloc refuses any type with an invariant, enums included.
+- Ruling: a literal token containing a dot or an exponent types as :f64.
+- Fix dispatched, with regress cases for each and two strengthened regress cases.
+- Wave C landed (commit f20f700): loop condition in loop scope, enum alloc refused, float literals typed :f64, regress cases added and two strengthened. 851 unittests, 184 cases.
+- Controller verification of wave C: E0303 fires for a move in a while condition and for a release in the body (probed directly); `(< 1.5 2.0)` prints lt; harness 184/0/10 leaks/0 regressions; accept.sh 7/7.
+- README status rewritten to describe the finished v1, its deliberate refusals and its known limits (commit e5f5be6).
+- Branch state: 68 commits on `build` off `e59a8db`. Not merged, not pushed.
