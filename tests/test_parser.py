@@ -81,6 +81,32 @@ class NodePathTest(unittest.TestCase):
             ["math", "math/add", "math/add/2"],
         )
 
+    def test_a_closure_numbers_its_children_from_the_return_type(self):
+        # S11: a closure has no name, so nothing is skipped. The return type
+        # takes position 0, the parameter list 1 and the body 2 — including
+        # when the return type is a composite form.
+        def parts(ret: str) -> tuple[str, str]:
+            root = parse(
+                f"(mod m)(fn f :void () (let g (fn {ret} ((x :i64)) (ret x))))",
+                "m.logos",
+            )
+            closure = [
+                node for node in root.walk() if node.kind == "fn" and node.name is None
+            ][0]
+            self.assertEqual(closure.path, "m/f/2/1")
+            body = closure.items[-1]
+            params = closure.items[-2]
+            return params.path, body.path
+
+        self.assertEqual(parts(":i64"), ("m/f/2/1/1", "m/f/2/1/2"))
+        self.assertEqual(parts("(vec :i64)"), ("m/f/2/1/1", "m/f/2/1/2"))
+
+    def test_a_closure_has_no_name_of_its_own(self):
+        root = parse("(mod m)(fn f :void () (fn :i64 ((x :i64)) (ret x)))", "m.logos")
+        closure = [node for node in root.walk() if node.kind == "fn"][1]
+        self.assertIsNone(closure.name)
+        self.assertEqual(closure.path, "m/f/2")
+
     def test_module_children_are_indexed_in_source_order(self):
         root = parse("(mod math)\n(use a)\n(use b)\n", "math.logos")
         self.assertEqual(

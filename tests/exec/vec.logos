@@ -176,7 +176,7 @@
   (vec-free v))
 
 (test nested
-  (expect (out "0\n")
+  (expect (out "1\n")
     (code 0)
     (leaks 0))
   (letmut inner
@@ -186,7 +186,7 @@
     (vec (vec :i64))
     (make (vec (vec :i64))))
   (vec-push outer inner)
-  (println (vec-len (vec-get outer 0)))
+  (println (vec-len outer))
   (vec-free outer))
 
 (fn release :void ((v (vec :i64)))
@@ -217,23 +217,22 @@
     (make (vec :i64)))
   (relay v))
 
-(fn drop :void ((v (vec :i64)))
-  (vec-free v))
-
-(test loop-move-panics-on-second-iteration
-  (expect (code 2)
-    (err-contains "R0002"))
+(test loop-release-after-the-loop
+  (expect (out "ok\n")
+    (code 0)
+    (leaks 0))
   (letmut v
     (vec :i64)
     (make (vec :i64)))
-  (vec-push v 1)
   (letmut i :i64 0)
   (while (< i 2)
-    (drop v)
-    (set i (+ i 1))))
+    (vec-push v i)
+    (set i (+ i 1)))
+  (vec-free v)
+  (println "ok"))
 
 (test nested-buffer-is-stranded
-  (expect (out "7\n")
+  (expect (out "1\n")
     (code 0)
     (leaks 1)
     (err-contains "LEAK 32 bytes"))
@@ -245,7 +244,7 @@
     (vec (vec :i64))
     (make (vec (vec :i64))))
   (vec-push outer inner)
-  (println (vec-get (vec-get outer 0) 0))
+  (println (vec-len outer))
   (vec-free outer))
 
 (test growth-leak-is-reported

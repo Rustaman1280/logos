@@ -331,7 +331,11 @@ class InstantiationTest(unittest.TestCase):
                 )
                 error = fail_on(source)
                 self.assertEqual(error.code, "E0402")
-                self.assertIn("a vector argument must be a name", error.message)
+                # The place read is refused before the argument rule sees it:
+                # a vector cannot leave a vector element at all.
+                self.assertIn(
+                    "a vector cannot be read out of a place", error.message
+                )
 
     def test_a_call_result_cannot_fill_a_parameter_that_unifies_to_a_vector(self):
         error = fail_on(
@@ -402,14 +406,16 @@ class InstantiationTest(unittest.TestCase):
         self.assertEqual(error.path, "m/box/0/0/0")
         self.assertIn("type variable T is not bound here", error.message)
 
-    def test_a_generic_helper_of_a_test_cannot_be_instantiated(self):
-        # A copy of a helper has nowhere to be emitted, so the call is refused
-        # with the code the lowerer gives an unlowerable name.
+    def test_a_generic_helper_of_a_test_is_refused_before_instantiation(self):
+        # Helpers are refused at the node now: no copy of one could be
+        # emitted, so there is nothing to instantiate in the first place.
         error = fail_on(
             "(mod m)(test t (fn h :T ((x :T)) (ret x)) (let a (h 1)))"
         )
-        self.assertEqual(error.code, "E0103")
-        self.assertIn("module functions", error.message)
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "test-local helper functions are not lowered yet"
+        )
 
 
 class InstantiationLimitTest(unittest.TestCase):
@@ -575,11 +581,11 @@ class ClosureCheckTest(unittest.TestCase):
 
     def test_a_non_capturing_closure_may_be_returned(self):
         cm = checked(
-            "(mod m)(fn make :(fn (:i64) :i64) ()"
+            "(mod m)(fn build-doubler :(fn (:i64) :i64) ()"
             " (ret (fn :i64 ((x :i64)) (ret (* x 2)))))"
         )
         self.assertEqual(
-            cm.fn_sigs["make"], FnTy((), FnTy((Prim("i64"),), Prim("i64")))
+            cm.fn_sigs["build-doubler"], FnTy((), FnTy((Prim("i64"),), Prim("i64")))
         )
 
     def test_a_capturing_closure_cannot_be_stored_in_a_field(self):

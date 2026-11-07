@@ -30,6 +30,12 @@ runner executes the binary with a timeout, counts stderr lines that begin
 ``opts`` (``-O0`` and ``-O2`` by default); a case passes only if the directive
 holds at every level, and a failure names the level that disagreed.
 
+The levels are also compared with each other: the same program built at
+``-O0`` and ``-O2`` must print the same bytes, exit the same way and write the
+same stderr. Comparing only against the directive would accept two different
+wrong answers, so a disagreement between the runs is a failure of the case in
+its own right, and the report names the fields that differ.
+
 A disagreement is never repaired. The fixture's directive is the human's
 statement of intent, so the runner reports both values and leaves the file
 alone.
@@ -499,9 +505,19 @@ def _run_case(
         )
 
     problems: list[str] = []
+    observed: list[tuple[str, tuple[str, str, int]]] = []
     for opt in opts:
         out = _binary_path(category, relative, name, index, opt)
-        problems.extend(_execute(path, name, out, opt, expectation, summary, timeout))
+        failed, seen = _execute(path, name, out, opt, expectation, summary, timeout)
+        problems.extend(failed)
+        if seen is not None:
+            observed.append((opt, seen))
+    if len(observed) > 1:
+        first_opt, first = observed[0]
+        for other_opt, other in observed[1:]:
+            disagreement = _disagreement(first_opt, first, other_opt, other)
+            if disagreement is not None:
+                problems.append(disagreement)
     _record(summary, case_id, "; ".join(problems) if problems else None)
 
 
@@ -525,12 +541,17 @@ def _execute(
     expectation: Expectation,
     summary: Summary,
     timeout: float,
-) -> list[str]:
-    """Build and run one case at one level; return its problems, prefixed."""
+) -> tuple[list[str], tuple[str, str, int] | None]:
+    """Build and run one case at one level; return its problems and its run.
+
+    The observation is ``(stdout, stderr, exit code)``, kept so the caller can
+    compare the optimisation levels with each other. A case that did not run
+    has no observation: there is nothing to compare.
+    """
     try:
         binary = driver.run_test(str(path), name, str(out), opt=opt)
     except (driver.BuildError, LogosError, OSError) as error:
-        return [f"{opt}: build failed: {_one_line(_message(error))}"]
+        return [f"{opt}: build failed: {_one_line(_message(error))}"], None
     try:
         done = subprocess.run(
             [binary],
@@ -542,14 +563,43 @@ def _execute(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return [f"{opt}: timed out after {timeout:g}s"]
+        return [f"{opt}: timed out after {timeout:g}s"], None
     except OSError as error:
-        return [f"{opt}: could not run: {_one_line(str(error))}"]
+        return [f"{opt}: could not run: {_one_line(str(error))}"], None
 
     leaks = sum(1 for line in done.stderr.splitlines() if line.startswith("LEAK "))
     summary.leaks += leaks
     problems = _compare(expectation, done.stdout, done.stderr, done.returncode, leaks)
-    return [f"{opt}: {problem}" for problem in problems]
+    seen = (done.stdout, done.stderr, done.returncode)
+    return [f"{opt}: {problem}" for problem in problems], seen
+
+
+def _disagreement(
+    first_opt: str,
+    first: tuple[str, str, int],
+    other_opt: str,
+    other: tuple[str, str, int],
+) -> str | None:
+    """One line naming every way two optimisation levels disagree.
+
+    Optimisation parity is a test in its own right: the same program built at
+    ``-O0`` and ``-O2`` must print the same bytes, exit the same way and write
+    the same stderr, or the compiler has changed meaning while optimising.
+    Comparing only against the directive would accept two different wrong
+    answers, so the comparison is explicit and names the fields that differ.
+    """
+    out_one, err_one, code_one = first
+    out_other, err_other, code_other = other
+    parts: list[str] = []
+    if out_one != out_other:
+        parts.append(f"stdout {out_one!r} vs {out_other!r}")
+    if code_one != code_other:
+        parts.append(f"exit code {code_one} vs {code_other}")
+    if err_one != err_other:
+        parts.append(f"stderr {err_one!r} vs {err_other!r}")
+    if not parts:
+        return None
+    return f"{first_opt} and {other_opt} disagree: " + ", ".join(parts)
 
 
 def _compare(

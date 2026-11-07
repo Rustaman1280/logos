@@ -706,16 +706,62 @@ class ReturnTest(unittest.TestCase):
     def test_a_return_inside_a_branch_counts(self):
         check_src("(mod m)(fn f :i64 ((a :bool)) (if a (ret 1) (ret 2)))")
 
+    def test_a_conditional_return_needs_both_arms(self):
+        # Presence is not termination: the else arm falls off the end, and
+        # nothing gives the caller a value on that path.
+        error = expect_error(
+            '(mod m)(fn f :i64 ((a :bool)) (if a (ret 1) (println "x")))',
+            "E0105",
+        )
+        self.assertEqual(error.path, "m/f")
+        self.assertIn("falls off the end", error.message)
+
+    def test_a_match_must_return_from_every_arm(self):
+        error = expect_error(
+            '(mod m)(fn f :i64 ((n :i64))'
+            ' (match n (0 (ret 1)) (_ (println "x"))))',
+            "E0105",
+        )
+        self.assertEqual(error.path, "m/f")
+
+    def test_a_match_whose_arms_all_return_satisfies_e0105(self):
+        check_src(
+            "(mod m)(fn f :i64 ((n :i64))"
+            " (match n (0 (ret 1)) (1 (ret 2)) (_ (ret 3))))"
+        )
+
+    def test_a_constant_true_loop_never_reaches_the_end(self):
+        check_src(
+            '(mod m)(fn spin :i64 () (while true (println "x")))'
+        )
+
+    def test_a_constant_true_loop_with_a_break_still_falls_through(self):
+        error = expect_error(
+            "(mod m)(fn f :i64 () (while true (break)))", "E0105"
+        )
+        self.assertEqual(error.path, "m/f")
+
+    def test_an_i64_main_must_return_on_every_path(self):
+        # main is the C entry point, so a fall-through used to exit 0 with a
+        # value nobody wrote.
+        error = expect_error(
+            '(mod m)(fn main :i64 ((a :bool)) (if a (ret 1) (println "x")))',
+            "E0105",
+        )
+        self.assertIn("function 'main'", error.message)
+        check_src("(mod m)(fn main :void () (println \"x\"))")
+
 
 class ImportTest(unittest.TestCase):
     def test_imported_fns_and_types_are_visible(self):
+        # Visible, though not callable: a call to an imported function is
+        # E0103 because this module does not lower it (test_emit covers that).
         checked = check_src(
-            "(mod a)(use b)(fn f :i64 () (ret (g 1)))",
+            "(mod a)(use b)(fn f :i64 ((x :i64)) (ret x))",
             {"b": "(mod b)(type p (struct))(fn g :i64 ((x :i64)) (ret x))"},
         )
         self.assertIn("g", checked.fn_sigs)
         self.assertIn("p", checked.types)
-        self.assertEqual(checked.expr_types["a/f/2/0"], Prim("i64"))
 
     def test_an_imported_type_can_annotate_a_local_signature(self):
         checked = check_src(
@@ -755,26 +801,32 @@ class TestNodeTest(unittest.TestCase):
         self.assertNotIn("m/test/t/0", checked.expr_types)
         self.assertEqual(checked.expr_types["m/test/t/1"], Prim("void"))
 
-    def test_a_helper_fn_inside_a_test_is_checked_and_callable(self):
-        checked = check_src(
+    def test_a_helper_fn_inside_a_test_is_refused(self):
+        # No definition of a helper is emitted, so a call could never link.
+        # Refused at the node, before any call is checked.
+        error = expect_error(
             "(mod m)(test t (fn twice :i64 ((x :i64)) (ret (* x 2)))"
-            " (let y :i64 (twice 2)))"
+            " (let y :i64 (twice 2)))",
+            "E0002",
         )
-        self.assertEqual(checked.expr_types["m/test/t/0/2/0"], Prim("i64"))
-        self.assertEqual(checked.expr_types["m/test/t/1/2"], Prim("i64"))
+        self.assertEqual(
+            error.message, "test-local helper functions are not lowered yet"
+        )
+        self.assertEqual(error.path, "m/test/t/0")
 
     def test_a_test_returns_no_value(self):
         error = expect_error("(mod m)(test t (ret 1))", "E0100")
         self.assertEqual(error.path, "m/test/t/0")
         self.assertIn("test 't'", error.message)
 
-    def test_a_helper_fn_is_not_visible_outside_its_test(self):
+    def test_a_helper_fn_is_refused_even_when_nothing_calls_it(self):
+        # The refusal is structural: the node has no lowered definition at all,
+        # so it does not matter whether anything would call it.
         error = expect_error(
-            "(mod m)(test t (fn helper :i64 () (ret 0)))"
-            "(fn f :i64 () (ret (helper)))",
-            "E0103",
+            "(mod m)(test t (fn helper :i64 () (ret 0)))",
+            "E0002",
         )
-        self.assertIn("'helper'", error.message)
+        self.assertEqual(error.path, "m/test/t/0")
 
 
 class UnknownFormTest(unittest.TestCase):

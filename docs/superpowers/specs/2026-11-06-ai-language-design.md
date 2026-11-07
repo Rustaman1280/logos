@@ -83,6 +83,16 @@ Rules:
   conditional initialisation, so no read can reach an undefined slot.
 - The compiler refuses any form it cannot lower. A checker that accepts a
   construct the backend cannot emit is a bug, not a gap.
+- A definition may not take a name a form already spells: `fn` and `type`
+  names are checked against the form vocabulary (`if`, `let`, `get`, `deref`,
+  `alloc`, `spawn`, `ok`, the `vec-`, `str-`, `arr-` and `atomic-` families,
+  and the rest), and a collision is E0003 `reserved form name`. The form wins
+  the spelling, so the definition could never be called.
+- Every function that returns a value ends every path in a `ret`: an `if`
+  terminates only when both arms do, a `match` only when every arm does, and
+  `while` with a literal `true` condition terminates unless its body can
+  `break` out. `main` returning `:i64` obeys the same rule, so an exit status
+  is never an accident.
 - No implicit numeric conversion. `(+ 1 2.0)` is a type error.
 - No statement without a node name. Nothing is implicit.
 - There is one name per integer width and no alias. `:int` does not exist;
@@ -128,7 +138,19 @@ Nothing here is undefined behaviour, so a C oracle can check it:
 ### Memory
 
 - `(alloc :T n)` gives `(own T)`. `(free p)` releases it. Release is
-  manual: the compiler inserts no drops and no cleanup blocks.
+  manual: the compiler inserts no drops and no cleanup blocks. An allocated
+  block is not initialised, so only a type whose every bit pattern is already
+  a value may be allocated: a scalar, `:bool`, a struct or enum of those, or an
+  array of those. A `(vec T)`, `(res ...)`, `(opt ...)`, `(fn ...)`, `:str` and
+  any owner-containing type are E0002 `allocation of T is not supported: it has
+  invariants`, because reading one uninitialised branches on a garbage tag or
+  calls through a garbage pointer.
+- A binding declared outside a loop may not be moved or released inside it:
+  `(free p)` or any move of it inside `while` is E0303 `a binding declared
+  outside a loop cannot be released or moved inside it`. The body is checked
+  once, so a release on the first pass leaves the second reading freed memory.
+  Release after the loop instead; a binding declared inside the body may be
+  released there.
 - Owning pointers move. Use after move is a compile error.
 - Raw pointers exist for arrays and FFI but need an explicit `(ptr ...)`.
 - In debug builds the runtime tracks every live block. At exit it prints
@@ -149,7 +171,10 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   owner (E0002 where the type is spelled), and no expression may read one
   out of a place — `(get b p)` over an owning field, `(arr-get a i)`,
   `(vec-get v i)`, and `(deref p)` of an owning pointer are E0402 — because
-  a place read copies the pointer and creates a second owner.
+  a place read copies the pointer and creates a second owner. The same rule
+  covers every move-only value: reading a `(vec T)`, or any type containing
+  one, out of `get`, `arr-get`, `vec-get` or `deref` is E0402, because the
+  read copies the descriptor and two descriptors free one buffer twice.
 - A container whose element type holds an owner at any depth is E0002, `a
   container of owners is not supported yet`, where the container is spelled:
   `(vec (own T))`, `(vec (opt (own T)))`, `(arr (own T) n)` — including
@@ -224,7 +249,9 @@ module function returning `:void`; its arguments are copied into one heap
 record that the thread owns, so a value that owns memory (a vector, an owner)
 cannot cross — E0402. A raw pointer or a synchronization handle crosses only
 when its type is marked `(shared ...)` — E0700 — because two threads reaching
-one object is exactly what the marker exists to show. The check descends into
+one object is exactly what the marker exists to show, and a `:thread` handle
+is one of those objects: `join` releases it, so a handle handed to another
+thread could be joined twice. The check descends into
 aggregates the way the move check does: a bare `(ptr T)` in a struct field or
 an array element is E0700 at the argument, while a `(shared (ptr T))` field is
 already marked and stays legal. A channel's element type is the other crossing
@@ -240,7 +267,9 @@ from another thread, is R0005 rather than a hang.
 `(chan T n)` returns a `(shared (chan T))`, a ring of `n` copies of T.
 `(send c v)` blocks while it is full, `(recv c)` while it is empty. T must be
 a type with a copy: a vector or an owner is refused at the channel type.
-Capacity must be positive (R0003 at the channel).
+T must also occupy at least one byte (E0002 `a channel of an empty type is not
+supported`), because the runtime copies an element into a slot the caller sized
+as empty. Capacity must be positive (R0003 at the channel).
 
 `(atomic :i64 v)` and `(atomic :u64 v)` return a `(shared (atomic T))`;
 `atomic-add` returns the new value, `atomic-load` reads it, `atomic-store`
@@ -249,7 +278,8 @@ replaces it. Every operation is sequentially consistent.
 The marker is spelled wherever a mutex, channel or atomic is named, and on any
 pointer handed to a thread: `(shared (ptr T))` is the marked form of an
 address, and `deref`/`set-deref`/`ptr-add` accept it. Only a pointer, a mutex,
-a channel or an atomic may be shared; a scalar behind the marker is E0002.
+a channel, an atomic or a thread handle may be shared; a scalar behind the
+marker is E0002.
 
 Data races are not prevented by the compiler in v1. Mutexes, channels and
 atomics are runtime objects the language cannot destroy, so they are
@@ -272,13 +302,19 @@ or optional that carries a bare pointer is refused as a thread argument, and
 ### Modules
 
 One file, one module, file name equals module name. `(use other)` imports.
-No circular imports: the resolver rejects them with the full cycle.
+No circular imports: the resolver rejects them with the full cycle. v1 lowers
+one module at a time: an imported definition is visible in the namespace
+(its type can annotate a local signature) but a call to it is E0103
+`imported functions are not lowered yet`, naming the function, because its
+symbol lives in an object file the program is not built with.
 
 ### Tests are grammar
 
 `(test ...)` and its directives are ordinary module-level nodes, not a
-second grammar. `(test name checks...)` may hold `(expect ...)` and
-private helper `fn` nodes. `logosc build` compiles a file that contains
+second grammar. `(test name checks...)` may hold `(expect ...)` nodes. A
+test-local helper `fn` is E0002 `test-local helper functions are not lowered
+yet` until a copy of one can be emitted; the refusal is at the node, not at a
+call. `logosc build` compiles a file that contains
 tests and drops every test node. `logosc test` compiles the same file with
 tests kept and runs each one in its own process. Directive nodes:
 `(expect (out S) (code N))`, `(expect-leak N)`, and module-level
@@ -361,7 +397,9 @@ Three extra checks:
    C's signed overflow and out-of-range float casts are undefined and
    cannot serve as an oracle.
 2. **Optimisation parity.** The whole corpus runs at `-O0` and `-O2`.
-   Output must be identical.
+   The two runs are compared with each other as well as with the directive:
+   stdout, exit status and stderr must be identical, and a disagreement fails
+   the case rather than being read off the directive twice.
 3. **Real programs.** `examples/wc.logos` counts bytes, words and lines,
    `examples/json.logos` parses JSON and prints a summary, and
    `examples/matrix.logos` multiplies a matrix with threads. Their output

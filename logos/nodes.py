@@ -24,6 +24,12 @@ position too, so a return type in front of the body pushes the body along.
 Paths never depend on the shape of a sibling, so editing one child moves no
 other path.
 
+A closure has no name to insert: ``(fn :i64 ((x :i64)) body)`` is an expression
+whose second item is its return type, so it is numbered like any other unnamed
+node — the return type is ``.../0``, the parameter list ``.../1`` and the body
+``.../2``. Changing the return type from a token to a composite form therefore
+moves no path below it.
+
 Paths are assigned once, by ``assign_paths``, immediately after parsing. Later
 passes must treat them as read-only, even though ``Node`` itself is mutable.
 """
@@ -56,10 +62,19 @@ class Node:
 
     @property
     def name(self) -> str | None:
-        """The definition name this form introduces, or ``None``."""
+        """The definition name this form introduces, or ``None``.
+
+        A type marker is not a name: ``(fn :i64 ((x :i64)) ...)`` is a closure
+        expression, whose second item is its return type, so it has no name and
+        its children are numbered positionally from that return type.
+        """
         if self.kind in NAMED_KINDS and len(self.items) > 1:
             head = self.items[1]
-            if isinstance(head, Token) and head.kind == ATOM:
+            if (
+                isinstance(head, Token)
+                and head.kind == ATOM
+                and not head.value.startswith(":")
+            ):
                 return head.value
         return None
 

@@ -1,6 +1,6 @@
 (mod leak)
 
-(type record (struct (tag :i32) (name :str)))
+(type record (struct (tag :i32) (value :i64) (extra :i64)))
 
 (fn consume :void ((p (own :i64)))
   (free p))

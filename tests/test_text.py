@@ -527,10 +527,32 @@ class VectorOwnershipTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'second'")
 
+    def test_a_vector_cannot_be_read_out_of_a_vector_element(self):
+        # S2: the element is a place, so naming the descriptor copies it. The
+        # copy and the element would free one buffer twice.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut outer (vec (vec :i64)) (make (vec (vec :i64))))"
+            " (letmut w (vec-get outer 0)) (vec-free w))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message, "a vector cannot be read out of a place yet"
+        )
+
+    def test_a_vector_cannot_be_read_through_a_pointer(self):
+        error = fail_on(
+            "(mod m)(fn f :void ((p (ptr (vec :i64))))"
+            " (letmut w (deref p)) (vec-free w))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message, "a vector cannot be read out of a place yet"
+        )
+
     def test_a_vector_element_cannot_be_passed_as_a_vector(self):
-        # R6: the callee may free what it is handed, so a descriptor copied
-        # out of the caller's container would leave it pointing at released
-        # memory. The argument has to be a name.
+        # R6 and S2 agree here: the callee may free what it is handed, and the
+        # place read that would produce the argument is refused even earlier.
         error = fail_on(
             "(mod m)(fn drain :void ((v (vec :i64))) (vec-free v))"
             "(fn f :void ()"
@@ -538,6 +560,9 @@ class VectorOwnershipTest(unittest.TestCase):
             " (drain (vec-get outer 0)))"
         )
         self.assertEqual(error.code, "E0402")
+        # The vector-argument rule runs before the argument is evaluated, so
+        # it names the naming rule; the place read is refused on its own too
+        # (``tests/type/vec-get-place.logos``).
         self.assertEqual(error.message, "a vector argument must be a name")
 
     def test_a_call_result_cannot_be_passed_as_a_vector(self):
@@ -631,12 +656,12 @@ class PrinterCheckTest(unittest.TestCase):
                 error = fail_on(source)
                 self.assertEqual(error.code, "E0102")
 
-    def test_a_modules_own_fn_still_shadows_the_printer(self):
-        cm = checked(
-            '(mod m)(fn print :void ((n :i32)) (ret))'
-            "(fn f :void ((n :i32)) (print n))"
-        )
-        self.assertEqual(type_of(cm, "print"), Prim("void"))
+    def test_a_modules_own_fn_may_not_shadow_the_printer(self):
+        # The printer form claims ``print`` before the function namespace is
+        # consulted, so a definition of that name could never be called.
+        error = fail_on('(mod m)(fn print :void ((n :i32)) (ret))')
+        self.assertEqual(error.code, "E0003")
+        self.assertEqual(error.message, "reserved form name")
 
     def test_printing_a_float_literal_does_not_widen_an_integer(self):
         # No implicit conversion: a float literal in the print position is an
@@ -989,11 +1014,11 @@ class VecExecTest(unittest.TestCase):
         "read-across-a-call": ("10\n4\n", 0),
         "free-a-parameter": ("3\n", 0),
         "name-argument-through-a-relay": ("3\n", 0),
-        "loop-move-panics-on-second-iteration": ("", 2),
+        "loop-release-after-the-loop": ("ok\n", 0),
         "move-then-free-in-both-branches": ("ok\n", 0),
         "small-elements": ("true\n3\n", 0),
         "struct-elements": ("4\n", 0),
-        "nested": ("0\n", 0),
+        "nested": ("1\n", 0),
         "get-out-of-bounds": ("", 2),
         "set-out-of-bounds": ("", 2),
     }
@@ -1032,7 +1057,7 @@ class VecExecTest(unittest.TestCase):
         # the tracker reports it — that is the remaining hole, and this case
         # pins its shape rather than hiding it.
         done = self.run_case("nested-buffer-is-stranded", "-O0")
-        self.assertEqual(done.stdout, "7\n", done.stderr)
+        self.assertEqual(done.stdout, "1\n", done.stderr)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(
             "LEAK 32 bytes at vec/test/nested-buffer-is-stranded/", done.stderr

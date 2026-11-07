@@ -544,57 +544,53 @@ class SymbolTest(unittest.TestCase):
         self.assertEqual(caught.exception.message, "rt_ names are reserved")
 
 
-class BuiltinShadowTest(unittest.TestCase):
-    """A module-level ``fn`` named ``print``/``println`` wins over the builtin.
+class ReservedNameTest(unittest.TestCase):
+    """A definition may not take a name a form already spells.
 
-    The checker has always resolved ``env.fns`` before ``BUILTINS``. The
-    lowerer used to do the reverse, so a program that defined its own ``print``
-    checked against its own signature and then silently emitted the builtin
-    instead: the user function was never called and no diagnostic appeared.
+    An earlier branch let ``env.fns`` win over the builtins, so a ``fn print``
+    was callable while a ``fn get`` was not: the dispatch table claims some
+    names before the function namespace is consulted. Rather than leave that
+    half-rule in place, every form name is reserved and the definition is
+    refused where it is written.
     """
 
-    def test_a_user_print_is_called_instead_of_the_builtin(self):
-        source = (
-            "(mod shadow)\n\n"
-            "(fn print :i64 ((n :i64))\n"
-            "  (ret (+ n 1)))\n\n"
-            "(fn main :i64 ()\n"
-            "  (ret (print 41)))\n"
-        )
-        path = write_source("shadow", source)
-        out = str(ROOT / "build" / "test-shadow")
-        driver.build(str(path), out)
-        r = run(out)
-        # 42 only happens if @lg.shadow.print ran and returned its sum.
-        self.assertEqual(r.returncode, 42, r.stderr)
-        self.assertEqual(r.stdout, "")
-        text = Path(driver.ir_path(str(path))).read_text(encoding="utf-8")
-        self.assertIn("call i64 @lg.shadow.print(i64 41)", text)
-        self.assertNotIn("call i64 @rt_write", text)
+    def test_a_fn_named_after_a_printer_is_refused(self):
+        with self.assertRaises(LogosError) as caught:
+            checked("(mod m)(fn print :i64 ((n :i64)) (ret n))")
+        self.assertEqual(caught.exception.code, "E0003")
+        self.assertEqual(caught.exception.message, "reserved form name")
+        self.assertEqual(caught.exception.path, "m/print")
 
-    def test_a_shadow_taking_str_calls_the_user_function(self):
-        """The review's probe, now that ``:str`` values are lowered.
+    def test_a_fn_named_after_a_plain_form_is_refused(self):
+        for name in ("get", "alloc", "while", "ok"):
+            with self.subTest(name=name):
+                with self.assertRaises(LogosError) as caught:
+                    checked(f"(mod m)(fn {name} :i64 () (ret 1))")
+                self.assertEqual(caught.exception.code, "E0003")
+                self.assertEqual(caught.exception.message, "reserved form name")
 
-        Falling back to the builtin made the bug silent: the call would print
-        ``x`` and never enter the user's function. Now the parameter carries
-        the aggregate, and only ``USER-FN`` may reach stdout.
-        """
-        source = (
-            "(mod shadow)\n\n"
-            "(fn print :void ((s :str))\n"
-            '  (println "USER-FN"))\n\n'
-            "(fn main :void ()\n"
-            '  (print "x"))\n'
+    def test_a_fn_named_inside_a_form_family_is_refused(self):
+        for name in ("vec-push", "str-len", "arr-get", "atomic-add"):
+            with self.subTest(name=name):
+                with self.assertRaises(LogosError) as caught:
+                    checked(f"(mod m)(fn {name} :i64 () (ret 1))")
+                self.assertEqual(caught.exception.code, "E0003")
+                self.assertEqual(caught.exception.message, "reserved form name")
+
+    def test_a_type_named_after_a_form_is_refused(self):
+        with self.assertRaises(LogosError) as caught:
+            checked("(mod m)(type alloc (struct (x :i64)))")
+        self.assertEqual(caught.exception.code, "E0003")
+        self.assertEqual(caught.exception.message, "reserved form name")
+        self.assertEqual(caught.exception.path, "m/alloc")
+
+    def test_a_name_that_only_looks_reserved_is_accepted(self):
+        # ``allocator`` and ``get-value`` are not the forms themselves.
+        checked(
+            "(mod m)"
+            "(type allocator (struct (x :i64)))"
+            "(fn get-value :i64 ((p allocator)) (ret (get p x)))"
         )
-        path = write_source("shadow-str", source)
-        out = str(ROOT / "build" / "test-shadow-str")
-        driver.build(str(path), out)
-        r = run(out)
-        self.assertEqual(r.stdout, "USER-FN\n")
-        self.assertEqual(r.returncode, 0)
-        text = Path(driver.ir_path(str(path))).read_text(encoding="utf-8")
-        self.assertIn("define internal void @lg.shadow.print({ i8*, i64 } %v.0)", text)
-        self.assertIn("call void @lg.shadow.print({ i8*, i64 } %t", text)
 
 
 class IntegerWidthTest(unittest.TestCase):
@@ -651,20 +647,25 @@ class IntegerWidthTest(unittest.TestCase):
 
 
 class CallResolutionTest(unittest.TestCase):
-    """The lowerer, not the printer, owns "no such callee"."""
+    """A call the backend cannot emit is refused by the checker, not the lowerer."""
 
-    def test_a_call_with_no_lowered_definition_is_a_diagnostic(self):
+    def test_a_call_to_an_imported_function_is_refused_at_check_time(self):
+        # The signature is visible, but only this module's own definitions are
+        # lowered: the callee's symbol belongs to an object file the program is
+        # not built with. Refused where the call is written, so a program can
+        # never pass the checker and then fail in the backend.
         other = parse("(mod other)\n\n(fn helper :i64 ()\n  (ret 1))\n", "other.logos")
         root = parse(
             "(mod main)\n\n(use other)\n\n(fn main :i64 ()\n  (ret (helper)))\n",
             "main.logos",
         )
         module = resolve(root, lambda name: other, "main.logos")
-        cm = check_module(module)
         with self.assertRaises(LogosError) as caught:
-            lower.lower_module(cm)
+            check_module(module)
         self.assertEqual(caught.exception.code, "E0103")
-        self.assertEqual(caught.exception.path, path_of(cm, "helper"))
+        self.assertEqual(caught.exception.path, "main/main/2/0")
+        self.assertIn("helper", caught.exception.message)
+        self.assertIn("imported functions are not lowered yet", caught.exception.message)
 
     def test_a_test_body_can_call_a_module_function(self):
         source = (

@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXEC = ROOT / "tests" / "exec" / "results.logos"
 
 #: A declared error enum, so every inline result can name one.
-ERR = "(type err (enum (bad :i64) (eof)))"
+ERR = "(type eof-error (enum (bad :i64) (eof)))"
 
 
 def _loader(name: str):
@@ -162,7 +162,7 @@ class ResultTypeTest(unittest.TestCase):
         self.assertIn("must be a declared enum", error.message)
 
     def test_a_res_of_a_vector_is_refused(self):
-        error = fail_on("(mod m)" + ERR + "(fn f :(res (vec :i64) err) () (ret))")
+        error = fail_on("(mod m)" + ERR + "(fn f :(res (vec :i64) eof-error) () (ret))")
         self.assertIn(error.code, ("E0002",))
         self.assertIn("vector", error.message)
 
@@ -239,9 +239,9 @@ class ResultTypeTest(unittest.TestCase):
         # environment f points at dies with this frame — E0502 where it is
         # built, the same refusal a struct field gives.
         error = fail_on(
-            "(mod m)(type err (enum (eof)))"
+            "(mod m)(type eof-error (enum (eof)))"
             "(fn f :void () (let n 1) (let h (fn :i64 () (ret n)))"
-            " (let r :(res (fn () :i64) err) (ok h)) (ret))"
+            " (let r :(res (fn () :i64) eof-error) (ok h)) (ret))"
         )
         self.assertEqual(error.code, "E0502")
         self.assertEqual(
@@ -259,29 +259,29 @@ class ResultTypeTest(unittest.TestCase):
         )
 
     def test_a_non_capturing_closure_may_be_carried_in_a_result(self):
-        checked("(mod m)(type err (enum (eof)))"
+        checked("(mod m)(type eof-error (enum (eof)))"
                 "(fn f :void ()"
-                " (let r :(res (fn () :i64) err) (ok (fn :i64 () (ret 1))))"
+                " (let r :(res (fn () :i64) eof-error) (ok (fn :i64 () (ret 1))))"
                 " (match r ((ok g) (println (g))) ((err e) (println 0))))")
 
 
 class TryTest(unittest.TestCase):
     def test_try_yields_the_ok_type(self):
         cm = checked("(mod m)" + ERR +
-                     "(fn g :(res :i64 err) () (ret (ok 1)))"
-                     "(fn f :(res :str err) () (let v (try (g))) (ret (ok \"x\")))")
+                     "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                     "(fn f :(res :str eof-error) () (let v (try (g))) (ret (ok \"x\")))")
         self.assertEqual(cm.expr_types["m/f/3/1"], Prim("i64"))
 
     def test_try_propagates_an_exactly_matching_error_type(self):
         cm = checked("(mod m)" + ERR +
-                     "(fn g :(res :i64 err) () (ret (ok 1)))"
-                     "(fn f :(res :i64 err) () (let v (try (g))) (ret (ok v)))")
+                     "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                     "(fn f :(res :i64 eof-error) () (let v (try (g))) (ret (ok v)))")
         self.assertEqual(cm.expr_types["m/f/3/1"], Prim("i64"))
 
     def test_a_different_error_type_is_e0601(self):
         error = fail_on("(mod m)" + ERR +
                         "(type other (enum (nope)))"
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :(res :i64 other) () (let v (try (g))) (ret (ok v)))")
         self.assertEqual(error.code, "E0601")
         self.assertEqual(error.path, "m/f/3/1")
@@ -289,7 +289,7 @@ class TryTest(unittest.TestCase):
 
     def test_a_try_in_a_function_without_a_result_is_e0601(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :i64 () (ret (try (g))))")
         self.assertEqual(error.code, "E0601")
         self.assertIn("cannot propagate", error.message)
@@ -300,8 +300,8 @@ class TryTest(unittest.TestCase):
         self.assertEqual(error.message, "'try' needs a result, found :i64")
 
     def test_try_takes_exactly_one_operand(self):
-        error = fail_on("(mod m)" + ERR + "(fn g :(res :i64 err) () (ret (ok 1)))"
-                        "(fn f :(res :i64 err) () (let v (try (g) (g))) (ret (ok v)))")
+        error = fail_on("(mod m)" + ERR + "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                        "(fn f :(res :i64 eof-error) () (let v (try (g) (g))) (ret (ok v)))")
         self.assertEqual(error.code, "E0102")
 
     def test_the_corpus_case_reports_e0601(self):
@@ -317,7 +317,7 @@ class TryTest(unittest.TestCase):
 class UnhandledResultTest(unittest.TestCase):
     def test_a_result_in_statement_position_is_e0602(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (g))")
         self.assertEqual(error.code, "E0602")
         self.assertEqual(error.path, "m/f/2")
@@ -325,7 +325,7 @@ class UnhandledResultTest(unittest.TestCase):
 
     def test_a_result_binding_that_is_never_handled_is_e0602(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (let r (g)) (println 1))")
         self.assertEqual(error.code, "E0602")
         self.assertEqual(error.path, "m/f/2")
@@ -333,36 +333,36 @@ class UnhandledResultTest(unittest.TestCase):
 
     def test_a_matched_binding_is_handled(self):
         checked("(mod m)" + ERR +
-                "(fn g :(res :i64 err) () (ret (ok 1)))"
+                "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                 "(fn f :void () (let r (g))"
                 " (match r ((ok v) (println v)) ((err e) (println 0))))")
 
     def test_a_tried_binding_is_handled(self):
         checked("(mod m)" + ERR +
-                "(fn g :(res :i64 err) () (ret (ok 1)))"
-                "(fn f :(res :i64 err) () (let r (g)) (ret (ok (try r))))")
+                "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                "(fn f :(res :i64 eof-error) () (let r (g)) (ret (ok (try r))))")
 
     def test_a_returned_result_is_handled(self):
         checked("(mod m)" + ERR +
-                "(fn g :(res :i64 err) () (ret (ok 1)))"
-                "(fn f :(res :i64 err) () (let r (g)) (ret r))")
+                "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                "(fn f :(res :i64 eof-error) () (let r (g)) (ret r))")
 
     def test_a_result_passed_to_a_callee_is_handled(self):
         checked("(mod m)" + ERR +
-                "(fn g :(res :i64 err) () (ret (ok 1)))"
-                "(fn take :void ((r :(res :i64 err))) (match r ((ok v) (println v))"
+                "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                "(fn take :void ((r :(res :i64 eof-error))) (match r ((ok v) (println v))"
                 " ((err e) (println 0))))"
                 "(fn f :void () (let r (g)) (take r))")
 
     def test_a_result_parameter_must_be_handled(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn take :void ((r :(res :i64 err))) (println 1))")
+                        "(fn take :void ((r :(res :i64 eof-error))) (println 1))")
         self.assertEqual(error.code, "E0602")
         self.assertIn("'r'", error.message)
 
     def test_a_set_gives_the_binding_a_new_obligation(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (letmut r (g))"
                         " (match r ((ok v) (println v)) ((err e) (println 0)))"
                         " (set r (g)))")
@@ -370,14 +370,14 @@ class UnhandledResultTest(unittest.TestCase):
 
     def test_a_closure_that_captures_a_result_must_handle_it(self):
         checked("(mod m)" + ERR +
-                "(fn g :(res :i64 err) () (ret (ok 1)))"
+                "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                 "(fn f :i64 () (let r (g))"
                 " (let h (fn :i64 () (ret (match r ((ok v) v) ((err e) 0)))))"
                 " (ret (h)))")
 
     def test_a_result_copied_inside_a_closure_is_that_closure_s_obligation(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :i64 () (let r (g))"
                         " (let h (fn :i64 () (let x r) (ret 1))) (ret (h)))")
         self.assertEqual(error.code, "E0602")
@@ -388,49 +388,50 @@ class UnhandledResultTest(unittest.TestCase):
 
     def test_a_result_inside_a_block_ends_with_it(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (if true (let r (g)) (println 1)))")
         self.assertEqual(error.code, "E0602")
         self.assertEqual(error.path, "m/f/2/1")
 
     def test_a_result_stored_in_a_field_is_refused(self):
         error = fail_on("(mod m)" + ERR +
-                        "(type box (struct (r (res :i64 err))))")
+                        "(type box (struct (r (res :i64 eof-error))))")
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.message, "result fields are not supported yet")
 
     def test_a_result_stored_in_a_vector_is_refused(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn f :void () (let v (vec (res :i64 err))"
-                        " (make (vec (res :i64 err)))) (ret))")
+                        "(fn f :void () (let v (vec (res :i64 eof-error))"
+                        " (make (vec (res :i64 eof-error)))) (ret))")
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.message, "a result cannot be a vector element yet")
 
     def test_a_result_stored_in_an_optional_is_refused(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn f :void () (let o :(opt (res :i64 err)) (none)) (ret))")
+                        "(fn f :void () (let o :(opt (res :i64 eof-error)) (none)) (ret))")
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.message, "a result cannot be inside an optional yet")
 
     def test_a_result_in_an_enum_payload_is_refused(self):
         error = fail_on("(mod m)" + ERR +
-                        "(type t (enum (p (res :i64 err))))")
+                        "(type t (enum (p (res :i64 eof-error))))")
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.message, "result payloads are not supported yet")
 
     def test_a_result_carried_in_an_optional_value_is_e0602(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (let o (some (g))) (println 1))")
         self.assertEqual(error.code, "E0602")
         self.assertIn("cannot be carried in an optional", error.message)
 
     def test_a_result_stored_through_a_pointer_is_e0602(self):
         # Review finding 4: the pointee is a nameless slot, so the obligation
-        # cannot be discharged there.
+        # cannot be discharged there. The pointer arrives as a parameter: an
+        # uninitialised (res ...) block is refused by its own rule now.
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
-                        "(fn f :void () (let p (alloc (res :i64 err) 1))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                        "(fn f :void ((p (own (res :i64 eof-error))))"
                         " (set-deref (ptr p) (g)) (ret))")
         self.assertEqual(error.code, "E0602")
         self.assertEqual(
@@ -442,7 +443,7 @@ class UnhandledResultTest(unittest.TestCase):
         # Review finding 5: assignment replaces the first value, so its error
         # slot would be dropped silently.
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (letmut r (g)) (set r (g)))")
         self.assertEqual(error.code, "E0602")
         self.assertEqual(error.path, "m/f/3")
@@ -452,7 +453,7 @@ class UnhandledResultTest(unittest.TestCase):
 
     def test_a_set_after_the_old_result_is_handled_rearms_the_obligation(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (letmut r (g))"
                         " (match r ((ok v) (println v)) ((err e) (println 0)))"
                         " (set r (g)))")
@@ -471,7 +472,7 @@ class UnhandledResultTest(unittest.TestCase):
 
 
 class ExhaustiveMatchTest(unittest.TestCase):
-    SOURCE = ("(mod m)" + ERR + "(fn f :i64 ((e err))"
+    SOURCE = ("(mod m)" + ERR + "(fn f :i64 ((e eof-error))"
               " (ret (match e {arms})))")
 
     def test_a_match_over_every_variant_checks(self):
@@ -482,7 +483,7 @@ class ExhaustiveMatchTest(unittest.TestCase):
         self.assertEqual(error.code, "E0600")
         self.assertEqual(error.path, "m/f/2/0")
         self.assertEqual(
-            error.message, "this match on err does not handle 'eof'"
+            error.message, "this match on eof-error does not handle 'eof'"
         )
 
     def test_a_wildcard_covers_the_rest(self):
@@ -490,11 +491,11 @@ class ExhaustiveMatchTest(unittest.TestCase):
 
     def test_a_result_match_must_handle_err(self):
         error = fail_on("(mod m)" + ERR +
-                        "(fn g :(res :i64 err) () (ret (ok 1)))"
+                        "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :i64 () (ret (match (g) ((ok v) v))))")
         self.assertEqual(error.code, "E0600")
         self.assertEqual(
-            error.message, "this match on (res :i64 err) does not handle 'err'"
+            error.message, "this match on (res :i64 eof-error) does not handle 'err'"
         )
 
     def test_an_optional_match_must_handle_none(self):
@@ -510,7 +511,7 @@ class ExhaustiveMatchTest(unittest.TestCase):
     def test_an_unknown_variant_is_e0100(self):
         error = fail_on(self.SOURCE.format(arms="((nope n) n) (eof 0)"))
         self.assertEqual(error.code, "E0100")
-        self.assertEqual(error.message, "enum 'err' has no variant 'nope'")
+        self.assertEqual(error.message, "enum 'eof-error' has no variant 'nope'")
 
     def test_a_payload_variant_needs_a_binding(self):
         error = fail_on(self.SOURCE.format(arms="(bad 1) (eof 0)"))
@@ -784,9 +785,9 @@ class OwnerPlaceTest(unittest.TestCase):
 
     def test_a_result_of_an_owner_moves_the_owner(self):
         error = fail_on(
-            "(mod m)(type err (enum (eof)))(fn f :void ()"
+            "(mod m)(type eof-error (enum (eof)))(fn f :void ()"
             " (letmut p (alloc :i64 1))"
-            " (let r :(res (own :i64) err) (ok p))"
+            " (let r :(res (own :i64) eof-error) (ok p))"
             " (free p))"
         )
         self.assertEqual(error.code, "E0300")
@@ -794,8 +795,8 @@ class OwnerPlaceTest(unittest.TestCase):
 
     def test_a_try_of_an_owning_ok_payload_moves_the_result(self):
         error = fail_on(
-            "(mod m)(type err (enum (eof)))"
-            "(fn f :(res :i64 err) ((r :(res (opt (own :i64)) err)))"
+            "(mod m)(type eof-error (enum (eof)))"
+            "(fn f :(res :i64 eof-error) ((r :(res (opt (own :i64)) eof-error)))"
             " (let o (try r))"
             " (match r ((ok x) (ret (ok 1))) ((err e) (ret (err e)))))"
         )
@@ -843,7 +844,7 @@ class ResultLoweringTest(unittest.TestCase):
 
     def test_ok_sets_the_tag(self):
         module = lowered("(mod m)" + ERR +
-                         "(fn f :(res :i64 err) () (ret (ok 1)))")
+                         "(fn f :(res :i64 eof-error) () (ret (ok 1)))")
         kinds = [i[0] for i in ops(fn_named(module, "lg.m.f"))]
         self.assertIn("insertvalue", kinds)
         tags = [i[5] for i in ops(fn_named(module, "lg.m.f"))
@@ -852,7 +853,7 @@ class ResultLoweringTest(unittest.TestCase):
 
     def test_err_clears_the_tag(self):
         module = lowered("(mod m)" + ERR +
-                         "(fn f :(res :i64 err) () (ret (err eof)))")
+                         "(fn f :(res :i64 eof-error) () (ret (err eof)))")
         tags = [i[5] for i in ops(fn_named(module, "lg.m.f"))
                 if i[0] == "insertvalue" and i[6] == 0]
         self.assertIn("false", tags)
@@ -893,12 +894,12 @@ class ResultLoweringTest(unittest.TestCase):
 
     def test_try_returns_the_error_on_the_error_path(self):
         module = lowered("(mod m)" + ERR +
-                         "(fn g :(res :i64 err) () (ret (ok 1)))"
-                         "(fn f :(res :i64 err) () (let v (try (g))) (ret (ok v)))")
+                         "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
+                         "(fn f :(res :i64 eof-error) () (let v (try (g))) (ret (ok v)))")
         fn = fn_named(module, "lg.m.f")
         error_block = next(b for b in fn.blocks if b.label.startswith("try"))
         self.assertEqual(error_block.term[0], "ret")
-        self.assertEqual(error_block.term[1], Res(Prim("i64"), EnumRef("err")))
+        self.assertEqual(error_block.term[1], Res(Prim("i64"), EnumRef("eof-error")))
 
     def test_a_result_with_no_layout_is_e0002(self):
         error = None

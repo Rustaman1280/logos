@@ -72,6 +72,7 @@ CODES = {
     "E0300": "use after move",
     "E0301": "free of a non-owning pointer",
     "E0302": "move out of an immutable binding",
+    "E0303": "move of a binding declared outside a loop",
     "E0400": "index type mismatch",
     "E0401": "string not a str",
     "E0402": "vector value not copyable",
@@ -102,6 +103,10 @@ FIELD_TYPE_MISMATCH = "E0201"
 USE_AFTER_MOVE = "E0300"
 FREE_NON_OWN = "E0301"
 MOVE_IMMUTABLE = "E0302"
+#: A binding declared outside a loop body was moved or released inside it. The
+#: body is checked once, so iteration two would read a slot the first pass
+#: emptied: releasing there must happen after the loop instead.
+LOOP_MOVE = "E0303"
 INDEX_TYPE = "E0400"
 NOT_A_STR = "E0401"
 VEC_MOVE = "E0402"

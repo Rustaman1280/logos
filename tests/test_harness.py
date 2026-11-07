@@ -486,6 +486,48 @@ class ParityTest(unittest.TestCase):
         self.assertNotIn("-O0: stdout", detail)
 
 
+class ParityComparisonTest(unittest.TestCase):
+    """S10: the two levels are compared with each other, not just directive."""
+
+    def test_levels_that_disagree_fail_even_when_each_matches_its_directive(self):
+        # The directive only pins the exit status, so both runs satisfy it.
+        # They print different bytes, and that difference is the failure.
+        def fake(src, name, out, *, opt="-O2", debug=True):
+            script = Path(out)
+            script.parent.mkdir(parents=True, exist_ok=True)
+            printed = "a\\n" if opt == "-O0" else "b\\n"
+            script.write_text(f'#!/bin/sh\nprintf "{printed}"\nexit 0\n', encoding="utf-8")
+            script.chmod(0o755)
+            return str(script)
+
+        source = '(mod m)\n\n(test t\n  (expect (code 0))\n  (println "x"))\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "exec", "parity", source)
+            with patch("logos.tester.driver.run_test", side_effect=fake):
+                summary = run(Path(tmp), opts=["-O0", "-O2"])
+        self.assertEqual(summary.failed, 1)
+        detail = summary.failures[0][1]
+        self.assertIn("disagree", detail)
+        self.assertIn("stdout", detail)
+
+    def test_an_exit_status_difference_is_named(self):
+        problem = tester._disagreement("-O0", ("x\n", "", 0), "-O2", ("x\n", "", 3))
+        self.assertIsNotNone(problem)
+        self.assertIn("exit code 0 vs 3", problem)
+
+    def test_a_stderr_difference_is_named(self):
+        problem = tester._disagreement(
+            "-O0", ("x\n", "LEAK 1 bytes\n", 0), "-O2", ("x\n", "", 0)
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("stderr", problem)
+
+    def test_identical_runs_agree(self):
+        self.assertIsNone(
+            tester._disagreement("-O0", ("x\n", "", 0), "-O2", ("x\n", "", 0))
+        )
+
+
 class TimeoutTest(unittest.TestCase):
     def test_a_hang_is_a_failure_not_a_stalled_suite(self):
         with tempfile.TemporaryDirectory() as tmp:

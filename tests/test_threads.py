@@ -139,6 +139,52 @@ class ThreadTypeTest(unittest.TestCase):
         self.assertEqual(error.code, "E0700")
         self.assertIn("(shared ...)", error.message)
 
+    def test_a_thread_handle_is_shared_state_for_e0700(self):
+        # S4: join releases the handle, so two threads holding one address can
+        # join it twice. Handing a thread to spawn is a crossing like any
+        # other, and it must say (shared :thread) out loud.
+        error = fail_on(
+            "(mod m)(fn w :void ((t :thread)) (join t))"
+            "(fn noop :void () (ret))"
+            "(fn f :void () (let t (spawn noop)) (spawn w t))"
+        )
+        self.assertEqual(error.code, "E0700")
+        self.assertIn("(shared ...)", error.message)
+
+    def test_a_marked_thread_handle_is_spellable(self):
+        # The marker is what makes the crossing visible; there is no unwrap
+        # yet, so holding one is all a program can do with it.
+        checked(
+            "(mod m)(fn hold :void ((t (shared :thread))) (let kept t))"
+        )
+
+    def test_a_channel_of_an_empty_type_is_refused(self):
+        # S5: the runtime copies one byte per element while the caller passes
+        # a zero-byte slot, which is an out-of-bounds stack write.
+        error = fail_on(
+            "(mod m)(fn f :void () (letmut c (chan (arr :i64 0) 4)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a channel of an empty type is not supported"
+        )
+
+    def test_a_channel_of_an_empty_struct_is_refused(self):
+        error = fail_on(
+            "(mod m)(type nothing (struct))"
+            "(fn f :void () (letmut c (chan nothing 1)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a channel of an empty type is not supported"
+        )
+
+    def test_a_channel_of_a_non_empty_struct_is_still_allowed(self):
+        checked(
+            "(mod m)(type cell (struct (v :i64)))"
+            "(fn f :void () (letmut c (chan cell 1)))"
+        )
+
     def test_lock_and_unlock_need_a_shared_mutex(self):
         cm = checked(
             "(mod m)(fn f :void ((m (shared :mutex))) (lock m) (unlock m))"
@@ -343,16 +389,17 @@ class ThreadTypeTest(unittest.TestCase):
         self.assertEqual(error.code, "E0501")
 
     def test_a_test_local_helper_cannot_be_spawned(self):
-        # A helper is checked but has no lowered definition, so a thunk
-        # calling it could not link. The same E0103 a function value gets.
+        # A helper has no lowered definition, so a thunk calling it could not
+        # link. It is refused at its own node now, before the spawn is seen.
         error = fail_on(
             "(mod m)(test t (expect (code 0))"
             " (fn helper :void () (ret))"
             " (spawn helper))"
         )
-        self.assertEqual(error.code, "E0103")
-        self.assertIn("helper", error.message)
-        self.assertIn("test-local", error.message)
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "test-local helper functions are not lowered yet"
+        )
 
     def test_an_imported_function_cannot_be_spawned_and_says_why(self):
         # A different reason with the same answer: the definition exists, but

@@ -2,9 +2,12 @@ LEAKS 10
 OPTS -O0 -O2
 PASS parse/fixture/add-wraps -
 PASS parse/unknown-node -
+PASS type/alloc-fn -
+PASS type/alloc-result -
 PASS type/arity -
 PASS type/free-raw -
 PASS type/immutable-set -
+PASS type/loop-move -
 PASS type/move-immutable -
 PASS type/move -
 PASS type/non-exhaustive -
@@ -14,6 +17,7 @@ PASS type/unhandled-result -
 PASS type/unknown-fn -
 PASS type/unknown-name -
 PASS type/unknown-type -
+PASS type/vec-get-place -
 PASS type/widening -
 PASS exec/closures/capture-one -
 PASS exec/closures/capture-is-a-copy -
@@ -113,7 +117,7 @@ PASS exec/vec/struct-elements -
 PASS exec/vec/nested -
 PASS exec/vec/free-a-parameter -
 PASS exec/vec/name-argument-through-a-relay -
-PASS exec/vec/loop-move-panics-on-second-iteration -
+PASS exec/vec/loop-release-after-the-loop -
 PASS exec/vec/nested-buffer-is-stranded -
 PASS exec/vec/growth-leak-is-reported -
 PASS mem/leak/no-leak -

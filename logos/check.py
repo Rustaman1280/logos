@@ -44,7 +44,13 @@ and a field is not one, so such a field would leak by construction. Both are
 Memory and ownership
 --------------------
 ``(alloc T n)`` has type ``(own T)``: a block of n elements the program must
-release with ``(free p)``. ``(ptr p)`` gives the same address as a raw
+release with ``(free p)``. Only a type whose every bit pattern is already a
+value may be allocated, because the block is not initialised: a scalar, a
+``:bool``, a struct or enum of those, or an array of those. A ``(vec T)``, a
+``(res ...)``, an ``(opt ...)``, a ``(fn ...)``, a ``:str`` and any type that
+holds an owner are **E0002**, ``allocation of T is not supported: it has
+invariants``: reading one of those uninitialised is a branch on a garbage tag
+or a call through a garbage pointer. ``(ptr p)`` gives the same address as a raw
 ``(ptr T)``, which may be walked with ``(ptr-add p i)`` and read or written
 with ``(deref p)``/``(set-deref p v)``; only the owner may free, so a raw
 pointer is E0301 there.
@@ -56,6 +62,13 @@ free a compile error in the direct case. A move is only legal out of a
 ``letmut`` or a parameter (E0302): a plain ``let`` promised to hold the same
 value for its whole scope, while ``free`` destroys the value rather than
 transferring it and so is allowed on any owning binding.
+
+A loop body is checked once, so it may not empty a binding declared outside
+it: ``(free p)`` or any move of ``p`` inside ``while`` is **E0303**, ``a
+binding declared outside a loop cannot be released or moved inside it``.
+Iteration two would read what iteration one released. Only a binding declared
+inside the body may be released there; anything else is released after the
+loop. The same holds for ``(vec-free v)``.
 
 An owner lives only in a direct binding or a function parameter. It may not be
 stored in a struct field, a fixed-array element or an enum payload, and an
@@ -69,7 +82,11 @@ reason no expression may *read* one out of a place — ``(get b p)`` where the
 field is an owner, ``(arr-get a i)``, ``(vec-get v i)`` and ``(deref p)`` of an
 owning pointer are **E0402**, ``an owner cannot be read out of a place yet``:
 a read copies the pointer, which is the second owner the whole rule exists to
-prevent.
+prevent. The rule is not owner-specific: a ``(vec T)`` read out of a place
+copies its descriptor the same way, so ``(vec-get v i)``, ``(arr-get a i)``,
+``(get b f)`` and ``(deref p)`` are E0402 whenever the place's type is
+move-only, with ``a vector cannot be read out of a place yet`` naming the
+reason.
 
 A type that *contains* an owner by value — ``(opt (own T))``, ``(res (own T)
 E)`` — has no copy either, so binding
@@ -109,15 +126,18 @@ and the last item of a body is the arm's value. An integer match needs no
 ``_`` — its domain is not enumerable — while the other three are closed sets
 and must name every variant (E0600). ``break`` and ``continue`` are statements
 with no operand and are only legal inside a loop, which this pass tracks as a
-depth on the enclosing environment: a helper ``fn`` starts at zero, because it
-is not inside the loop that lexically contains it.
+depth on the enclosing environment: a closure starts at zero, because it is
+not inside the loop that lexically contains it.
 
 Concurrency
 -----------
 ``(spawn f args...)`` starts ``f`` on a thread and returns ``:thread``; ``f``
 is a module function returning ``:void`` and its arguments are copied into the
 new thread, so a value that owns memory is E0402. A raw pointer or a handle
-crosses only under ``(shared ...)``, which is E0700 when it is missing.
+crosses only under ``(shared ...)``, which is E0700 when it is missing. A
+``:thread`` handle is one of those handles: ``join`` releases it, so two
+threads holding one address could join it twice, and passing one to ``spawn``
+needs ``(shared :thread)`` to say so.
 ``(join t)`` waits and uses the handle up.
 
 ``(mutex)`` gives a ``(shared :mutex)``, which ``lock``/``unlock`` take;
@@ -145,7 +165,18 @@ and the functions of its direct imports therefore all have a type by the time a
 call is checked, which makes source order irrelevant: a function can call one
 defined later. Because imports are not merged into ``Module.fns``, walking
 ``Module.imports`` is what builds the visible namespace, and a caller sees the
-definitions of the modules it names, never the ones they name.
+definitions of the modules it names, never the ones they name. Only this
+module's definitions are lowered, so a call to an imported function is
+**E0103**, ``imported functions are not lowered yet: 'name'``, at the call:
+the callee's symbol lives in an object file the program is not built with.
+
+Reserved names
+--------------
+A ``fn`` or ``type`` name that a form already spells is **E0003**, ``reserved
+form name``. The form wins — ``(get ...)`` is always the field read — so a
+definition of that name could never be called. The list is the forms plus the
+``vec-``, ``str-``, ``arr-`` and ``atomic-`` families; ``allocator`` and
+``get-value`` are not the forms themselves and stay legal.
 
 What a binding is
 -----------------
@@ -170,16 +201,21 @@ fit its resolved type is E0106, never a silent truncation.
 
 Returning
 ---------
-A function whose declared return type is not ``:void`` must contain a ``ret``
-somewhere in its body; otherwise it is E0105. A test is ``:void`` by
+A function whose declared return type is not ``:void`` must end every path in
+a ``ret``; a path that falls off the end is E0105. Presence is not enough: an
+``if`` terminates only when both arms do, a ``match`` when every arm does, and
+a ``while`` whose condition is the literal ``true`` terminates unless its body
+can ``break`` out. ``main`` is held to the same rule when it returns ``:i64``:
+an exit status nobody wrote must not become 0. A test is ``:void`` by
 construction and needs none.
 
 Tests
 -----
 Test bodies are checked too, because they are ordinary grammar. ``expect`` and
 ``expect-leak`` are harness directives, not expressions, so their children are
-left alone; a helper ``fn`` inside a test is checked in that test's scope and
-is invisible outside it.
+left alone. A helper ``fn`` inside a test is **E0002**, ``test-local helper
+functions are not lowered yet``: no symbol is emitted for one, so a call could
+never link, and the refusal is at the node rather than at the call.
 
 Generics
 --------
@@ -276,6 +312,7 @@ from logos.diag import (
     INDEX_TYPE,
     INSTANTIATION_LIMIT,
     LITERAL_RANGE,
+    LOOP_MOVE,
     MISSING_RETURN,
     MOVE_IMMUTABLE,
     NON_EXHAUSTIVE,
@@ -750,6 +787,16 @@ _CLOSURE_ESCAPE = "a closure that captures cannot leave its function"
 #: it twice.
 _OWNER_PLACE = "an owner cannot be read out of a place yet"
 
+#: The same sentence for a value that holds a vector: a place read copies the
+#: descriptor, and two descriptors of one buffer free it twice.
+_VEC_PLACE = "a vector cannot be read out of a place yet"
+
+#: The sentence E0303 carries: the loop body is checked once, so a binding
+#: from outside it may not be emptied from inside.
+_LOOP_MOVE = (
+    "a binding declared outside a loop cannot be released or moved inside it"
+)
+
 #: The one sentence E0700 carries. State two threads can both reach is marked
 #: ``(shared T)`` where it is declared and where it is handed to a thread, so a
 #: reader sees it without tracing the calls.
@@ -989,7 +1036,9 @@ class _Var:
     ``origin_loop`` how many enclosed the value now stored. They differ only
     for a capturing closure: one made inside a loop and stored in a binding
     declared outside it would outlive its iteration, when the environment slot
-    is overwritten by the next pass (E0502).
+    is overwritten by the next pass (E0502). ``decl_loop`` is also what refuses
+    a move inside a loop of a binding declared outside it (E0303): the body is
+    checked once, so the second pass would read what the first released.
 
     ``handled`` is the obligation a ``(res T E)`` carries: the value was made,
     so somebody has to look at its error slot. ``match``, ``try``, ``ret`` and
@@ -1050,7 +1099,8 @@ class _Env:
         self.ret = ret
         self.label = label
         #: How many loops enclose the form being checked. ``break`` and
-        #: ``continue`` are legal only when it is non-zero.
+        #: ``continue`` are legal only when it is non-zero, and a move of a
+        #: binding whose ``decl_loop`` is smaller is E0303.
         self.loop = 0
         self.outer = outer
         self.tvars = dict(tvars or {})
@@ -1209,8 +1259,9 @@ DIRECTIVES = ("expect", "expect-leak")
 #: The two printers. They are the only names the language provides without a
 #: definition, and they are overloaded over every scalar the runtime knows how
 #: to format, so their rule lives in :meth:`_Checker._printer` rather than in a
-#: single signature. A module-level ``fn`` of one of these names shadows the
-#: builtin, because ``env.fns`` is consulted first.
+#: single signature. A definition of one of these names is refused (E0003,
+#: ``reserved form name``): the form wins the spelling, so the definition could
+#: never be called.
 PRINTERS = ("print", "println")
 
 #: What a printer accepts. Exactly the widths the runtime has a formatter for:
@@ -1221,9 +1272,29 @@ PRINTABLE = ("i64", "u64", "f64", "bool", "str")
 
 #: The forms that build and propagate a result or an optional: ``(ok v)``,
 #: ``(err e)``, ``(some v)``, ``(none)`` and ``(try e)``. Like the printers they
-#: live outside the function namespace, and a user definition of one of these
-#: names shadows the form.
+#: live outside the function namespace, and a definition of one of these names
+#: is refused as a reserved form name.
 RESULT_FORMS = ("ok", "err", "some", "none", "try")
+
+#: Every name a form already owns. The form wins: ``(fn if :i64 () ...)``
+#: defines a function no source can call, because ``(if ...)`` is always the
+#: form, so the definition is refused where it is written. The four starred
+#: entries are families, not single names.
+RESERVED_FORMS = frozenset(
+    """
+    if while match let letmut set ret make get set-field alloc free ptr deref
+    set-deref ptr-add print println spawn join lock unlock send recv ok err some
+    none try break continue cast and or not
+    """.split()
+)
+#: Form families: every name starting with one of these heads is a form.
+RESERVED_PREFIXES = ("vec-", "str-", "arr-", "atomic-")
+
+
+def reserved_name(name: str) -> bool:
+    """Whether ``name`` is spelled by a form, so a definition could not be called."""
+    return name in RESERVED_FORMS or name.startswith(RESERVED_PREFIXES)
+
 
 #: Built-in function names. A name is here once this module has a rule for it.
 BUILTINS = PRINTERS
@@ -1353,6 +1424,12 @@ class _Checker:
             own_types = {
                 name: _declared(name, node) for name, node in module.types.items()
             }
+            for name, node in module.types.items():
+                if reserved_name(name):
+                    # A type name lives in the same spelling space as the
+                    # forms: ``(type alloc ...)`` could never be written in a
+                    # type slot that the form does not claim first.
+                    raise diag(DUPLICATE, node.path, "reserved form name")
             types = dict(inherited)
             types.update(own_types)
             # Field types resolve against the complete namespace, so a struct
@@ -1414,6 +1491,11 @@ class _Checker:
         name = node.name
         if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
+        if reserved_name(name):
+            # ``(fn get ...)`` defines a name no call can reach: ``(get ...)``
+            # is always the form. Refused where it is written rather than left
+            # as a definition that silently does nothing.
+            raise diag(DUPLICATE, node.path, "reserved form name")
         ret, params, _ = fn_shape(node, types, structs=structs, enums=enums)
         sig = FnTy(tuple(ty for _, ty in params), ret)
         order = typevars(ret)
@@ -1481,44 +1563,17 @@ class _Checker:
             if item.kind in DIRECTIVES:
                 continue
             if item.kind == "fn":
-                self._check_helper(item, env)
-                continue
+                # A helper has no lowered definition: the backend builds only
+                # module functions, so a call to one would link against a
+                # symbol that was never emitted. Refused at the node instead of
+                # accepted here and failing during the build.
+                raise diag(
+                    UNKNOWN_NODE,
+                    item.path,
+                    "test-local helper functions are not lowered yet",
+                )
             self._statement(item, env)
         env.finish()
-
-    def _check_helper(self, node: Node, env: _Env) -> None:
-        """A ``fn`` private to one test: same rules, test-local visibility."""
-        name = node.name
-        if name is None or name.startswith(":"):
-            raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
-        if name in env.fns:
-            raise diag(DUPLICATE, node.path, f"duplicate definition '{name}'")
-        sig = self._signature(node, self._types, self._structs, self._enums)
-        env.fns[name] = sig
-        inner = _Env(
-            env.fns,
-            ret=sig.ret,
-            label=f"function '{name}'",
-            tvars=env.tvars,
-            structs=self._structs,
-            enums=self._enums,
-        )
-        for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
-            param_name, _ = _param_parts(param)
-            inner.define(
-                param_name,
-                sig.params[index],
-                mutable=False,
-                path=param.path,
-                param=True,
-            )
-        if name in self._params:
-            # A generic helper's body is checked per copy like any other, but a
-            # copy of a helper has nowhere to be emitted — helpers are not
-            # module functions — so a call to one is refused (E0103) rather
-            # than accepted and then refused by the backend.
-            return
-        self._body(node, _body_start(node), inner)
 
     def _body(self, node: Node, start: int, env: _Env) -> None:
         statements = node.items[start:]
@@ -1541,11 +1596,11 @@ class _Checker:
             if not isinstance(item, Node):
                 raise diag(UNKNOWN_NODE, path, "a statement must be a form")
             self._statement(item, env)
-        if env.ret != Prim("void") and not _contains_ret(statements):
+        if env.ret != Prim("void") and not _all_terminate(statements):
             raise diag(
                 MISSING_RETURN,
                 path,
-                f"{env.label} must return {env.ret} but has no 'ret'",
+                f"{env.label} must return {env.ret} but a path falls off the end",
             )
         env.finish()
 
@@ -2406,11 +2461,7 @@ class _Checker:
         name = _name(items[2], node.path, "get")
         for field, fty in self._fields(ty, node.path):
             if field == name:
-                if holds_owner(fty, self._structs, self._enums):
-                    # An owning field is E0002 at its declaration, so this is
-                    # the invariant stated at the read site: a place read has
-                    # no way to move an owner out, only to copy the pointer.
-                    raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
+                self._refuse_place_copy(fty, node.path)
                 return fty
         raise diag(UNKNOWN_FIELD, node.path, f"struct '{ty.name}' has no field '{name}'")
 
@@ -2488,10 +2539,9 @@ class _Checker:
                 _at(items[2], node),
                 f"array index must be an integer, found {index}",
             )
-        if holds_owner(ty.elem, self._structs, self._enums):
-            # An element of a fixed array is a place: the read would copy the
-            # owning pointer out of it, and both copies would free the block.
-            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
+        # An element of a fixed array is a place: reading one copies whatever
+        # the element bytes are, which is illegal for a value that owns memory.
+        self._refuse_place_copy(ty.elem, node.path)
         return ty.elem
 
     def _arr_set(self, node: Node, env: _Env) -> Ty:
@@ -2721,10 +2771,9 @@ class _Checker:
             raise diag(WRONG_ARITY, node.path, "'vec-get' takes a vector and an index")
         ty = self._vec_operand(items[1], env, node, "vec-get")
         self._index(items[2], env, node, "vector index")
-        if holds_owner(ty.elem, self._structs, self._enums):
-            # A vector element is a place: releasing the owner needs the
-            # element value, and the read would copy it rather than move it.
-            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
+        # An element is a place: the read would copy a descriptor or an owner,
+        # leaving the vector and the new binding naming one buffer.
+        self._refuse_place_copy(ty.elem, node.path)
         return ty.elem
 
     def _vec_set(self, node: Node, env: _Env) -> Ty:
@@ -2757,13 +2806,18 @@ class _Checker:
         releases nothing — ``rt_free`` treats NULL as free(NULL) — and a
         subsequent length reads zero instead of a stale count.
         """
-        self._vec_target(
+        var, _ = self._vec_target(
             node,
             env,
             arity=2,
             shape="vec-free takes a vector name",
             verb="free",
         )
+        if var.decl_loop < env.loop:
+            # Releasing from inside the body leaves the next iteration's
+            # ``vec-free`` on an emptied descriptor and any other use of the
+            # name reading nothing; the release belongs after the loop.
+            raise diag(LOOP_MOVE, node.path, _LOOP_MOVE)
         return Prim("void")
 
     # -- memory ----------------------------------------------------------
@@ -2773,8 +2827,9 @@ class _Checker:
 
         The count is in elements, not bytes: the lowerer multiplies by the
         element's size, which is the one place that knows the layout. Nothing
-        is initialised, because a block the program has not written is not a
-        value the language has a spelling for.
+        is initialised, so only a type that is already a value at every bit
+        pattern may be allocated; anything with an invariant is refused here
+        rather than read as garbage later.
         """
         items = node.items
         if len(items) != 3:
@@ -2782,22 +2837,21 @@ class _Checker:
                 WRONG_ARITY, node.path, "alloc takes a type and an element count"
             )
         elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
-        if holds_owner(elem, self._structs, self._enums):
-            # ``(own X)`` is refused when X holds an owner, so an allocation
-            # whose element does would make a binding of a type the language
-            # cannot spell — an outer owner holding the inner one reachable
-            # only through a read that is itself refused. The container types
-            # are allowed to spell an owner as an element (``(opt (own T))``),
-            # which is why the check has to be here as well as in
-            # ``resolve_type``: ``(alloc (opt (own T)) n)`` is the spelling
-            # that reaches this method with an owner-holding element.
+        if _is_void(elem):
+            raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
+        if not _invariant_free(elem, self._structs, self._enums):
+            # ``alloc`` hands out an uninitialised block. That is a value only
+            # for a type whose every bit pattern is one: a scalar, a bool, an
+            # aggregate of those. A vector descriptor, a result or optional tag,
+            # a function value or a :str would be read as a live value while
+            # still holding whatever the allocator left there — a branch on a
+            # garbage tag, a call through a garbage pointer, a length that
+            # walks off the buffer.
             raise diag(
                 UNKNOWN_NODE,
                 node.path,
-                "allocation of owners is not supported yet",
+                f"allocation of {elem} is not supported: it has invariants",
             )
-        if _is_void(elem):
-            raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
         count = self._value(items[2], env, None, node.path)
         if not _integer(count):
             raise diag(
@@ -2867,12 +2921,10 @@ class _Checker:
                 _at(items[1], node),
                 f"deref needs a pointer, found {ty}",
             )
-        if holds_owner(elem, self._structs, self._enums):
-            # ``(deref p)`` is a place. When the pointee is itself an owner —
-            # ``(ptr (own T))`` names one, while ``(alloc (own T) n)`` is
-            # refused — the read would hand out a second owner of the inner
-            # block.
-            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
+        # ``(deref p)`` is a place. A pointee that owns memory — an owner
+        # behind ``(ptr (own T))``, or a vector descriptor stored in memory —
+        # would be copied out, and two copies free the same block.
+        self._refuse_place_copy(elem, node.path)
         return elem
 
     def _set_deref(self, node: Node, env: _Env) -> Ty:
@@ -3118,6 +3170,15 @@ class _Checker:
         # element that is, or holds at any depth, shared state with no
         # `(shared ...)` marker must say so at the element type.
         _channel_element(elem, node.path)
+        if _zero_sized(elem, self._structs):
+            # The ring copies one element per slot and the caller passes a
+            # zero-byte stack slot; the runtime writes at least one byte into
+            # it, which is an out-of-bounds stack access.
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                "a channel of an empty type is not supported",
+            )
         if _unmarked_share(elem, self._structs, self._enums):
             raise diag(SHARED_MARKER, _at(items[1], node), _SHARED_MARKER)
         capacity = self._value(items[2], env, None, node.path)
@@ -3279,6 +3340,22 @@ class _Checker:
                     return max(self._origin_loop(arm, env, ty) for arm in arms)
         return env.loop
 
+    def _refuse_place_copy(self, ty: Ty, path: str) -> None:
+        """Refuse a read that would copy a move-only value out of a place.
+
+        ``get``, ``arr-get``, ``vec-get`` and ``deref`` all name storage that
+        belongs to somebody else: the field of a struct, the element of an
+        array or vector, the block behind a pointer. Copying an ``(own T)`` or
+        a value that holds one gives two owners of one block; copying a
+        ``(vec T)`` descriptor gives two descriptors of one buffer. Either way
+        the block is released twice, so the read is E0402 and the value has to
+        arrive through a binding that can be moved instead.
+        """
+        if isinstance(ty, Own) or holds_owner(ty, self._structs, self._enums):
+            raise diag(VEC_MOVE, path, _OWNER_PLACE)
+        if holds_vector(ty, self._structs):
+            raise diag(VEC_MOVE, path, _VEC_PLACE)
+
     def _move_only(self, ty: Ty) -> bool:
         """Whether a value of ``ty`` has no copy at all.
 
@@ -3321,6 +3398,17 @@ class _Checker:
             return
         if not self._move_only(var.ty):
             return
+        if var.decl_loop < env.loop:
+            # The loop body is checked once. A binding from outside it still
+            # holds its value on iteration two only if nothing moved it during
+            # iteration one, and the value here is one that cannot be copied
+            # back: releasing or transferring it inside the body leaves every
+            # later pass reading emptied memory. Release after the loop.
+            raise diag(
+                LOOP_MOVE,
+                where,
+                _LOOP_MOVE,
+            )
         if not isinstance(var.ty, Own):
             # Structural ownership travels with the value, so the move needs no
             # ``letmut``: the binding is not being reused, it is being emptied.
@@ -3610,8 +3698,8 @@ class _Checker:
 
         A name that is neither is one of the compiler's own forms — the
         printers, ``ok``/``err``/``some``/``none``/``try`` — or an enum
-        variant, which is a constructor. A user definition of one of those
-        names shadows the form, exactly as ``print`` already does.
+        variant, which is a constructor. No definition can take a form's name
+        (E0003), so this branch is the only meaning such a name has.
         """
         name = node.kind
         var = env.lookup(name, node.path)
@@ -3631,6 +3719,15 @@ class _Checker:
             if constructed is not None:
                 return constructed
             raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
+        if name not in self._bodies:
+            # The signature is visible because the module imports it, but only
+            # this module's own definitions are lowered: the callee's symbol
+            # lives in another object file the program is not built with.
+            raise diag(
+                UNKNOWN_FUNCTION,
+                node.path,
+                f"imported functions are not lowered yet: '{name}'",
+            )
         if name in self._params:
             return self._generic_call(node, env, name, found)
         return self._arguments(node, env, name, found)
@@ -4401,13 +4498,62 @@ def _scalar(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name in _SCALARS
 
 
-def _contains_ret(items: tuple[Node | Token, ...] | list[Node | Token]) -> bool:
-    """Whether any statement in ``items`` is or contains a ``ret``."""
+def _all_terminate(items: tuple[Node | Token, ...] | list[Node | Token]) -> bool:
+    """Whether control never falls off the end of a statement block.
+
+    A block terminates when any of its statements terminates: everything after
+    a ``ret`` is unreachable, so the earlier statements cannot carry control
+    past it. This is what makes ``(if c (ret 1) (ret 2))`` a whole function
+    body while ``(if c (ret 1) (println "x"))`` is not.
+    """
+    return any(_terminates(item) for item in items)
+
+
+def _terminates(item: Node | Token) -> bool:
+    """Whether ``item`` is a path that cannot reach the end of its block.
+
+    ``ret`` ends the function. ``if`` ends it when both arms do, and ``match``
+    when every arm does, because whichever arm runs has to leave. ``while``
+    with a literal ``true`` condition never finishes, so nothing after it runs
+    — unless the body can ``break`` out, in which case the fall-through is
+    reachable again. Anything else may fall through.
+    """
+    if not isinstance(item, Node):
+        return False
+    if item.kind == "ret":
+        return True
+    if item.kind == "if" and len(item.items) == 4:
+        return _terminates(item.items[2]) and _terminates(item.items[3])
+    if item.kind == "match":
+        arms = [arm for arm in item.items[2:] if isinstance(arm, Node) and arm.items]
+        return bool(arms) and all(_terminates(arm.items[-1]) for arm in arms)
+    if (
+        item.kind == "while"
+        and len(item.items) >= 2
+        and isinstance(item.items[1], Token)
+        and item.items[1].kind == ATOM
+        and item.items[1].value == "true"
+    ):
+        return not _breaks_out(item.items[2:])
+    return False
+
+
+def _breaks_out(items: tuple[Node | Token, ...] | list[Node | Token]) -> bool:
+    """Whether a ``break`` in ``items`` targets the loop that contains them.
+
+    A nested ``while`` owns its own breaks, so it is not descended into; every
+    other form is, because ``(if c (break))`` leaves the loop just as surely as
+    a bare ``break``.
+    """
     for item in items:
-        if isinstance(item, Node):
-            for node in item.walk():
-                if node.kind == "ret":
-                    return True
+        if not isinstance(item, Node):
+            continue
+        if item.kind == "break":
+            return True
+        if item.kind == "while":
+            continue
+        if _breaks_out(item.items):
+            return True
     return False
 
 
@@ -4448,14 +4594,14 @@ def _shareable(ty: Ty) -> bool:
         return True
     if isinstance(ty, (Chan, Atomic)):
         return True
-    return isinstance(ty, Prim) and ty.name == "mutex"
+    return isinstance(ty, Prim) and ty.name in ("mutex", "thread")
 
 
 def _shared_state(ty: Ty) -> bool:
     """Whether ``ty`` is a handle that only the ``(shared ...)`` marker allows."""
     if isinstance(ty, (Chan, Atomic)):
         return True
-    return isinstance(ty, Prim) and ty.name == "mutex"
+    return isinstance(ty, Prim) and ty.name in ("mutex", "thread")
 
 
 def _unmarked_share(
@@ -4489,7 +4635,7 @@ def _unmarked_share(
     if isinstance(ty, (Ptr, Chan, Atomic)):
         return True
     if isinstance(ty, Prim):
-        return ty.name == "mutex"
+        return ty.name in ("mutex", "thread")
     if isinstance(ty, (Arr, Vec, Opt)):
         return _unmarked_share(ty.elem, structs, enums, seen)
     if isinstance(ty, Res):
@@ -4541,6 +4687,70 @@ def _channel_element(elem: Ty, path: str) -> Ty:
     if _escapes(elem):
         raise diag(CLOSURE_ESCAPE, path, _CLOSURE_ESCAPE)
     return elem
+
+
+def _invariant_free(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether every bit pattern of ``ty`` is already a value of ``ty``.
+
+    Only such a type may be allocated uninitialised. A scalar takes any bits;
+    a struct or enum takes any bits when every field or payload does; an array
+    when its element does. Everything else has an invariant a reader would
+    rely on — a vector's descriptor, a result's tag, a function value's code
+    pointer, a ``:str``'s length, an owner that must be released — so an
+    uninitialised block of it is not a value, and ``alloc`` refuses it.
+    """
+    if isinstance(ty, Prim):
+        return ty.name in NUMBERS or ty.name == "bool"
+    if isinstance(ty, Arr):
+        return _invariant_free(ty.elem, structs, enums, seen)
+    if isinstance(ty, StructRef):
+        if structs is None or ty.name in seen:
+            return False
+        inner = seen | {ty.name}
+        return all(
+            _invariant_free(field, structs, enums, inner)
+            for _name, field in structs.get(ty.name, ())
+        )
+    if isinstance(ty, EnumRef):
+        if enums is None or ty.name in seen:
+            return False
+        inner = seen | {ty.name}
+        return all(
+            payload is None or _invariant_free(payload, structs, enums, inner)
+            for _variant, payload in enums.get(ty.name, ())
+        )
+    return False
+
+
+def _zero_sized(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether one value of ``ty`` occupies no bytes at all.
+
+    A channel ring copies one element per slot and the runtime copies at least
+    one byte, so a zero-sized element would make the caller's slot a zero-byte
+    stack object the runtime writes past. Only a fixed array of count zero and
+    a struct with no non-empty field reach zero: every other type carries at
+    least its tag, descriptor or pointer.
+    """
+    if isinstance(ty, Arr):
+        return ty.n == 0 or _zero_sized(ty.elem, structs, seen)
+    if isinstance(ty, StructRef):
+        if structs is None or ty.name in seen:
+            return False
+        inner = seen | {ty.name}
+        fields = structs.get(ty.name, ())
+        return not fields or all(
+            _zero_sized(field, structs, inner) for _name, field in fields
+        )
+    return False
 
 
 def _stored_result(ty: Ty) -> bool:

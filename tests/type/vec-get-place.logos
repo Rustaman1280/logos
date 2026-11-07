@@ -1,0 +1,10 @@
+(mod vec-get-place)
+
+(fn f :void ()
+  (letmut outer
+    (vec (vec :i64))
+    (make (vec (vec :i64))))
+  (vec-push outer (make (vec :i64)))
+  (letmut w (vec-get outer 0))
+  (vec-free w)
+  (vec-free outer))

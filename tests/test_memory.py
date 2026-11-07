@@ -119,22 +119,54 @@ class AllocCheckTest(unittest.TestCase):
         self.assertEqual(error.message, "cannot allocate :void")
 
     def test_alloc_of_a_type_containing_an_owner_is_refused(self):
-        # ``_alloc`` builds ``Own(elem)`` directly, so an element the type
-        # system cannot spell as an owner reached a binding anyway:
-        # ``(alloc (opt (own :i64)) 1)`` checked and made an unspellable
-        # nested-owner type, bypassing the inner-owner refusal. Only a
-        # container could sneak the owner in; ``(own T)`` itself is refused at
-        # the alloc because its element is an owner too.
-        for spelling in ("(own :i64)", "(opt (own :i64))", "(res (own :i64) err)"):
+        # An uninitialised block is only a value for a type whose every bit
+        # pattern already is one. An owner is not: the block it would name has
+        # to be released, and a garbage pointer cannot be. The whole family is
+        # refused at the alloc with one sentence.
+        for spelling in ("(own :i64)", "(opt (own :i64))", "(res (own :i64) eof-error)"):
             with self.subTest(spelling=spelling):
                 error = fail_on(
-                    "(mod m)(type err (enum (eof)))"
+                    "(mod m)(type eof-error (enum (eof)))"
                     f"(fn f :void () (let p (alloc {spelling} 1)))"
                 )
                 self.assertEqual(error.code, "E0002")
                 self.assertEqual(
-                    error.message, "allocation of owners is not supported yet"
+                    error.message,
+                    f"allocation of {spelling} is not supported: it has invariants",
                 )
+
+    def test_alloc_of_a_str_or_vector_is_refused(self):
+        # A :str is a pointer and a length; a vector is a descriptor. Both are
+        # read as live values when they hold allocator garbage.
+        for spelling, shown in (
+            (":str", ":str"),
+            ("(vec :i64)", "(vec :i64)"),
+        ):
+            with self.subTest(spelling=spelling):
+                error = fail_on(
+                    f"(mod m)(fn f :void () (let p (alloc {spelling} 2)))"
+                )
+                self.assertEqual(error.code, "E0002")
+                self.assertEqual(
+                    error.message,
+                    f"allocation of {shown} is not supported: it has invariants",
+                )
+
+    def test_alloc_of_a_struct_of_scalars_is_allowed(self):
+        # Everything a struct of scalars can hold is already a value, so the
+        # uninitialised block is readable-as-garbage but not type-unsafe.
+        checked(
+            "(mod m)(type pair (struct (a :i64) (b :bool)))"
+            "(fn f :void () (let p (alloc pair 2)) (free p))"
+        )
+
+    def test_alloc_of_a_struct_carrying_a_str_is_refused(self):
+        error = fail_on(
+            "(mod m)(type record (struct (tag :i32) (name :str)))"
+            "(fn f :void () (let p (alloc record 1)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertIn("allocation of record is not supported", error.message)
 
     def test_alloc_takes_a_type_and_a_count(self):
         error = fail_on("(mod m)(fn f :void () (let p (alloc :i64)))")
@@ -312,13 +344,40 @@ class MoveCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.path, "m/f/4")
 
-    def test_a_move_in_a_while_body_is_a_move_after_the_loop(self):
+    def test_a_move_in_a_while_body_is_refused_at_the_move(self):
+        # S1: the loop body is checked once, so a binding declared outside it
+        # cannot be emptied inside it — iteration two would read freed memory.
         error = fail_on(
             "(mod m)(fn f :void () (letmut p (alloc :i64 2))"
             " (while true (free p)) (free p))"
         )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.path, "m/f/4")
+        self.assertEqual(error.code, "E0303")
+        self.assertEqual(error.path, "m/f/3/1")
+        self.assertEqual(
+            error.message,
+            "a binding declared outside a loop cannot be released or moved inside it",
+        )
+
+    def test_releasing_after_the_loop_is_the_way_out(self):
+        checked(
+            "(mod m)(fn f :void () (letmut p (alloc :i64 2))"
+            " (while true (break)) (free p))"
+        )
+
+    def test_a_binding_declared_inside_the_loop_may_be_released_there(self):
+        checked(
+            "(mod m)(fn f :void () (letmut i :i64 0)"
+            " (while (< i 2) (let q (alloc :i64 2)) (free q)"
+            " (set i (+ i 1))))"
+        )
+
+    def test_a_vector_cannot_be_released_inside_a_loop_it_was_declared_before(self):
+        error = fail_on(
+            "(mod m)(fn f :void () (letmut v (make (vec :i64)))"
+            " (letmut i :i64 0) (while (< i 2) (vec-free v) (set i (+ i 1))))"
+        )
+        self.assertEqual(error.code, "E0303")
+        self.assertIn("declared outside a loop", error.message)
 
     def test_a_parameter_may_be_returned(self):
         cm = checked(
@@ -417,13 +476,21 @@ class MemoryLoweringTest(unittest.TestCase):
         self.assertEqual(lower.sizeof_of(StructRef("record"), structs), 24)
         self.assertEqual(lower.align_of(StructRef("record"), structs), 8)
 
-    def test_an_alloc_of_a_str_struct_asks_for_its_true_layout(self):
+    def test_an_alloc_of_a_struct_asks_for_its_true_layout(self):
+        # { i32, i32, i64, i64 } is twenty-four bytes, eight-aligned: the
+        # allocator is asked for count * layout size, not for a guess.
         text = emitted(
-            "(mod m)(type record (struct (tag :i32) (name :str)))"
+            "(mod m)(type record (struct (tag :i32) (pad :i32) (lo :i64) (hi :i64)))"
             "(fn f :void () (let p (alloc record 2)))"
         )
         self.assertIn("mul i64 2, 24", text)
         self.assertIn(", i64 8, i8* %t", text)
+
+    def test_an_infinite_loop_closes_its_exit_block(self):
+        # S9 accepts a constant-true loop as a terminating path; the lowerer
+        # has to agree, or a checked program would fail in the backend.
+        text = emitted('(mod m)(fn spin :i64 () (while true (println "x")))')
+        self.assertIn("unreachable", text)
 
     def test_deref_is_a_typed_load(self):
         text = emitted(
@@ -579,9 +646,9 @@ class MemoryExecTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertIn(expected, done.stderr)
 
-    def test_a_str_struct_leak_reports_its_true_size(self):
-        # (struct (tag :i32) (name :str)) is { i32, %str }: 4 + 4 pad + 16,
-        # so twenty-four bytes. Sixteen-aligned str rounded it up to 32.
+    def test_a_struct_leak_reports_its_true_size(self):
+        # record is { i32, i64, i64 }: 4 + 4 pad + 8 + 8, so twenty-four
+        # bytes. The record keeps the requested size, not a rounded one.
         case = "struct-leak"
         style = checked(LEAK.read_text(encoding="utf-8"))
         expected = f"LEAK 24 bytes at {path_in(style, case, 'alloc')}\n"

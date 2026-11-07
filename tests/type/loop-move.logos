@@ -1,0 +1,11 @@
+(mod loop-move)
+
+(fn f :i64 ()
+  (let p (alloc :i64 2))
+  (set-deref p 42)
+  (letmut i :i64 0)
+  (while (< i 3)
+    (println (deref p))
+    (free p)
+    (set i (+ i 1)))
+  (ret 0))
