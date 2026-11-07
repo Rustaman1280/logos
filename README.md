@@ -61,8 +61,15 @@ Everything else reports a diagnostic at the construct.
 python3 -m logos version                      # logos 0.1.0
 python3 -m logos build examples/hello.logos   # build/hello, and build/hello.ll
 ./build/hello                                 # hello
-python3 -m logos test FILE                    # not implemented yet
+python3 -m logos test                         # run the directive-driven corpus
+python3 -m logos test --only exec --opt -O0   # one category, one optimisation level
 ```
+
+`logosc test` reads the `(expect ...)` directive in each `(test ...)` node and
+the module-level `(expect-error E0xxx)` of a negative case, runs every case at
+`-O0` and `-O2`, and writes one line per case to `tests/summary.txt` with
+`--update-baseline`. A case that passed in the baseline and fails now is a
+regression and exits 1.
 
 The IR is always kept beside the binary under `build/`: it is the artefact to
 read when a compiled program misbehaves.

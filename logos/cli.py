@@ -1,9 +1,9 @@
 """Command line entry point for the Logos toolchain.
 
-The compiler is built incrementally. ``build`` compiles a file to a native
-binary; every other subcommand except ``version`` and ``fmt`` parses its
-arguments and reports that it is not implemented yet, so the command surface
-is fixed before the passes behind it exist.
+``build`` compiles a file to a native binary, ``test`` runs the directive-driven
+corpus, and ``fmt`` rewrites source in canonical form. ``show`` and ``patch``
+still parse their arguments and report that they are not implemented yet, so the
+command surface is fixed before the passes behind them exist.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-from logos import __version__, driver
+from logos import __version__, driver, tester
 from logos.diag import LogosError
 from logos.fmt import render
 from logos.parser import parse
@@ -89,6 +89,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         help="optimisation level to run; repeat for several, e.g. --opt -O0 -O2",
     )
+    test.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="write the run's results to the suite's summary.txt baseline",
+    )
 
     fmt = sub.add_parser("fmt", help="rewrite Logos source in canonical form")
     fmt.add_argument(
@@ -132,8 +137,65 @@ def main(argv: list[str]) -> int:
     if args.command == "build":
         return _build(args.file, args.out, args.opt)
 
+    if args.command == "test":
+        return _test(args.path, args.only, args.opt, args.update_baseline)
+
     print(f"{args.command}: not implemented")
     return 0
+
+
+def _test(
+    path: str, only: str | None, opts: list[str] | None, update_baseline: bool
+) -> int:
+    """Run the corpus, print one line per case, and enforce the baseline.
+
+    The exit status is 1 when any case fails, when the baseline records a
+    regression, or when there was nothing to run. A usage error (an unknown
+    category, or a baseline asked for a single file) is 2, as elsewhere in the
+    command line.
+    """
+    try:
+        summary = tester.run_suite(path, only, opts)
+    except ValueError as error:
+        print(f"logos: test: {error}", file=sys.stderr)
+        return 2
+    except tester.SuiteError as error:
+        print(f"logos: test: {error}", file=sys.stderr)
+        return 1
+
+    if summary.total == 0:
+        print(f"test: no cases found in {path}")
+        return 1
+
+    for case in summary.cases:
+        print(f"{case.status} {case.id} {case.detail}")
+    print(f"{summary.passed} passed, {summary.failed} failed, {summary.leaks} leaked")
+
+    baseline = tester.baseline_path(path)
+    if update_baseline:
+        if baseline is None:
+            print("logos: test: --update-baseline needs a directory", file=sys.stderr)
+            return 2
+        tester.write_baseline(summary, baseline)
+        print(f"baseline {_display(baseline)}: {summary.total} cases")
+        return 1 if summary.failed else 0
+
+    regressions = tester.compare_baseline(summary, baseline) if baseline else []
+    if baseline is not None and baseline.is_file():
+        for case, detail in regressions:
+            print(f"BASELINE {case} {detail}")
+        print(f"baseline {_display(baseline)}: {len(regressions)} regression(s)")
+    else:
+        print("baseline: none")
+    return 1 if summary.failed or regressions else 0
+
+
+def _display(path: Path) -> str:
+    """A path as it reads from the working directory, or in full."""
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 def _build(source: str, out: str | None, opt: str) -> int:

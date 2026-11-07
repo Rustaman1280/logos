@@ -47,9 +47,9 @@ class CliFlagParsingTest(unittest.TestCase):
         """A value starting with ``-`` must parse as the value of ``--opt``."""
         out = io.StringIO()
         with redirect_stdout(out):
-            code = main(["test", "tests/exec/strings.logos", "--opt", "-O0", "-O2"])
+            code = main(["test", "tests/exec/hello.logos", "--opt", "-O0"])
         self.assertEqual(code, 0)
-        self.assertIn("test: not implemented", out.getvalue())
+        self.assertIn("PASS exec/hello/hello", out.getvalue())
 
     def test_build_defaults_to_the_drivers_optimisation_level(self):
         """The CLI default and ``driver.build``'s default are the same -O2."""
