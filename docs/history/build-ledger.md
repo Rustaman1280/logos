@@ -268,3 +268,10 @@ Rulings:
 - Controller verification of wave C: E0303 fires for a move in a while condition and for a release in the body (probed directly); `(< 1.5 2.0)` prints lt; harness 184/0/10 leaks/0 regressions; accept.sh 7/7.
 - README status rewritten to describe the finished v1, its deliberate refusals and its known limits (commit e5f5be6).
 - Branch state: 68 commits on `build` off `e59a8db`. Not merged, not pushed.
+
+## Contribution machinery (2026-11-07)
+- Goal from Stefano: any AI that finds the repo can take part by opening a PR, and that behaviour must be enforced.
+- Hard truth recorded: the repository is private, so nobody finds it; GitHub also requires an account, so an agent acts through its operator's credentials. Enforcement therefore means a public-or-shared repo plus gates that block a bad merge, not a README request.
+- Ruling: the gate list lives in ONE place (tools/gate-list) and AGENTS.md, tools/pr_gate.sh and the workflow all read it, so the three cannot drift.
+- Ruling: branch protection requires the `gate` check and one review, with no direct pushes to main, because a rule that admins bypass is not a rule.
+- Deferred to Stefano: public vs private, and the licence (without one, outside contributions are legally unclear).
