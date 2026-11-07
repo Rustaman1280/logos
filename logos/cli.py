@@ -10,11 +10,12 @@ replaced subtree comes back in the same canonical bytes ``fmt`` would write.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
 
-from logos import __version__, driver, tester
+from logos import __version__, driver, guide, tester
 from logos.diag import LogosError
 from logos.fmt import render, render_token
 from logos.lexer import LPAREN, RPAREN, Token, tokenize
@@ -124,6 +125,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", help="print the compiler version")
 
+    manual = sub.add_parser(
+        "guide", help="print the generated Logos manual or its manifest"
+    )
+    mode = manual.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--json",
+        action="store_true",
+        help="print the machine-readable manifest instead of the markdown",
+    )
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="verify docs/LOGOS.md is the current generated manual",
+    )
+
     return parser
 
 
@@ -139,6 +155,9 @@ def main(argv: list[str]) -> int:
     if args.command == "version":
         print(f"logos {__version__}")
         return 0
+
+    if args.command == "guide":
+        return _guide(args.json, args.check)
 
     if args.command == "fmt":
         return _fmt(args.files)
@@ -259,6 +278,29 @@ def _display(path: Path) -> str:
         return str(path.relative_to(Path.cwd()))
     except ValueError:
         return str(path)
+
+
+def _guide(as_json: bool, check: bool) -> int:
+    """Print the generated manual or manifest, or verify the committed copy.
+
+    ``--check`` is the drift gate: it regenerates the markdown in memory and
+    compares it with ``docs/LOGOS.md``, printing a short diff and returning 1
+    when the committed file is stale. Success prints one line, so a green
+    pipeline is quiet about a 30,000-line manual.
+    """
+    if check:
+        problems = guide.check_current()
+        if problems:
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            return 1
+        print("guide: docs/LOGOS.md is current")
+        return 0
+    if as_json:
+        print(json.dumps(guide.build_manifest(), indent=2))
+        return 0
+    sys.stdout.write(guide.build_markdown())
+    return 0
 
 
 def _build(source: str, out: str | None, opt: str) -> int:
