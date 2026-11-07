@@ -46,8 +46,10 @@ FILE = "file"
 #: Forms whose second item names a definition. ``use`` is not one of them: its
 #: argument is a module, not a definition, so it is numbered positionally.
 #: ``struct`` and ``enum`` are bodies of a ``type`` definition, not definitions
-#: themselves: ``(type point (struct (x :i64) (y :i64)))``.
-NAMED_KINDS = ("mod", "fn", "test", "type")
+#: themselves: ``(type point (struct (x :i64) (y :i64)))``. ``extern`` spells
+#: its definition as ``(extern fn name :ret (...))``, so its name is the third
+#: item, not the second; :meth:`Node.name` reads that one spelling.
+NAMED_KINDS = ("mod", "fn", "test", "type", "extern")
 
 
 @dataclass(slots=True)
@@ -67,7 +69,24 @@ class Node:
         A type marker is not a name: ``(fn :i64 ((x :i64)) ...)`` is a closure
         expression, whose second item is its return type, so it has no name and
         its children are numbered positionally from that return type.
+
+        ``extern`` writes the ``fn`` marker between the head and the name, so
+        its name is the third item. A form that does not have that shape has no
+        name here; the resolver reports the malformed spelling.
         """
+        if self.kind == "extern":
+            if len(self.items) > 2:
+                marker, head = self.items[1], self.items[2]
+                if (
+                    isinstance(marker, Token)
+                    and marker.kind == ATOM
+                    and marker.value == "fn"
+                    and isinstance(head, Token)
+                    and head.kind == ATOM
+                    and not head.value.startswith(":")
+                ):
+                    return head.value
+            return None
         if self.kind in NAMED_KINDS and len(self.items) > 1:
             head = self.items[1]
             if (
@@ -165,6 +184,11 @@ def _children(node: Node) -> tuple[Union[Node, Token], ...]:
     """The children ``_assign`` numbers: everything after the head and name."""
     if node.kind == "":
         return node.items
+    if node.kind == "extern":
+        # ``(extern fn name ...)``: the marker and the name are part of the
+        # definition, so the return type is child 0 exactly as it is for a
+        # ``fn`` — ``m/getpid/0`` is the return type, ``/1`` the parameters.
+        return node.items[3:] if node.name is not None else node.items[1:]
     if node.name is not None:
         return node.items[2:]
     return node.items[1:]

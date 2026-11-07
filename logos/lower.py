@@ -808,6 +808,11 @@ class _Lower:
             for name in cm.module.fns
             if name not in cm.generic
         }
+        #: Every visible C declaration, by name. A call to one is emitted as a
+        #: ``declare`` of the bare name: no mangle, no ``define``, and the
+        #: linker finds the symbol in libc. Kept apart from ``symbols`` because
+        #: an extern has no body to lower and its name must not be prefixed.
+        self.externs: dict[str, FnTy] = dict(cm.externs)
         #: The ``$lambda$<n>`` names closures have been given so far.
         self.lambdas = 0
         self.lambda_names: set[str] = set()
@@ -3357,6 +3362,9 @@ class _Fn:
             dest = "" if _is_void(instance.ret) else self.temp()
             self.emit(("call", dest, self.lowering.symbol(target), args))
             return dest
+        extern = self.lowering.externs.get(node.kind)
+        if extern is not None:
+            return self.extern_call(node, extern)
         symbol = self.lowering.symbols.get(node.kind)
         if symbol is None:
             raise diag(
@@ -3369,6 +3377,52 @@ class _Fn:
         args = tuple(self.value(arg, node.path) for arg in node.items[1:])
         dest = "" if _is_void(sig.ret) else self.temp()
         self.emit(("call", dest, symbol, args))
+        return dest
+
+    def extern_call(self, node: Node, sig: FnTy) -> str:
+        """One call to a C function the module declared with ``extern``.
+
+        The declaration is spelled from the extern's signature, not from the
+        call's values: a ``:str`` parameter becomes two parameters here, the
+        data pointer and the byte count in that order, because that is the pair
+        a C function such as ``write`` actually takes. A ``:str`` return stays
+        one aggregate, which is what a C function returning a two-word struct
+        returns — the split is a rule for arguments, where a C caller passes the
+        two words separately.
+
+        The name is the source name: no module prefix, no ``internal``, so the
+        linker resolves it wherever it lives (libc, for the functions this
+        declaration exists for). The declaration is emitted once per distinct
+        signature by :meth:`_Lower.declare`, so two call sites cost one line.
+        """
+        items = node.items
+        if len(items) - 1 != len(sig.params):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                f"'{node.kind}' takes {len(sig.params)} arguments",
+            )
+        params: list[Ty] = []
+        for ty in sig.params:
+            if isinstance(ty, Prim) and ty.name == "str":
+                params.extend((_PTR_U8, Prim("i64")))
+            else:
+                params.append(ty)
+        for ty in params:
+            self.lowering.use_type(ty, node.path)
+        if not _is_void(sig.ret):
+            self.lowering.use_type(sig.ret, node.path)
+        decl = IrDecl(node.kind, tuple(params), sig.ret)
+        self.lowering.declare(decl)
+        args: list[str] = []
+        for arg, ty in zip(items[1:], sig.params):
+            if isinstance(ty, Prim) and ty.name == "str":
+                pointer, length = self.str_parts(arg, node.path)
+                args.extend((pointer, length))
+            else:
+                args.append(self.value(arg, node.path))
+        dest = "" if _is_void(sig.ret) else self.temp()
+        self.emit(("call", dest, decl.name, tuple(args)))
         return dest
 
     # -- closures ---------------------------------------------------------

@@ -493,6 +493,10 @@ class CheckedModule:
     #: ``Types`` carries the same map for each monomorphised copy; see there
     #: for why the backend needs it.
     literal_types: dict["Token", Ty] = field(default_factory=dict)
+    #: Every C declaration the program can call, its own and its imports', by
+    #: name. The lowerer emits one ``declare`` per name it calls and hands the
+    #: bare name to the linker, which is where a libc symbol comes from.
+    externs: dict[str, FnTy] = field(default_factory=dict)
 
 
 def mangle_instance(name: str, args: tuple[Ty, ...], where: str = "") -> str:
@@ -1301,6 +1305,10 @@ class _Visible:
     ``own_*`` are this module's definitions; ``types``, ``fns``, ``structs`` and
     ``enums`` add the own definitions of each direct import, and nothing deeper,
     because an import is not transitive.
+
+    ``externs`` is the subset of ``fns`` that is a C declaration rather than a
+    body. It is carried separately because a call has to reach the backend's
+    ``declare`` path and must not be refused as an imported body.
     """
 
     own_types: dict[str, Ty]
@@ -1311,6 +1319,8 @@ class _Visible:
     fns: dict[str, FnTy]
     structs: dict[str, tuple[tuple[str, Ty], ...]]
     enums: dict[str, tuple[tuple[str, Ty | None], ...]]
+    own_externs: dict[str, FnTy] = field(default_factory=dict)
+    externs: dict[str, FnTy] = field(default_factory=dict)
 
 
 #: ``expect`` and ``expect-leak`` are harness directives, not expressions. The
@@ -1424,6 +1434,10 @@ class _Checker:
         #: definitions, because a copy's body is emitted from here; a generic
         #: reached through an import has no body this module can lower.
         self._bodies: dict[str, Node] = {}
+        #: Every visible name that is a C declaration rather than a body. A
+        #: call to one is not the "imported functions are not lowered yet"
+        #: refusal: a ``declare`` needs no body in this module at all.
+        self._externs: dict[str, FnTy] = {}
         #: The copy each (name, type arguments) pair made, in discovery order.
         self._instances: dict[str, Instance] = {}
         #: Copies discovered but not yet checked. A worklist rather than
@@ -1446,6 +1460,7 @@ class _Checker:
                 # constructor is used.
                 self._variants.setdefault(variant, []).append((enum_name, payload))
         self._bodies = {name: node for name, node in self.module.fns.items()}
+        self._externs = dict(visible.externs)
         for node in self.module.fns.values():
             self._check_fn(node, visible.fns)
         for node in self.module.tests.values():
@@ -1464,6 +1479,7 @@ class _Checker:
             frozenset(self._params),
             dict(visible.enums),
             literal_types=self.literal_types,
+            externs=dict(visible.externs),
         )
 
     # -- namespaces ------------------------------------------------------
@@ -1485,6 +1501,7 @@ class _Checker:
             inherited_fns: dict[str, FnTy] = {}
             inherited_structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
             inherited_enums: dict[str, tuple[tuple[str, Ty | None], ...]] = {}
+            inherited_externs: dict[str, FnTy] = {}
             for imported in module.imports.values():
                 # Only the import's own names cross the boundary: a module
                 # never inherits its imports' imports.
@@ -1493,6 +1510,7 @@ class _Checker:
                 inherited_fns.update(visible.own_fns)
                 inherited_structs.update(visible.own_structs)
                 inherited_enums.update(visible.own_enums)
+                inherited_externs.update(visible.own_externs)
             own_types = {
                 name: _declared(name, node) for name, node in module.types.items()
             }
@@ -1536,10 +1554,28 @@ class _Checker:
                     # time.
                     raise diag(DUPLICATE, node.path, "rt_ names are reserved")
                 own_fns[name] = self._signature(node, types, structs, enums)
+            own_externs: dict[str, FnTy] = {}
+            for name, node in module.externs.items():
+                sig = self._extern_signature(node, types, structs, enums)
+                own_externs[name] = sig
+                # One namespace: a call reaches an extern exactly as it reaches
+                # a body, and the arity and argument rules are the same ones.
+                own_fns[name] = sig
             fns = dict(inherited_fns)
             fns.update(own_fns)
+            externs = dict(inherited_externs)
+            externs.update(own_externs)
             visible = _Visible(
-                own_types, own_fns, own_structs, own_enums, types, fns, structs, enums
+                own_types,
+                own_fns,
+                own_structs,
+                own_enums,
+                types,
+                fns,
+                structs,
+                enums,
+                own_externs,
+                externs,
             )
         finally:
             self._active.pop()
@@ -1586,6 +1622,50 @@ class _Checker:
                 )
             self._params[name] = tuple(order)
         return sig
+
+    def _extern_signature(
+        self,
+        node: Node,
+        types: dict[str, Ty],
+        structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+        enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    ) -> FnTy:
+        """The type of one ``(extern fn name :ret ((p :type) ...))``.
+
+        The declaration is the same shape as a ``fn`` after its head, so the
+        signature is read by :func:`fn_shape` rather than a second parser. What
+        is different is what may appear in it: a C function is not generic
+        (there is no one copy per call site to make), its name cannot be a form
+        (no call could reach it), and every type in its signature has to be one
+        a C caller and this backend agree on. A type that does not is E0002
+        ``type does not cross the C boundary``, at the parameter or return type
+        that spelled it.
+        """
+        name = node.name
+        if name is None:
+            raise diag(UNKNOWN_NODE, node.path, "extern needs a name")
+        if name.startswith("rt_"):
+            raise diag(DUPLICATE, node.path, "rt_ names are reserved")
+        if reserved_name(name):
+            raise diag(DUPLICATE, node.path, "reserved form name")
+        ret, params, _ = fn_shape(_extern_fn(node), types, structs=structs, enums=enums)
+        order = typevars(ret)
+        for _, ty in params:
+            for var in typevars(ty):
+                if var not in order:
+                    order.append(var)
+        if order:
+            raise diag(
+                UNKNOWN_TYPE,
+                node.path,
+                "an extern function cannot have type variables",
+            )
+        if not _crosses(ret, structs) and not _is_void(ret):
+            raise diag(UNKNOWN_NODE, _return_path(node), _C_BOUNDARY)
+        for param, (_, ty) in zip(fn_param_nodes(_extern_fn(node)), params):
+            if not _crosses(ty, structs):
+                raise diag(UNKNOWN_NODE, param.path, _C_BOUNDARY)
+        return FnTy(tuple(ty for _, ty in params), ret)
 
     # -- bodies ----------------------------------------------------------
 
@@ -3902,6 +3982,11 @@ class _Checker:
             if constructed is not None:
                 return constructed
             raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
+        if name in self._externs:
+            # A C declaration has no body to lower and no module to link
+            # against: the backend emits its ``declare`` and the linker finds
+            # the symbol in libc. The argument rules are a body's.
+            return self._arguments(node, env, name, found)
         if name not in self._bodies:
             # The signature is visible because the module imports it, but only
             # this module's own definitions are lowered: the callee's symbol
@@ -4970,6 +5055,74 @@ def _stored_result(ty: Ty) -> bool:
 
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
+
+
+#: The sentence E0002 carries for a type an extern declaration names that C
+#: and this backend do not lay out the same way.
+_C_BOUNDARY = "type does not cross the C boundary"
+
+#: The primitives that are one machine value in C too. ``:str`` is here even
+#: though it is two words: the lowerer splits it into a pointer and a length in
+#: that order, which is the pair ``write`` and friends actually take.
+_C_PRIMITIVES = INTEGERS + FLOATS + ("bool", "str")
+
+
+def _crosses(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None,
+    stack: tuple[str, ...] = (),
+) -> bool:
+    """Whether ``ty`` is a type C and this backend lay out identically.
+
+    The boundary is deliberately narrow: the primitives, a ``:str`` (split into
+    two arguments), a pointer to a boundary type, a ``(shared ...)`` marker
+    around one, and a struct of those. Everything else has a representation
+    only this backend knows — a vector's descriptor, an enum's tag plus payload
+    area, a result's tag, a function value's code pointer, an owning pointer
+    whose release C cannot honour — so passing one to C would hand over a value
+    the other side reads by a different rule.
+
+    ``stack`` holds the struct names being walked, which is what lets a struct
+    that points at itself cross: the pointer ends the walk. A struct that
+    contains itself by value has no size and cannot cross.
+    """
+    if isinstance(ty, Prim):
+        return ty.name in _C_PRIMITIVES
+    if isinstance(ty, (Ptr, Shared)):
+        return _crosses(ty.elem, structs, stack)
+    if isinstance(ty, StructRef):
+        if structs is None or ty.name in stack:
+            return False
+        fields = structs.get(ty.name)
+        if fields is None:
+            return False
+        inner = stack + (ty.name,)
+        return all(_crosses(field, structs, inner) for _name, field in fields)
+    return False
+
+
+def _extern_fn(node: Node) -> Node:
+    """The ``fn`` a ``(extern fn ...)`` declaration spells, as a ``fn`` node.
+
+    The declaration is flat: ``(extern fn name :ret ((p :type) ...))``. Dropping
+    the head leaves exactly the items :func:`fn_shape` reads, so one reader
+    owns the signature shape for both. The node is not inserted into the tree —
+    it holds the same children, whose paths were assigned once — so nothing
+    renumbers anything.
+    """
+    return Node("fn", node.items[1:], node.path, node.line, node.col)
+
+
+def _return_path(node: Node) -> str:
+    """The path of an extern declaration's return type, or the form's own."""
+    index = 3
+    if index < len(node.items) and _marker(node.items[index]):
+        index += 1
+    if index < len(node.items):
+        item = node.items[index]
+        if isinstance(item, Node) and item.path:
+            return item.path
+    return node.path
 
 
 def _escapes(ty: Ty) -> bool:

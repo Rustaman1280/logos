@@ -1,0 +1,6 @@
+(mod extern-noncl)
+
+(extern fn fill :i64 ((v : (vec :i64))))
+
+(fn f :i64 ()
+  (ret 0))

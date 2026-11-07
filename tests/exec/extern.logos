@@ -1,0 +1,27 @@
+(mod extern)
+
+(extern fn getpid :i64 ())
+
+(extern fn strlen :i64 ((s : (ptr :u8))))
+
+(extern fn write :i64 ((fd :i64) (text :str)))
+
+(test pid-comes-back-as-i64
+  (expect (out "pid ok\n"))
+  (if (> (getpid) 0)
+    (println "pid ok")
+    (println "pid bad")))
+
+(test strlen-of-a-raw-pointer
+  (expect (out "3\n"))
+  (let b (alloc :u8 4))
+  (set-deref b 104)
+  (set-deref (ptr-add b 1) 105)
+  (set-deref (ptr-add b 2) 105)
+  (set-deref (ptr-add b 3) 0)
+  (println (strlen (ptr b)))
+  (free b))
+
+(test str-arrives-as-pointer-and-length
+  (expect (out "hi2\n"))
+  (println (write 1 "hi")))

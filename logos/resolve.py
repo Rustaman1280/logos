@@ -10,8 +10,8 @@ of the modules it names, not the ones they name.
 Module vocabulary
 -----------------
 Only module-level forms are resolved here: ``mod``, ``use``, ``fn``, ``test``,
-``type`` and the ``expect-error`` directive. Forms inside a ``fn`` or a
-``test`` belong to the checker, so the resolver leaves them alone; the
+``type``, ``extern`` and the ``expect-error`` directive. Forms inside a ``fn``
+or a ``test`` belong to the checker, so the resolver leaves them alone; the
 module-level vocabulary grows with the language, one task at a time. A form
 outside that vocabulary is E0002, reported at the form's path.
 
@@ -56,6 +56,12 @@ class Module:
     by name; ``imports`` holds the modules ``use`` named, keyed by module name.
     Imported definitions are therefore not copied into ``fns``: a consumer
     that needs a name searches this module, then ``imports``.
+
+    ``externs`` holds the C declarations ``(extern fn ...)`` wrote, keyed by
+    name. They share the ``fn``/``type`` namespace — one linker symbol, one
+    spelling — but they are not bodies: nothing lowers them, so they are kept
+    apart from ``fns`` and the backend emits a ``declare`` instead of a
+    ``define``.
     """
 
     name: str
@@ -64,6 +70,7 @@ class Module:
     fns: dict[str, Node]
     tests: dict[str, Node]
     imports: dict[str, "Module"] = field(default_factory=dict)
+    externs: dict[str, Node] = field(default_factory=dict)
 
 
 def resolve(root: Node, loader: Loader, file: str = "") -> Module:
@@ -123,7 +130,7 @@ class _Resolver:
         return module
 
     def _build(self, root: Node, form: Node, name: str) -> Module:
-        module = Module(name, root, {}, {}, {}, {})
+        module = Module(name, root, {}, {}, {}, {}, {})
         # ``defs`` is the module's fn/type namespace as it grows, imported
         # names included, so a later definition or import can be checked
         # against everything visible at that point.
@@ -141,6 +148,8 @@ class _Resolver:
                 self._import(module, item, defs)
             elif kind in ("fn", "type"):
                 _define(module, item, kind, defs)
+            elif kind == "extern":
+                _define_extern(module, item, defs)
             elif kind == "test":
                 _define_test(module, item, tests)
             elif kind == "expect-error":
@@ -224,6 +233,28 @@ def _define(module: Module, node: Node, kind: str, defs: dict[str, Node]) -> Non
     table[name] = node
 
 
+def _define_extern(module: Module, node: Node, defs: dict[str, Node]) -> None:
+    """Record one ``(extern fn name ...)`` declaration.
+
+    Only the spine is checked here: the ``fn`` marker and a name. The return
+    type and the parameters are types, and types are the checker's work — a
+    malformed one there carries a location inside the declaration, which the
+    resolver cannot supply. The name shares the ``fn``/``type`` namespace,
+    because all three are one spelling.
+    """
+    name = node.name
+    if name is None:
+        raise diag(
+            UNKNOWN_NODE,
+            node.path,
+            "extern needs (extern fn name :ret ((p :type) ...))",
+        )
+    if name in defs:
+        raise diag(DUPLICATE, node.path, f"duplicate definition '{name}'")
+    defs[name] = node
+    module.externs[name] = node
+
+
 def _define_test(module: Module, node: Node, tests: dict[str, Node]) -> None:
     name = node.name
     if name is None:
@@ -236,7 +267,7 @@ def _define_test(module: Module, node: Node, tests: dict[str, Node]) -> None:
 
 def _merge(imported: Module, defs: dict[str, Node], path: str) -> None:
     """Make the imported module's definitions visible, refusing collisions."""
-    for table in (imported.types, imported.fns):
+    for table in (imported.types, imported.fns, imported.externs):
         for name in table:
             if name in defs:
                 raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
