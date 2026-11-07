@@ -44,7 +44,7 @@ adds threads and the synchronization that goes with them: `(spawn f args...)`,
 `(join t)`, `(mutex)`/`lock`/`unlock`, `(chan T n)`/`send`/`recv`, and
 `(atomic T v)`/`atomic-add`/`atomic-load`/`atomic-store`, over pthreads. Shared
 mutable state is marked `(shared ...)`, and handing a thread an unmarked pointer
-or handle is E0700. A pthread failure is R0005.
+or handle — or making one a channel element — is E0700. A pthread failure is R0005.
 Everything else reports a diagnostic at the construct.
 
 ## Requirements

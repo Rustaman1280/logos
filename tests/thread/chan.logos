@@ -121,3 +121,22 @@
   (letmut t (spawn noop))
   (join t)
   (join t))
+
+(type cell (struct (p (shared (ptr :i64)))))
+
+(fn send-cell :void ((c (shared (chan cell))) (p (shared (ptr :i64))))
+  (send c (make cell p)))
+
+(test shared-pointer-element
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (let p (alloc :i64 1))
+  (letmut s (shared (ptr :i64)) (ptr p))
+  (set-deref s 7)
+  (letmut c (chan cell 1))
+  (letmut t (spawn send-cell c s))
+  (let got (recv c))
+  (join t)
+  (println (deref (get got p)))
+  (free p))

@@ -227,7 +227,10 @@ when its type is marked `(shared ...)` — E0700 — because two threads reachin
 one object is exactly what the marker exists to show. The check descends into
 aggregates the way the move check does: a bare `(ptr T)` in a struct field or
 an array element is E0700 at the argument, while a `(shared (ptr T))` field is
-already marked and stays legal. `(join t)` waits and
+already marked and stays legal. A channel's element type is the other crossing
+and obeys the same rule: `(chan (ptr T) n)` and a channel of a struct holding a
+bare pointer are E0700 at the element type, while `(shared (ptr T))` as the
+element, or as a field of the element, stays legal. `(join t)` waits and
 releases the handle; joining one twice is R0005.
 
 `(mutex)` returns a `(shared :mutex)`; `lock`/`unlock` take it. The mutex is

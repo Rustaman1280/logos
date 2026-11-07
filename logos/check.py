@@ -514,7 +514,13 @@ def check_module(m: Module) -> CheckedModule:
     return _Checker(m).run()
 
 
-def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]], int]:
+def fn_shape(
+    node: Node,
+    types: dict[str, Ty],
+    *,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+) -> tuple[Ty, list[tuple[str, Ty]], int]:
     """A ``fn``'s return type, its parameters and the index of its first statement.
 
     The signature has three spellings — ``(fn f :i64 ((a :i64)) ...)``,
@@ -531,7 +537,9 @@ def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]]
         raise diag(
             UNKNOWN_NODE, node.path, "fn needs a return type and a parameter list"
         )
-    ret, index = _read_type_at(node.items, 2, types, node.path)
+    ret, index = _read_type_at(
+        node.items, 2, types, node.path, structs=structs, enums=enums
+    )
     if index >= len(node.items):
         raise diag(UNKNOWN_NODE, node.path, "fn needs a parameter list")
     params: list[tuple[str, Ty]] = []
@@ -541,7 +549,7 @@ def fn_shape(node: Node, types: dict[str, Ty]) -> tuple[Ty, list[tuple[str, Ty]]
         if name in names:
             raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
         names.add(name)
-        ty = _read_type(item, types, param.path)
+        ty = _read_type(item, types, param.path, structs=structs, enums=enums)
         if compatible(ty, Prim("void")):
             # A parameter is a storage location, and no ``void`` value exists
             # to put in it; a backend that tried would emit ``void %v.0``.
@@ -563,7 +571,12 @@ def fn_param_nodes(node: Node) -> list[Node]:
 
 
 def let_shape(
-    node: Node, types: dict[str, Ty], bindings: dict[str, Ty] | None = None
+    node: Node,
+    types: dict[str, Ty],
+    bindings: dict[str, Ty] | None = None,
+    *,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> tuple[str, Ty | None, Node | Token]:
     """A binding's name, its declared type and the item holding its initialiser.
 
@@ -590,7 +603,9 @@ def let_shape(
         return name, None, items[2]
     if not _is_type_slot(items[2]):
         raise diag(WRONG_ARITY, node.path, shape)
-    declared, index = _read_type_at(items, 2, types, node.path, bindings)
+    declared, index = _read_type_at(
+        items, 2, types, node.path, bindings, structs=structs, enums=enums
+    )
     if len(items) != index + 1:
         raise diag(WRONG_ARITY, node.path, shape)
     return name, declared, items[index]
@@ -1369,7 +1384,7 @@ class _Checker:
                     # already owns, so it is refused here rather than at link
                     # time.
                     raise diag(DUPLICATE, node.path, "rt_ names are reserved")
-                own_fns[name] = self._signature(node, types)
+                own_fns[name] = self._signature(node, types, structs, enums)
             fns = dict(inherited_fns)
             fns.update(own_fns)
             visible = _Visible(
@@ -1380,7 +1395,13 @@ class _Checker:
         self._seen[module.name] = visible
         return visible
 
-    def _signature(self, node: Node, types: dict[str, Ty]) -> FnTy:
+    def _signature(
+        self,
+        node: Node,
+        types: dict[str, Ty],
+        structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+        enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    ) -> FnTy:
         """A ``fn``'s type, and its type parameters when it has any.
 
         A type variable in a signature is what declares it: there is no
@@ -1391,7 +1412,7 @@ class _Checker:
         name = node.name
         if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
-        ret, params, _ = fn_shape(node, types)
+        ret, params, _ = fn_shape(node, types, structs=structs, enums=enums)
         sig = FnTy(tuple(ty for _, ty in params), ret)
         order = typevars(ret)
         for param in sig.params:
@@ -1470,7 +1491,7 @@ class _Checker:
             raise diag(UNKNOWN_NODE, node.path, "fn needs a name")
         if name in env.fns:
             raise diag(DUPLICATE, node.path, f"duplicate definition '{name}'")
-        sig = self._signature(node, self._types)
+        sig = self._signature(node, self._types, self._structs, self._enums)
         env.fns[name] = sig
         inner = _Env(
             env.fns,
@@ -1802,7 +1823,9 @@ class _Checker:
         return Prim("bool")
 
     def _let(self, node: Node, env: _Env, *, mutable: bool) -> Ty:
-        name, declared, init = let_shape(node, self._types, env.tvars)
+        name, declared, init = let_shape(
+            node, self._types, env.tvars, structs=self._structs, enums=self._enums
+        )
         self._transfer(init, env, node.path)
         ty = self._value(init, env, declared, node.path)
         if declared is not None and not _fits(declared, ty):
@@ -3005,7 +3028,7 @@ class _Checker:
                     "a thread argument is copied into the new thread; "
                     "a value that owns memory cannot be copied across",
                 )
-            if self._unmarked_share(ty):
+            if _unmarked_share(ty, self._structs, self._enums):
                 raise diag(SHARED_MARKER, _at(arg, node), _SHARED_MARKER)
             if not compatible(param, ty):
                 raise diag(
@@ -3018,48 +3041,6 @@ class _Checker:
                 # a callee's is; the caller's copy is discharged by the handoff.
                 self._handled(arg, env)
         return Prim("thread")
-
-    def _unmarked_share(self, ty: Ty, seen: frozenset[str] = frozenset()) -> bool:
-        """Whether ``ty`` is, or holds at any depth, shared state with no marker.
-
-        A thread argument is *copied* into the new thread, and a struct or an
-        array copy carries every field with it: a raw address in a field
-        crosses the boundary exactly as a bare ``(ptr T)`` argument does, while
-        the argument's spelling — ``holder`` — says nothing about it. So the
-        check descends through aggregates, the same way the move check does,
-        and the ``(shared ...)`` marker is a stop: below it the state is
-        already accounted for, and ``(shared (ptr T))`` in a field is legal.
-        A bare mutex, channel or atomic cannot appear in a field (their own
-        declaration rules refuse it), but they are named here so one reachable
-        by any future route is refused too.
-        """
-        if isinstance(ty, Shared):
-            return False
-        if isinstance(ty, (Ptr, Chan, Atomic)):
-            return True
-        if isinstance(ty, Prim):
-            return ty.name == "mutex"
-        if isinstance(ty, (Arr, Vec, Opt)):
-            return self._unmarked_share(ty.elem, seen)
-        if isinstance(ty, Res):
-            return self._unmarked_share(ty.ok, seen) or self._unmarked_share(ty.err, seen)
-        if isinstance(ty, StructRef):
-            if ty.name in seen:
-                return False
-            inner = seen | {ty.name}
-            return any(
-                self._unmarked_share(field, inner)
-                for _name, field in self._structs.get(ty.name, ())
-            )
-        if isinstance(ty, EnumRef):
-            if ty.name in seen:
-                return False
-            inner = seen | {ty.name}
-            return any(
-                payload is not None and self._unmarked_share(payload, inner)
-                for _variant, payload in self._enums.get(ty.name, ())
-            )
-        return False
 
     def _join(self, node: Node, env: _Env) -> Ty:
         """``(join t)``: wait for a thread to finish; the handle is used up."""
@@ -3104,12 +3085,24 @@ class _Checker:
             raise diag(
                 WRONG_ARITY, node.path, "chan takes an element type and a capacity"
             )
-        elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
+        elem, _ = _read_type_at(
+            items,
+            1,
+            self._types,
+            node.path,
+            env.tvars,
+            structs=self._structs,
+            enums=self._enums,
+        )
         # The same element rules `resolve_type` applies to a spelled
         # `(chan T)`: a channel copies its elements, so a value that owns
         # memory cannot be one, and a result's obligation would be dropped in
-        # the ring.
+        # the ring. The same E0700 a spawn argument gets applies here too: an
+        # element that is, or holds at any depth, shared state with no
+        # `(shared ...)` marker must say so at the element type.
         _channel_element(elem, node.path)
+        if _unmarked_share(elem, self._structs, self._enums):
+            raise diag(SHARED_MARKER, _at(items[1], node), _SHARED_MARKER)
         capacity = self._value(items[2], env, None, node.path)
         if not _integer(capacity):
             raise diag(
@@ -3842,7 +3835,7 @@ class _Checker:
     def _check_instance(self, instance: Instance, fns: dict[str, FnTy]) -> None:
         """Check one copy's body under its own substitution and type record."""
         node = self._bodies[instance.fn]
-        _, _, start = fn_shape(node, self._types)
+        _, _, start = fn_shape(node, self._types, structs=self._structs, enums=self._enums)
         subst = dict(zip(self._params[instance.fn], instance.args))
         env = _Env(
             fns,
@@ -3880,7 +3873,9 @@ class _Checker:
         lowerer builds the environment from is exactly the set of names the
         body could not resolve for itself.
         """
-        ret, params, start = closure_shape(node, self._types, env.tvars)
+        ret, params, start = closure_shape(
+            node, self._types, env.tvars, structs=self._structs, enums=self._enums
+        )
         inner = _Env(
             env.fns,
             ret=ret,
@@ -3911,7 +3906,12 @@ class _Checker:
 
 
 def closure_shape(
-    node: Node, types: dict[str, Ty], bindings: dict[str, Ty] | None = None
+    node: Node,
+    types: dict[str, Ty],
+    bindings: dict[str, Ty] | None = None,
+    *,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> tuple[Ty, list[tuple[str, Ty]], int]:
     """A ``(fn ...)`` expression's return type, parameters and body start.
 
@@ -3925,7 +3925,9 @@ def closure_shape(
             node.path,
             "a closure needs a return type and a parameter list",
         )
-    ret, index = _read_type_at(node.items, 1, types, node.path, bindings)
+    ret, index = _read_type_at(
+        node.items, 1, types, node.path, bindings, structs=structs, enums=enums
+    )
     if index >= len(node.items):
         raise diag(UNKNOWN_NODE, node.path, "a closure needs a parameter list")
     params: list[tuple[str, Ty]] = []
@@ -3935,7 +3937,7 @@ def closure_shape(
         if name in names:
             raise diag(DUPLICATE, param.path, f"duplicate definition '{name}'")
         names.add(name)
-        ty = _read_type(item, types, param.path, bindings)
+        ty = _read_type(item, types, param.path, bindings, structs=structs, enums=enums)
         if compatible(ty, Prim("void")):
             raise diag(
                 TYPE_MISMATCH, param.path, f"parameter '{name}' cannot be :void"
@@ -4030,10 +4032,20 @@ def _read_type(
     types: dict[str, Ty],
     fallback: str,
     bindings: dict[str, Ty] | None = None,
+    *,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> Ty:
     """Read one type item and resolve its names, locating errors at it."""
     path = item.path if isinstance(item, Node) and item.path else fallback
-    return resolve_type(parse_type(item, path=path), types, path, bindings)
+    return resolve_type(
+        parse_type(item, path=path),
+        types,
+        path,
+        bindings,
+        structs=structs,
+        enums=enums,
+    )
 
 
 def _read_type_at(
@@ -4042,6 +4054,9 @@ def _read_type_at(
     types: dict[str, Ty],
     fallback: str,
     bindings: dict[str, Ty] | None = None,
+    *,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> tuple[Ty, int]:
     """Read the type at ``items[start]``, returning it and the next index.
 
@@ -4054,7 +4069,10 @@ def _read_type_at(
             raise diag(UNKNOWN_TYPE, fallback, "expected a type after ':'")
         item = items[start + 1]
         start += 1
-    return _read_type(item, types, fallback, bindings), start + 1
+    return (
+        _read_type(item, types, fallback, bindings, structs=structs, enums=enums),
+        start + 1,
+    )
 
 
 def resolve_type(
@@ -4064,6 +4082,8 @@ def resolve_type(
     bindings: dict[str, Ty] | None = None,
     *,
     _shared: bool = False,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> Ty:
     """Resolve every named reference in ``ty`` against ``types``.
 
@@ -4106,9 +4126,11 @@ def resolve_type(
             raise diag(UNKNOWN_TYPE, path, f"unknown type '{ty.name}'")
         return declared
     if isinstance(ty, Ptr):
-        return Ptr(resolve_type(ty.elem, types, path, bindings))
+        return Ptr(
+            resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
+        )
     if isinstance(ty, Own):
-        elem = resolve_type(ty.elem, types, path, bindings)
+        elem = resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
         if holds_owner(elem):
             # An owner holds a block, not another owner: the inner pointer
             # would only be reachable through a deref, and that read is E0402.
@@ -4122,7 +4144,7 @@ def resolve_type(
             )
         return Own(elem)
     if isinstance(ty, Opt):
-        elem = resolve_type(ty.elem, types, path, bindings)
+        elem = resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
         if holds_vector(elem):
             # Same reason a vector may not be a struct field: a tagged value is
             # copied where it is built, and a vector's descriptor has no copy.
@@ -4137,7 +4159,15 @@ def resolve_type(
             )
         return Opt(elem)
     if isinstance(ty, Shared):
-        elem = resolve_type(ty.elem, types, path, bindings, _shared=True)
+        elem = resolve_type(
+            ty.elem,
+            types,
+            path,
+            bindings,
+            _shared=True,
+            structs=structs,
+            enums=enums,
+        )
         # Shared state is something a thread can reach and change: a pointer
         # into the heap, or one of the three synchronization handles. A
         # ``(shared :i64)`` would name a copy, which no thread could change for
@@ -4153,9 +4183,16 @@ def resolve_type(
     if isinstance(ty, (Chan, Atomic)):
         if not _shared:
             raise diag(SHARED_MARKER, path, _SHARED_MARKER)
-        elem = resolve_type(ty.elem, types, path, bindings)
+        elem = resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
         if isinstance(ty, Chan):
-            return Chan(_channel_element(elem, path))
+            # The element crosses into a thread's ring just as a spawn
+            # argument crosses into a thread: an element that is, or holds at
+            # any depth, a bare pointer or synchronization handle must carry
+            # the ``(shared ...)`` marker, exactly as the argument would.
+            _channel_element(elem, path)
+            if _unmarked_share(elem, structs, enums):
+                raise diag(SHARED_MARKER, path, _SHARED_MARKER)
+            return Chan(elem)
         if not (isinstance(elem, Prim) and elem.name in ("i64", "u64")):
             raise diag(
                 TYPE_MISMATCH,
@@ -4164,7 +4201,7 @@ def resolve_type(
             )
         return Atomic(elem)
     if isinstance(ty, Vec):
-        elem = resolve_type(ty.elem, types, path, bindings)
+        elem = resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
         if holds_owner(elem):
             # A container is not a place this language can name: an element
             # can be neither read (E0402) nor released where it lies, so a
@@ -4182,8 +4219,8 @@ def resolve_type(
             )
         return Vec(elem)
     if isinstance(ty, Res):
-        ok = resolve_type(ty.ok, types, path, bindings)
-        err = resolve_type(ty.err, types, path, bindings)
+        ok = resolve_type(ty.ok, types, path, bindings, structs=structs, enums=enums)
+        err = resolve_type(ty.err, types, path, bindings, structs=structs, enums=enums)
         if not isinstance(err, EnumRef):
             # The error slot is a declared enum and nothing else: `try` needs
             # one identity to compare, and a primitive or a struct has none.
@@ -4202,16 +4239,17 @@ def resolve_type(
         return Res(ok, err)
     if isinstance(ty, FnTy):
         params = tuple(
-            resolve_type(param, types, path, bindings) for param in ty.params
+            resolve_type(param, types, path, bindings, structs=structs, enums=enums)
+            for param in ty.params
         )
         return FnTy(
             params,
-            resolve_type(ty.ret, types, path, bindings),
+            resolve_type(ty.ret, types, path, bindings, structs=structs, enums=enums),
             ty.captures,
         )
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
-    elem = resolve_type(ty.elem, types, path, bindings)
+    elem = resolve_type(ty.elem, types, path, bindings, structs=structs, enums=enums)
     if holds_owner(elem):
         # Also the reachable spelling of the same program: an `(arr (own T)
         # n)` parameter could name the type, and nothing could release an
@@ -4401,6 +4439,63 @@ def _shared_state(ty: Ty) -> bool:
     if isinstance(ty, (Chan, Atomic)):
         return True
     return isinstance(ty, Prim) and ty.name == "mutex"
+
+
+def _unmarked_share(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether ``ty`` is, or holds at any depth, shared state with no marker.
+
+    The rule covers every thread crossing, so one walk serves them all: an
+    argument *copied* into a new thread and a channel element *copied* into a
+    new thread's ring both carry every field with them, and a raw address in a
+    field crosses the boundary exactly as a bare ``(ptr T)`` does, while the
+    value's spelling — ``holder`` — says nothing about it. So the check
+    descends through aggregates, the same way the move check does, and the
+    ``(shared ...)`` marker is a stop: below it the state is already accounted
+    for, and ``(shared (ptr T))`` in a field or as a channel element is legal.
+    A bare mutex, channel or atomic cannot appear in a field (their own
+    declaration rules refuse it), but they are named here so one reachable by
+    any future route is refused too.
+
+    ``structs`` and ``enums`` are the visible aggregate tables. A caller that
+    has none — a signature read before a module's own structs are recorded —
+    still catches a pointer or handle reached through arrays, optionals,
+    results and other non-named types; only a field of a *named* aggregate
+    needs the table to see.
+    """
+    if isinstance(ty, Shared):
+        return False
+    if isinstance(ty, (Ptr, Chan, Atomic)):
+        return True
+    if isinstance(ty, Prim):
+        return ty.name == "mutex"
+    if isinstance(ty, (Arr, Vec, Opt)):
+        return _unmarked_share(ty.elem, structs, enums, seen)
+    if isinstance(ty, Res):
+        return _unmarked_share(ty.ok, structs, enums, seen) or _unmarked_share(
+            ty.err, structs, enums, seen
+        )
+    if isinstance(ty, StructRef):
+        if structs is None or ty.name in seen:
+            return False
+        inner = seen | {ty.name}
+        return any(
+            _unmarked_share(field, structs, enums, inner)
+            for _name, field in structs.get(ty.name, ())
+        )
+    if isinstance(ty, EnumRef):
+        if enums is None or ty.name in seen:
+            return False
+        inner = seen | {ty.name}
+        return any(
+            payload is not None and _unmarked_share(payload, structs, enums, inner)
+            for _variant, payload in enums.get(ty.name, ())
+        )
+    return False
 
 
 def _channel_element(elem: Ty, path: str) -> Ty:

@@ -30,7 +30,7 @@ from logos.check import CheckedModule, check_module
 from logos.diag import LogosError
 from logos.parser import parse
 from logos.resolve import resolve
-from logos.types import Atomic, Chan, Prim, Ptr, Shared
+from logos.types import Atomic, Chan, Prim, Ptr, Shared, StructRef
 
 ROOT = Path(__file__).resolve().parents[1]
 THREADS = ROOT / "tests" / "thread"
@@ -174,6 +174,50 @@ class ThreadTypeTest(unittest.TestCase):
             with self.subTest(source=source):
                 error = fail_on(source)
                 self.assertIn(error.code, ("E0102", "E0100"))
+
+    def test_a_channel_of_bare_pointers_is_e0700(self):
+        # The ring is a thread crossing like any other: an element that is a
+        # raw address has to say `(shared ...)`, at the element type.
+        error = fail_on("(mod m)(fn f :void () (let c (chan (ptr :i64) 1)))")
+        self.assertEqual(error.code, "E0700")
+        self.assertEqual(error.path, "m/f/2/1/0")
+        self.assertIn("(shared ...)", error.message)
+
+    def test_a_channel_of_structs_holding_a_pointer_is_e0700(self):
+        error = fail_on(
+            "(mod m)(type holder (struct (p (ptr :i64))))"
+            "(fn f :void () (let c (chan holder 1)))"
+        )
+        self.assertEqual(error.code, "E0700")
+        self.assertEqual(error.path, "m/f/2/1")
+
+    def test_a_spelled_channel_of_bare_pointers_is_e0700(self):
+        # A signature names the element type too, and the marker rule does not
+        # wait for a `(chan ...)` constructor to apply.
+        error = fail_on(
+            "(mod m)(fn f :void ((c (shared (chan (ptr :i64))))) (ret))"
+        )
+        self.assertEqual(error.code, "E0700")
+
+    def test_a_channel_of_marked_pointers_checks(self):
+        cm = checked("(mod m)(fn f :void () (let c (chan (shared (ptr :i64)) 1)))")
+        self.assertEqual(
+            cm.expr_types[path_of(cm, "chan")],
+            Shared(Chan(Shared(Ptr(Prim("i64"))))),
+        )
+
+    def test_a_channel_of_structs_holding_a_marked_pointer_checks(self):
+        # The marker is a stop at any depth: the field is already accounted
+        # for, so the element crosses and both ends see the pointee.
+        cm = checked(
+            "(mod m)(type holder (struct (p (shared (ptr :i64)))))"
+            "(fn f :void ((p (shared (ptr :i64))))"
+            " (let c (chan holder 1))"
+            " (send c (make holder p))"
+            " (let got (recv c))"
+            " (println (deref (get got p))))"
+        )
+        self.assertEqual(type_of(cm, "recv"), StructRef("holder"))
 
     def test_an_atomic_is_shared_and_typed(self):
         cm = checked(
@@ -494,6 +538,14 @@ class ThreadExecTest(unittest.TestCase):
             with self.subTest(opt=opt):
                 done = self.run_case(CHAN, "struct-elements", opt)
                 self.assertEqual(done.stdout, "90\n", done.stderr)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn("LEAK", done.stderr)
+
+    def test_a_channel_of_shared_pointer_structs(self):
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = self.run_case(CHAN, "shared-pointer-element", opt)
+                self.assertEqual(done.stdout, "7\n", done.stderr)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertNotIn("LEAK", done.stderr)
 
