@@ -156,6 +156,15 @@ Nothing here is undefined behaviour, so a C oracle can check it:
 - In debug builds the runtime tracks every live block. At exit it prints
   `LEAK n bytes at module/fn/line` for each. `(expect-leak 0)` makes a
   leaking test fail.
+- Release builds do not quarantine a freed block: the tracker still records
+  the address, but `free` returns it to the allocator, so a later `alloc` may
+  reuse it and a stale owner of the old block is indistinguishable from the
+  owner of the new one. R0002 `double free` is therefore **defence in depth**,
+  exact only in a debug build. What makes a stale double free impossible is
+  the compile-time rule, not the runtime check: an owner is moved or released
+  once, a second release of it is E0300 at that read, and a copy of it out of
+  a place is E0402. A program a release build accepts has no second release to
+  catch.
 - No hidden allocation. Every allocating call is visible in the source.
 - A `(vec T)` is not copyable, and neither is a type that contains one.
   Binding such a value moves it; reading the source afterwards is E0300.
@@ -302,21 +311,29 @@ or optional that carries a bare pointer is refused as a thread argument, and
 ### Modules
 
 One file, one module, file name equals module name. `(use other)` imports.
-No circular imports: the resolver rejects them with the full cycle. v1 lowers
-one module at a time: an imported definition is visible in the namespace
-(its type can annotate a local signature) but a call to it is E0103
-`imported functions are not lowered yet`, naming the function, because its
-symbol lives in an object file the program is not built with.
+No circular imports: the resolver rejects them with the full cycle. An import
+resolves at check time: the imported definition is visible in the namespace,
+so its type can annotate a local signature and its signature can be checked
+against a call. v1 lowers one module at a time, and a body is emitted only for
+a definition in the module being compiled. An imported *function* therefore
+has no symbol in the object being built, and a call to it is E0103 `imported
+functions are not lowered yet`, naming the function. The refusal is
+deliberate until linking exists: the alternative is a program that type-checks
+and then fails in the linker. An imported `extern` declaration is the one
+exception, because it has no body to lower — the consumer emits its own
+`declare`, and the symbol is the C one either way.
 
 ### Tests are grammar
 
 `(test ...)` and its directives are ordinary module-level nodes, not a
 second grammar. `(test name checks...)` may hold `(expect ...)` nodes. A
 test-local helper `fn` is E0002 `test-local helper functions are not lowered
-yet` until a copy of one can be emitted; the refusal is at the node, not at a
-call. `logosc build` compiles a file that contains
-tests and drops every test node. `logosc test` compiles the same file with
-tests kept and runs each one in its own process. Directive nodes:
+yet`, and it is refused for the same reason an imported function is: the
+backend emits a definition only for a module-level `fn`, so a helper's symbol
+would never exist. The refusal is at the node, not at a call, so a helper
+that nothing calls is reported too. `logosc build` compiles a file that
+contains tests and drops every test node. `logosc test` compiles the same file
+with tests kept and runs each one in its own process. Directive nodes:
 `(expect (out S) (code N))`, `(expect-leak N)`, and module-level
 `(expect-error E0xxx)` for negative cases.
 
@@ -328,8 +345,16 @@ goes through the normal front end.
 Structs use C layout: fields in declaration order, natural alignment,
 padding as C would. `:bool` is one byte. Enums are a tag plus payload and
 never cross to C. `(extern fn name :ret ((p :type) ...))` declares a C
-function; only C-layout types cross that boundary. File I/O, allocation,
-threads and formatting all arrive this way.
+function. It is a declaration, not a body: the backend emits an LLVM
+`declare` under the bare name with the C ABI, and the linker resolves it in
+libc. What may cross is a closed list: the integer and float primitives,
+`:bool`, `:str`, a pointer to one of those, a `(shared ...)` marker around one,
+and a struct of those. A `:str` parameter becomes two arguments, the data
+pointer then the byte count — never one aggregate — which is the pair
+`write` takes; a `:str` return stays one two-word aggregate, as a C function
+returning that struct returns. Anything else at the boundary is E0002 `type
+does not cross the C boundary`, at the parameter or return type that spelled
+it. File I/O, allocation, threads and formatting all arrive this way.
 
 ### Addressing and tooling
 
@@ -345,10 +370,15 @@ share a name.
 
 Every diagnostic prints a location: a node path when one exists, otherwise
 `file:line:column`. The compiler prints that location in every diagnostic. `logosc show <path>` prints one
-subtree. `logosc patch <path>` accepts a replacement subtree and rewrites
-only that node, then reformats. `logosc fmt FILE...` rewrites each file to
-the canonical form in place, and `logosc fmt -` prints it to stdout, so any
-file an AI produces normalises to one shape.
+subtree. A path may address a token as well as a node: every child occupies a
+position, tokens included, so `hello/main/2/0` is the string token of
+`hello/main/2`. `show` prints a node in canonical form or the token's own
+bytes, one item, one trailing newline. `logosc patch <path>` accepts a
+replacement subtree, rewrites only that node — or that token — and then
+reformats the whole file, so what `patch` writes is exactly what `fmt` would
+write and every other node keeps its path. `logosc fmt FILE...` rewrites each
+file to the canonical form in place, and `logosc fmt -` prints it to stdout, so
+any file an AI produces normalises to one shape.
 
 ## Compiler
 
@@ -416,7 +446,10 @@ With no manual step:
 1. `logosc build examples/hello.logos` produces an ELF that prints
    `hello` and exits 0.
 2. `logosc test` passes every test in all seven categories, at `-O0` and
-   `-O2`, with zero leaks reported.
+   `-O2`, with zero leaks reported except where a case declares them. The
+   rule is the declaration, not the number: `tests/mem` and `tests/exec` hold
+   tests that leak to prove the tracker reports a leak, and each states the
+   count it expects. Every other case is zero.
 3. The differential suite passes against gcc for all its cases.
 4. The three example programs produce output identical to the reference
    tools.
