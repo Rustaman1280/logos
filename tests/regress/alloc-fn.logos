@@ -1,0 +1,4 @@
+(mod alloc-fn)
+
+(fn f :void ()
+  (let p (alloc (fn (:i64) :i64) 1)))

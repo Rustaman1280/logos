@@ -1,0 +1,6 @@
+(mod recursive-enum)
+
+(type e (enum (a e)))
+
+(fn f :i64 ()
+  (ret 0))

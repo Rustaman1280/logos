@@ -1,0 +1,9 @@
+(mod str-concat-overflow)
+
+(test concatenation-keeps-every-byte
+  (expect (out "hello world11\n"))
+  (let a "hello")
+  (let b " world")
+  (let c (str-concat a b))
+  (print c)
+  (println (str-len c)))

@@ -1,0 +1,7 @@
+(mod int-overflow)
+
+(test int-min-divided-by-minus-one-wraps
+  (expect (out "-9223372036854775808\n0\n"))
+  (let low (shl 1 63))
+  (println (/ low -1))
+  (println (% low -1)))

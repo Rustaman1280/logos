@@ -1,0 +1,9 @@
+(mod generic-vector)
+
+(fn same :T ((x :T))
+  (ret x))
+
+(fn f :i64 ()
+  (let w (same (make (vec :i64))))
+  (vec-free w)
+  (ret 0))

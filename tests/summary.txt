@@ -7,6 +7,7 @@ PASS type/alloc-result -
 PASS type/arity -
 PASS type/cast-nonnumeric -
 PASS type/cast-same -
+PASS type/extern-noncl -
 PASS type/float-mix -
 PASS type/free-raw -
 PASS type/immutable-set -
@@ -51,6 +52,9 @@ PASS exec/closures/non-capturing-through-a-parameter -
 PASS exec/closures/capturing-local-called-twice -
 PASS exec/divzero/div-by-zero-panics -
 PASS exec/divzero/modulo-by-zero-panics -
+PASS exec/extern/pid-comes-back-as-i64 -
+PASS exec/extern/strlen-of-a-raw-pointer -
+PASS exec/extern/str-arrives-as-pointer-and-length -
 PASS exec/floats/add-and-subtract -
 PASS exec/floats/multiply-and-divide -
 PASS exec/floats/compare-ordered -
@@ -164,3 +168,15 @@ PASS thread/chan/shared-pointer-element -
 PASS thread/sum/eight-threads -
 PASS generics/limit -
 PASS generics/unbound -
+PASS regress/alloc-fn -
+PASS regress/closure-escape -
+PASS regress/div-zero/division-by-zero-panics -
+PASS regress/generic-vector -
+PASS regress/int-overflow/int-min-divided-by-minus-one-wraps -
+PASS regress/libc-interposition/a-user-write-does-not-take-over-printing -
+PASS regress/loop-release -
+PASS regress/owner-place-read -
+PASS regress/recursive-enum -
+PASS regress/reserved-name -
+PASS regress/str-concat-overflow/concatenation-keeps-every-byte -
+PASS regress/vec-place-copy -

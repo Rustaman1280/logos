@@ -1,0 +1,4 @@
+(mod owner-place-read)
+
+(fn f :void ((p (ptr (own :i64))))
+  (let q (deref p)))

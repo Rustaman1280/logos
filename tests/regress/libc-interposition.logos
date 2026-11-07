@@ -1,0 +1,9 @@
+(mod libc-interposition)
+
+(fn write :i64 ()
+  (ret 0))
+
+(test a-user-write-does-not-take-over-printing
+  (expect (out "still here\n"))
+  (let _ (write))
+  (println "still here"))
