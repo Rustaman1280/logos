@@ -2280,16 +2280,21 @@ class _Fn:
         return handle
 
     def send_form(self, node: Node) -> str:
-        """``(send c v)``: spill the element and hand its address to the ring."""
+        """``(send c v)``: spill the element and hand its address to the ring.
+
+        The channel is evaluated before the element, left to right: a send
+        whose channel is itself a call blocks on that call first, exactly as
+        every other form evaluates its operands in the order they are written.
+        """
         items = node.items
         if len(items) != 3:
             raise diag(WRONG_ARITY, node.path, "send takes a channel and a value")
         chan = self.channel_of(items[1], node.path)
         elem = chan.elem
         self.lowering.use_type(elem, node.path)
+        handle = self.value(items[1], node.path)
         slot = self.slot(elem, path=node.path)
         self.emit(("store", elem, self.value(items[2], node.path), slot))
-        handle = self.value(items[1], node.path)
         address = self.temp()
         self.emit(("bitcast", address, Ptr(elem), _VOID_PTR, slot))
         path = self._c_argument(node.path)

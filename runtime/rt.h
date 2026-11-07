@@ -216,7 +216,9 @@ void rt_join(rt_thread *t, const char *path);
 
 /* A new error-checking mutex. Relocking it from the thread that holds it is an
  * error (EDEADLK) rather than a hang, and so is unlocking it from another
- * thread; both panic R0005. The mutex is untracked and lives for the process. */
+ * thread; both panic R0005. This is the limit of that check: a thread that
+ * exits while still holding the mutex cannot be seen, so the next lock of it
+ * blocks forever. The mutex is untracked and lives for the process. */
 rt_mutex *rt_mutex_new(const char *path);
 void rt_mutex_lock(rt_mutex *m, const char *path);
 void rt_mutex_unlock(rt_mutex *m, const char *path);

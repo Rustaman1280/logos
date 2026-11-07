@@ -52,6 +52,17 @@ def lowered(source: str) -> ir.IrModule:
     return lower.lower_module(checked(source))
 
 
+def checked_importing(sources: dict[str, str], source: str) -> CheckedModule:
+    """Check ``source`` with ``sources`` answering its ``(use ...)`` forms."""
+
+    def loader(name: str):
+        if name not in sources:
+            raise FileNotFoundError(name)
+        return parse(sources[name], f"{name}.logos")
+
+    return check_module(resolve(parse(source, "m.logos"), loader))
+
+
 def emitted(source: str) -> str:
     return llvm.emit(lowered(source))
 
@@ -209,6 +220,48 @@ class ThreadTypeTest(unittest.TestCase):
         )
         self.assertEqual(type_of(cm, "spawn"), Prim("thread"))
 
+    def test_a_pointer_field_in_a_struct_handed_to_spawn_is_e0700(self):
+        # The copy carries the address across the boundary even though the
+        # argument's spelling — `holder` — never says `(ptr ...)`.
+        error = fail_on(
+            "(mod m)(type holder (struct (p (ptr :i64))))"
+            "(fn w :void ((h holder)) (ret))"
+            "(fn f :void ((h holder)) (spawn w h))"
+        )
+        self.assertEqual(error.code, "E0700")
+        self.assertEqual(error.path, "m/f/2")
+
+    def test_an_array_of_pointers_in_a_struct_handed_to_spawn_is_e0700(self):
+        error = fail_on(
+            "(mod m)(type holder (struct (a (arr (ptr :i64) 2))))"
+            "(fn w :void ((h holder)) (ret))"
+            "(fn f :void ((h holder)) (spawn w h))"
+        )
+        self.assertEqual(error.code, "E0700")
+        self.assertEqual(error.path, "m/f/2")
+
+    def test_a_pointer_deep_in_nested_aggregates_is_e0700(self):
+        error = fail_on(
+            "(mod m)(type inner (struct (p (ptr :i64))))"
+            "(type outer (struct (i inner)))"
+            "(fn w :void ((o outer)) (ret))"
+            "(fn f :void ((o outer)) (spawn w o))"
+        )
+        self.assertEqual(error.code, "E0700")
+
+    def test_a_marked_pointer_in_an_aggregate_field_is_still_legal(self):
+        # The marker is a stop, wherever it is written: the field is already
+        # accounted for, so the struct may cross a thread boundary.
+        for field in ("(p (shared (ptr :i64)))",
+                      "(a (arr (shared (ptr :i64)) 2))"):
+            with self.subTest(field=field):
+                cm = checked(
+                    f"(mod m)(type holder (struct {field}))"
+                    "(fn w :void ((h holder)) (ret))"
+                    "(fn f :void ((h holder)) (let t (spawn w h)) (join t))"
+                )
+                self.assertEqual(type_of(cm, "spawn"), Prim("thread"))
+
     def test_a_thread_cannot_be_started_with_a_vector(self):
         error = fail_on(
             "(mod m)(fn w :void ((v (vec :i64))) (vec-free v))"
@@ -255,6 +308,22 @@ class ThreadTypeTest(unittest.TestCase):
         )
         self.assertEqual(error.code, "E0103")
         self.assertIn("helper", error.message)
+        self.assertIn("test-local", error.message)
+
+    def test_an_imported_function_cannot_be_spawned_and_says_why(self):
+        # A different reason with the same answer: the definition exists, but
+        # in another module, so this module has no symbol to point a thunk at.
+        try:
+            checked_importing(
+                {"lib": "(mod lib)(fn work :void () (ret))"},
+                "(mod m)(use lib)(fn f :void () (spawn work))",
+            )
+        except LogosError as error:
+            self.assertEqual(error.code, "E0103")
+            self.assertIn("imported", error.message)
+            self.assertIn("not lowered yet", error.message)
+        else:
+            self.fail("spawning an imported function was accepted")
 
     def test_a_channel_cannot_carry_a_capturing_closure(self):
         error = fail_on(
@@ -351,6 +420,23 @@ class ThreadLoweringTest(unittest.TestCase):
             "(fn f :void () (let c (chan pair 4)))"
         )
         self.assertIn("call i8* @rt_chan_new(i64 16, i64 4,", text)
+
+    def test_send_evaluates_its_channel_before_its_element(self):
+        # Operands left to right, like every other form: a send whose channel
+        # is a call blocks on that call before it evaluates the element, so
+        # `(send (recv a) (/ 1 0))` waits on the channel rather than panicking.
+        module = lowered(
+            "(mod m)(fn ch :(shared (chan :i64)) ()"
+            " (letmut c (chan :i64 2)) (ret c))"
+            "(fn n :i64 () (ret 1))"
+            "(fn f :void () (send (ch) (n)))"
+        )
+        f = next(fn for fn in module.functions if fn.symbol == "lg.m.f")
+        order = callees(f)
+        self.assertIn("lg.m.ch", order)
+        self.assertIn("lg.m.n", order)
+        self.assertLess(order.index("lg.m.ch"), order.index("lg.m.n"))
+        self.assertEqual(order[-1], "rt_chan_send")
 
     def test_a_shared_pointer_deref_uses_the_pointee_type(self):
         text = emitted(
@@ -574,6 +660,14 @@ class RuntimeThreadProbeTest(unittest.TestCase):
         cls.tracker = build_probe("thread-probe-tracker", TRACKER_PROBE)
         cls.leak = build_probe("thread-probe-leak", LEAK_PROBE)
         cls.primitive = build_probe("thread-probe-primitive", PRIMITIVE_PROBE)
+        cls.null_atomic = build_probe("thread-probe-atomic-null", r"""
+#include "rt.h"
+
+int main(void) {
+    (void)rt_atomic_load(NULL);
+    return 0;
+}
+""")
 
     def test_concurrent_alloc_and_free_leaves_no_leak(self):
         done = subprocess.run([self.tracker], capture_output=True, text=True)
@@ -594,6 +688,13 @@ class RuntimeThreadProbeTest(unittest.TestCase):
         done = subprocess.run([self.primitive], capture_output=True, text=True)
         self.assertEqual(done.stdout, "500500\n41\n", done.stderr)
         self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_null_atomic_handle_panics_r0005(self):
+        # Every other concurrency failure is R0005, `thread operation failed`;
+        # a null handle is one, not a runtime range check.
+        done = subprocess.run([self.null_atomic], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("R0005: atomic handle is null", done.stderr)
 
 
 class RuntimeMutexProbeTest(unittest.TestCase):

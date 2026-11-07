@@ -2955,14 +2955,24 @@ class _Checker:
                 "main is the entry point and cannot be started as a thread",
             )
         if name not in self._bodies:
-            # A test-local helper is checked but not lowered: its symbol does
-            # not exist, so a thunk calling it could not link. Same rule as a
-            # function value (E0103).
+            # Two different reasons share this rule. A test-local helper is
+            # checked but not lowered: its symbol does not exist, so a thunk
+            # calling it could not link. An imported function is a module
+            # function, but in another module — this module lowers only its own
+            # definitions, so that symbol is not in this object file. Both are
+            # E0103, like a function value; the message says which.
+            if any(name in module.fns for module in self.module.imports.values()):
+                raise diag(
+                    UNKNOWN_FUNCTION,
+                    _at(target, node),
+                    f"cannot start '{name}' as a thread: imported functions "
+                    "are not lowered yet",
+                )
             raise diag(
                 UNKNOWN_FUNCTION,
                 _at(target, node),
-                f"cannot start '{name}' as a thread: only a module function "
-                "has a lowered definition",
+                f"cannot start '{name}' as a thread: '{name}' is a test-local "
+                "helper with no lowered definition",
             )
         if name in self._params:
             raise diag(
@@ -2995,7 +3005,7 @@ class _Checker:
                     "a thread argument is copied into the new thread; "
                     "a value that owns memory cannot be copied across",
                 )
-            if isinstance(ty, Ptr) or _shared_state(ty):
+            if self._unmarked_share(ty):
                 raise diag(SHARED_MARKER, _at(arg, node), _SHARED_MARKER)
             if not compatible(param, ty):
                 raise diag(
@@ -3008,6 +3018,48 @@ class _Checker:
                 # a callee's is; the caller's copy is discharged by the handoff.
                 self._handled(arg, env)
         return Prim("thread")
+
+    def _unmarked_share(self, ty: Ty, seen: frozenset[str] = frozenset()) -> bool:
+        """Whether ``ty`` is, or holds at any depth, shared state with no marker.
+
+        A thread argument is *copied* into the new thread, and a struct or an
+        array copy carries every field with it: a raw address in a field
+        crosses the boundary exactly as a bare ``(ptr T)`` argument does, while
+        the argument's spelling — ``holder`` — says nothing about it. So the
+        check descends through aggregates, the same way the move check does,
+        and the ``(shared ...)`` marker is a stop: below it the state is
+        already accounted for, and ``(shared (ptr T))`` in a field is legal.
+        A bare mutex, channel or atomic cannot appear in a field (their own
+        declaration rules refuse it), but they are named here so one reachable
+        by any future route is refused too.
+        """
+        if isinstance(ty, Shared):
+            return False
+        if isinstance(ty, (Ptr, Chan, Atomic)):
+            return True
+        if isinstance(ty, Prim):
+            return ty.name == "mutex"
+        if isinstance(ty, (Arr, Vec, Opt)):
+            return self._unmarked_share(ty.elem, seen)
+        if isinstance(ty, Res):
+            return self._unmarked_share(ty.ok, seen) or self._unmarked_share(ty.err, seen)
+        if isinstance(ty, StructRef):
+            if ty.name in seen:
+                return False
+            inner = seen | {ty.name}
+            return any(
+                self._unmarked_share(field, inner)
+                for _name, field in self._structs.get(ty.name, ())
+            )
+        if isinstance(ty, EnumRef):
+            if ty.name in seen:
+                return False
+            inner = seen | {ty.name}
+            return any(
+                payload is not None and self._unmarked_share(payload, inner)
+                for _variant, payload in self._enums.get(ty.name, ())
+            )
+        return False
 
     def _join(self, node: Node, env: _Env) -> Ty:
         """``(join t)``: wait for a thread to finish; the handle is used up."""

@@ -832,21 +832,21 @@ rt_atomic *rt_atomic_new(long long value) {
 
 long long rt_atomic_add(rt_atomic *a, long long delta) {
     if (a == NULL) {
-        rt_panic(NULL, "R0003", "atomic handle is null");
+        rt_panic(NULL, "R0005", "atomic handle is null");
     }
     return __atomic_add_fetch(&a->value, delta, __ATOMIC_SEQ_CST);
 }
 
 long long rt_atomic_load(rt_atomic *a) {
     if (a == NULL) {
-        rt_panic(NULL, "R0003", "atomic handle is null");
+        rt_panic(NULL, "R0005", "atomic handle is null");
     }
     return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST);
 }
 
 void rt_atomic_store(rt_atomic *a, long long value) {
     if (a == NULL) {
-        rt_panic(NULL, "R0003", "atomic handle is null");
+        rt_panic(NULL, "R0005", "atomic handle is null");
     }
     __atomic_store_n(&a->value, value, __ATOMIC_SEQ_CST);
 }

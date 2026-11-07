@@ -224,7 +224,10 @@ module function returning `:void`; its arguments are copied into one heap
 record that the thread owns, so a value that owns memory (a vector, an owner)
 cannot cross — E0402. A raw pointer or a synchronization handle crosses only
 when its type is marked `(shared ...)` — E0700 — because two threads reaching
-one object is exactly what the marker exists to show. `(join t)` waits and
+one object is exactly what the marker exists to show. The check descends into
+aggregates the way the move check does: a bare `(ptr T)` in a struct field or
+an array element is E0700 at the argument, while a `(shared (ptr T))` field is
+already marked and stays legal. `(join t)` waits and
 releases the handle; joining one twice is R0005.
 
 `(mutex)` returns a `(shared :mutex)`; `lock`/`unlock` take it. The mutex is
