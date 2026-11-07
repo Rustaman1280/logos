@@ -628,6 +628,16 @@ def _compare(
     return problems
 
 
+def expectation_of(test: Node) -> tuple[Expectation | None, int | None]:
+    """Read one test's directives for a caller outside the runner.
+
+    The generator of the manual embeds the same ``(expect ...)`` the runner
+    compares against, so both read it here rather than in two places that could
+    drift. A malformed directive raises :class:`DirectiveError`.
+    """
+    return _expectation(test)
+
+
 def _expectation(test: Node) -> tuple[Expectation | None, int | None]:
     """Read one test's directives, or raise :class:`DirectiveError`.
 
