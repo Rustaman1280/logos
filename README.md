@@ -78,18 +78,21 @@ the module-level `(expect-error E0xxx)` of a negative case, runs every case at
 The baseline records the optimisation levels it ran (`OPTS -O0 -O2`), one line
 per case and the suite's leak total; a case that passed in the baseline and
 fails now is a regression and exits 1, as is a full run that leaks more than
-the baseline recorded at the same levels. `--update-baseline` with `--only`
+the baseline recorded at the same levels. A baseline that has no `OPTS` line
+cannot be compared and is refused with a request to regenerate it, rather than
+silently leaving the leak total ungated. `--update-baseline` with `--only`
 merges: it rewrites the cases it ran, drops the ones the category no longer
 contains, and keeps the rest. A `.logos` file outside the known categories
 (`parse`, `type`, `exec`, `mem`, `thread`, `generics`, `regress`, `diff`) is
 reported and fails the run rather than being skipped.
 
 `tools/accept.sh` is the end-to-end gate: the corpus, `tests/diff/run_diff.sh`
-(Logos against gcc at `-O0` and `-O2`), the three example programs against
-`wc`, `jq` and a C reference build, `logosc fmt` idempotency over every
-`.logos` file in the tree, and a generated 200-function program with structs,
-a generic and a thread that must compile in under five seconds. It exits 0
-only when every section prints PASS.
+(Logos against gcc at `-O0` and `-O2`, floored by `tests/diff/manifest.txt`),
+the three example programs against `wc`, `jq` and a C reference build,
+`logosc fmt` idempotency over every `.logos` file in the tree, and a generated
+200-function program with structs, a generic and a thread that must compile in
+under five seconds. A section that examined zero items is a failure, and the
+script exits 0 only when all seven sections print PASS.
 
 The IR is always kept beside the binary under `build/`: it is the artefact to
 read when a compiled program misbehaves.
@@ -103,13 +106,20 @@ read when a compiled program misbehaves.
 | `examples/matrix.logos` | multiplies two 200x200 matrices on four threads | `examples/matrix_ref.c` |
 
 `wc` reads through `(read-all)` and prints GNU wc's three seven-wide columns in
-GNU's order: lines, words, bytes. `json` is a recursive-descent parser over
-`(res :i64 json-error)` that validates every value, including string escapes
-and number grammar, and counts objects, arrays, members, scalars and nesting
-depth. `matrix` fills two matrices from a fixed integer pattern, hands each of
-four threads fifty rows through `(shared (ptr :i64))`, and prints a checksum,
-a weighted checksum, the centre cell and the last cell. `examples/sample.json`
-is the JSON fixture the acceptance script feeds to both the program and jq.
+GNU's order: lines, words, bytes. It splits words on the same set GNU does:
+ASCII space and the C-locale controls, then the UTF-8 space separators
+(U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F, U+3000); U+2028 and U+2029
+are line and paragraph separators, not spaces, and GNU wc does not split there
+either. `json` is a recursive-descent parser over `(res :i64 json-error)` that
+validates every value, including string escapes and number grammar, counts
+objects, arrays, members, scalars and nesting depth, and resolves duplicate
+keys the way jq does (the last member wins). `matrix` fills two matrices from a
+fixed integer pattern, hands each of four threads fifty rows through
+`(shared (ptr :i64))`, and prints a checksum, a weighted checksum, the centre
+cell and the last cell. `examples/sample.json` is the JSON fixture the
+acceptance script feeds to both the program and jq; `examples/inputs/` holds
+the Unicode word-separator inputs and the duplicate-key and malformed JSON
+documents the script also compares.
 
 ## Development
 

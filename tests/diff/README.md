@@ -25,7 +25,13 @@ directive corpus under `tests/exec` and `tests/mem`, not here.
 
 1. Write `X.logos` with a `main` that prints what it computes.
 2. Write `X.c` doing the same with the same types and return code.
-3. Run `bash tests/diff/run_diff.sh --verbose`.
+3. Add `X` on its own line in `manifest.txt`.
+4. Run `bash tests/diff/run_diff.sh --verbose`.
+
+The manifest is the corpus's floor: the script fails when a named case is
+missing either half, when a pair exists that the manifest does not name, or
+when the manifest lists fewer than three cases. Deleting a case therefore
+fails the run rather than shrinking it to a vacuously green one.
 
 The files carry no `(test ...)` node, so the directive harness under
 `python3 -m logos test` ignores them and `tests/diff` contributes no cases to

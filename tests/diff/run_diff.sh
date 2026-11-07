@@ -13,9 +13,14 @@
 # C, so no case may depend on them; a case that needs to pin Logos's defined
 # wrap would be testing C's absence of a guarantee, not C's behaviour.
 #
+# The corpus has a floor. tests/diff/manifest.txt names every case the oracle
+# promises: a named case must have both a .logos and a .c, a pair that exists
+# must be named, and the manifest must list at least MIN_CASES. Deleting a case
+# therefore fails the run instead of shrinking it to a vacuously green one.
+#
 # Usage: bash tests/diff/run_diff.sh [--verbose]
-# Exit:  0 when every case agrees, 1 on the first disagreement's summary, 2 on
-#        a missing tool.
+# Exit:  0 when every case agrees, 1 on a disagreement, a corpus below the
+#        floor, or a missing twin, 2 on a missing tool.
 
 set -u
 
@@ -67,11 +72,59 @@ if [[ ${#sources[@]} -eq 0 ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The floor: the manifest names the cases this oracle must run.
+# ---------------------------------------------------------------------------
+MANIFEST="$DIR/manifest.txt"
+MIN_CASES=3
+if [[ ! -f "$MANIFEST" ]]; then
+    echo "run_diff: no manifest at tests/diff/manifest.txt" >&2
+    exit 1
+fi
+
+expected=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    expected+=("$line")
+done < "$MANIFEST"
+
+if [[ ${#expected[@]} -lt $MIN_CASES ]]; then
+    printf 'run_diff: tests/diff/manifest.txt names %d case(s); at least %d are required\n' \
+        "${#expected[@]}" "$MIN_CASES" >&2
+    exit 1
+fi
+
+in_manifest() {
+    local name=$1 candidate
+    for candidate in "${expected[@]}"; do
+        if [[ "$candidate" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+for name in "${expected[@]}"; do
+    if [[ ! -f "$DIR/$name.logos" ]]; then
+        fail "$name" "named in tests/diff/manifest.txt but tests/diff/$name.logos is missing"
+    fi
+    if [[ ! -f "$DIR/$name.c" ]]; then
+        fail "$name" "named in tests/diff/manifest.txt but tests/diff/$name.c is missing"
+    fi
+done
+
 for source in "${sources[@]}"; do
     name="$(basename "$source" .logos)"
     twin="$DIR/$name.c"
     cases=$((cases + 1))
 
+    if ! in_manifest "$name"; then
+        fail "$name" "tests/diff/$name.logos is not named in tests/diff/manifest.txt"
+        continue
+    fi
     if [[ ! -f "$twin" ]]; then
         fail "$name" "no C twin at tests/diff/$name.c"
         continue

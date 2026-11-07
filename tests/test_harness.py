@@ -893,6 +893,43 @@ class OptLevelBaselineTest(unittest.TestCase):
             )
             self.assertEqual([case for case, _ in problems], ["suite/leaks"])
 
+    def test_a_baseline_without_the_header_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            baseline = root / "summary.txt"
+            tester.write_baseline(tester.run_suite(str(root), None, ["-O0"]), baseline)
+            baseline.write_text(
+                "\n".join(
+                    line
+                    for line in baseline.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith("OPTS ")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(tester.SuiteError) as caught:
+                tester.compare_baseline(
+                    tester.run_suite(str(root), None, ["-O0"]), baseline
+                )
+            message = str(caught.exception)
+            self.assertIn("no OPTS header", message)
+            self.assertIn("--update-baseline", message)
+
+    def test_the_command_line_refuses_a_headerless_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            baseline = root / "summary.txt"
+            tester.write_baseline(tester.run_suite(str(root), None, ["-O0"]), baseline)
+            baseline.write_text("PASS exec/hello/prints -\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["test", str(root), "--opt", "-O0"])
+            self.assertEqual(code, 1)
+            self.assertIn("no OPTS header", err.getvalue())
+            self.assertIn("regenerate it with --update-baseline", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

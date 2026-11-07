@@ -1,0 +1,11 @@
+# The cases the differential oracle promises to run, one name per line.
+#
+# run_diff.sh fails when a case named here has no X.logos and X.c pair, and it
+# fails when a pair exists that this file does not name. Deleting a case can
+# therefore never turn the oracle green: the manifest is the floor, and a
+# corpus smaller than MIN_CASES is a failure in its own right.
+#
+# Names are basenames without the .logos extension.
+arith
+strings
+arrays

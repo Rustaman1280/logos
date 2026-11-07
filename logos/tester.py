@@ -47,8 +47,10 @@ covered in full. :func:`compare_baseline` reports a case that passed before and
 fails now, a case in the baseline that a full run no longer contains (even when
 its whole category directory went away), a new case with no baseline result,
 and a full run whose total leak count exceeds the recorded one at the same
-levels. The suite root keeps its own baseline, so the repository's is
-``tests/summary.txt``.
+levels. A baseline that predates the ``OPTS`` line is refused rather than
+compared, so an old file cannot switch the leak gate off by lacking a header;
+regenerating it with ``--update-baseline`` writes the header. The suite root
+keeps its own baseline, so the repository's is ``tests/summary.txt``.
 """
 
 from __future__ import annotations
@@ -705,7 +707,8 @@ class _Baseline:
     records: list[tuple[str, str, str]]
     total: int | None
     #: The levels the total was taken at, or ``None`` when the file predates
-    #: the header. A total with no levels cannot be compared with any run.
+    #: the header. A total with no levels cannot be compared with any run, so
+    #: :func:`compare_baseline` refuses such a file instead of ungating it.
     opts: tuple[str, ...] | None
 
 
@@ -856,12 +859,21 @@ def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
     suite green. The problem names both totals. The totals only compare when
     the recorded levels and the run's levels are the same, because one level
     runs half as many executions as two and its total is a different number for
-    an identical suite; a baseline with no levels line cannot be compared at
-    all and is not gated.
+    an identical suite.
+
+    A baseline with no ``OPTS`` header cannot be compared at all, so it is
+    refused rather than silently ungated: an old file must not be able to
+    switch off the leak total by lacking a line. The refusal tells the reader
+    to regenerate the baseline, which a full ``--update-baseline`` run does.
     """
     baseline = _read_baseline(path)
     if baseline is None:
         return []
+    if baseline.opts is None:
+        raise SuiteError(
+            f"{path}: baseline has no OPTS header, so its leak total cannot be "
+            "compared with this run; regenerate it with --update-baseline"
+        )
     total = baseline.total
     previous = {case_id: status for status, case_id, _ in baseline.records}
     current = {case.id: case for case in summary.cases}
