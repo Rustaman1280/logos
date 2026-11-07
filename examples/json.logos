@@ -1,0 +1,385 @@
+(mod json)
+
+(type json-error (enum (unexpected :i64) (truncated :i64)))
+
+(fn char-at :str ((s :str) (i :i64))
+  (ret (str-slice s i (+ i 1))))
+
+(fn is-digit :bool ((c :str))
+  (ret (or (= c "0")
+         (or (= c "1")
+           (or (= c "2")
+             (or (= c "3")
+               (or (= c "4")
+                 (or (= c "5")
+                   (or (= c "6")
+                     (or (= c "7")
+                       (or (= c "8")
+                         (= c "9"))))))))))))
+
+(fn is-hex :bool ((c :str))
+  (ret (or (is-digit c)
+         (or (= c "a")
+           (or (= c "b")
+             (or (= c "c")
+               (or (= c "d")
+                 (or (= c "e")
+                   (or (= c "f")
+                     (or (= c "A")
+                       (or (= c "B")
+                         (or (= c "C")
+                           (or (= c "D")
+                             (or (= c "E")
+                               (= c "F")))))))))))))))
+
+(fn is-space :bool ((c :str))
+  (ret (or (= c " ")
+         (or (= c "\t")
+           (or (= c "\n")
+             (= c "\r"))))))
+
+(fn skip-space :i64 ((s :str) (start :i64))
+  (let n (str-len s))
+  (letmut i start)
+  (while (and (< i n)
+           (is-space (char-at s i)))
+    (set i (+ i 1)))
+  (ret i))
+
+(fn digits-end :i64 ((s :str) (start :i64))
+  (let n (str-len s))
+  (letmut i start)
+  (while (and (< i n)
+           (is-digit (char-at s i)))
+    (set i (+ i 1)))
+  (ret i))
+
+(fn bump :void ((c (ptr :i64)) (slot :i64))
+  (set-deref (ptr-add c slot)
+    (+ (deref (ptr-add c slot)) 1)))
+
+(fn count-of :i64 ((c (ptr :i64)) (slot :i64))
+  (ret (deref (ptr-add c slot))))
+
+(fn counted-index :i64 ((c (ptr :i64)) (slot :i64) (index :i64))
+  (bump c slot)
+  (ret index))
+
+(fn count-object :void ((c (ptr :i64)))
+  (bump c 0))
+
+(fn count-array :void ((c (ptr :i64)))
+  (bump c 1))
+
+(fn count-member :void ((c (ptr :i64)))
+  (bump c 2))
+
+(fn count-string :void ((c (ptr :i64)))
+  (bump c 3))
+
+(fn count-number :void ((c (ptr :i64)))
+  (bump c 4))
+
+(fn count-boolean :void ((c (ptr :i64)))
+  (bump c 5))
+
+(fn count-null :void ((c (ptr :i64)))
+  (bump c 6))
+
+(fn note-depth :void ((c (ptr :i64)) (depth :i64))
+  (set-deref (ptr-add c 7)
+    (if (> depth (count-of c 7)) depth
+      (count-of c 7))))
+
+(fn skip-escape :
+  (res :i64 json-error) ((s :str) (slash :i64))
+  (if (> (+ slash 2)
+        (str-len s))
+    (ret (err (truncated slash)))
+    (ret (escape-tail s slash (char-at s (+ slash 1))))))
+
+(fn escape-tail :
+  (res :i64 json-error) ((s :str) (slash :i64) (letter :str))
+  (if (or (= letter "\"")
+        (or (= letter "\\")
+          (or (= letter "/")
+            (or (= letter "b")
+              (or (= letter "f")
+                (or (= letter "n")
+                  (or (= letter "r")
+                    (= letter "t"))))))))
+    (ret (ok (+ slash 2)))
+    (if (= letter "u")
+      (ret (unicode-escape s slash))
+      (ret (err (unexpected (+ slash 1)))))))
+
+(fn unicode-escape :
+  (res :i64 json-error) ((s :str) (slash :i64))
+  (let start (+ slash 2))
+  (if (> (+ start 4)
+        (str-len s))
+    (ret (err (truncated slash)))
+    (ret (hex-run s start))))
+
+(fn hex-run :
+  (res :i64 json-error) ((s :str) (start :i64))
+  (letmut k :i64 0)
+  (letmut valid true)
+  (while (< k 4)
+    (set valid (and valid (is-hex (char-at s (+ start k)))))
+    (set k (+ k 1)))
+  (if valid
+    (ret (ok (+ start 4)))
+    (ret (err (unexpected start)))))
+
+(fn string-tail :
+  (res :i64 json-error) ((s :str) (start :i64))
+  (let n (str-len s))
+  (letmut i start)
+  (while (< i n)
+    (let ch (char-at s i))
+    (if (= ch "\"")
+      (ret (ok (+ i 1)))
+      (if (= ch "\\")
+        (set i (try (skip-escape s i)))
+        (set i (+ i 1)))))
+  (ret (err (truncated start))))
+
+(fn parse-string :
+  (res :i64 json-error) ((s :str) (open :i64))
+  (if (= (char-at s open) "\"")
+    (ret (string-tail s (+ open 1)))
+    (ret (err (unexpected open)))))
+
+(fn int-first :
+  (res :i64 json-error) ((s :str) (i :i64) (ch :str))
+  (if (= ch "0")
+    (ret (ok (+ i 1)))
+    (if (is-digit ch)
+      (ret (ok (digits-end s i)))
+      (ret (err (unexpected i))))))
+
+(fn parse-integer :
+  (res :i64 json-error) ((s :str) (i :i64))
+  (if (>= i (str-len s))
+    (ret (err (truncated i)))
+    (ret (int-first s i (char-at s i)))))
+
+(fn parse-fraction :
+  (res :i64 json-error) ((s :str) (i :i64))
+  (let n (str-len s))
+  (if (and (< i n)
+        (= (char-at s i) "."))
+    (if (and (< (+ i 1) n)
+          (is-digit (char-at s (+ i 1))))
+      (ret (ok (digits-end s (+ i 1))))
+      (ret (err (unexpected i))))
+    (ret (ok i))))
+
+(fn exp-tail :
+  (res :i64 json-error) ((s :str) (start :i64))
+  (let n (str-len s))
+  (let k (if (and (< start n)
+               (or (= (char-at s start) "+")
+                 (= (char-at s start) "-")))
+           (+ start 1) start))
+  (if (and (< k n)
+        (is-digit (char-at s k)))
+    (ret (ok (digits-end s k)))
+    (ret (err (unexpected k)))))
+
+(fn parse-exponent :
+  (res :i64 json-error) ((s :str) (i :i64))
+  (let n (str-len s))
+  (if (and (< i n)
+        (or (= (char-at s i) "e")
+          (= (char-at s i) "E")))
+    (ret (exp-tail s (+ i 1)))
+    (ret (ok i))))
+
+(fn parse-number :
+  (res :i64 json-error) ((s :str) (start :i64))
+  (let n (str-len s))
+  (let signed (if (and (< start n)
+                    (= (char-at s start) "-"))
+                (+ start 1) start))
+  (let integer (try (parse-integer s signed)))
+  (let fraction (try (parse-fraction s integer)))
+  (let exponent (try (parse-exponent s fraction)))
+  (ret (ok exponent)))
+
+(fn parse-number-value :
+  (res :i64 json-error) ((s :str) (i :i64) (c (ptr :i64)))
+  (let end (try (parse-number s i)))
+  (ret (ok (counted-index c 4 end))))
+
+(fn parse-string-value :
+  (res :i64 json-error) ((s :str) (i :i64) (c (ptr :i64)))
+  (let end (try (parse-string s i)))
+  (ret (ok (counted-index c 3 end))))
+
+(fn literal-check :
+  (res :i64 json-error) ((s :str) (i :i64) (word :str) (end :i64) (c (ptr :i64)) (slot :i64))
+  (if (= (str-slice s i end) word)
+    (ret (ok (counted-index c slot end)))
+    (ret (err (unexpected i)))))
+
+(fn literal :
+  (res :i64 json-error) ((s :str) (i :i64) (word :str) (c (ptr :i64)) (slot :i64))
+  (let end (+ i (str-len word)))
+  (if (> end (str-len s))
+    (ret (err (truncated i)))
+    (ret (literal-check s i word end c slot))))
+
+(fn parse-value :
+  (res :i64 json-error) ((s :str) (start :i64) (c (ptr :i64)) (depth :i64))
+  (let i (skip-space s start))
+  (if (>= i (str-len s))
+    (ret (err (truncated i)))
+    (ret (value-at s i c depth))))
+
+(fn value-at :
+  (res :i64 json-error) ((s :str) (i :i64) (c (ptr :i64)) (depth :i64))
+  (let ch (char-at s i))
+  (if (= ch "{")
+    (ret (parse-object s i c depth))
+    (if (= ch "[")
+      (ret (parse-array s i c depth))
+      (if (= ch "\"")
+        (ret (parse-string-value s i c))
+        (if (= ch "t")
+          (ret (literal s i "true" c 5))
+          (if (= ch "f")
+            (ret (literal s i "false" c 5))
+            (if (= ch "n")
+              (ret (literal s i "null" c 6))
+              (if (or (= ch "-")
+                    (is-digit ch))
+                (ret (parse-number-value s i c))
+                (ret (err (unexpected i)))))))))))
+
+(fn parse-object :
+  (res :i64 json-error) ((s :str) (open :i64) (c (ptr :i64)) (depth :i64))
+  (count-object c)
+  (note-depth c depth)
+  (let i (skip-space s (+ open 1)))
+  (if (>= i (str-len s))
+    (ret (err (truncated i)))
+    (if (= (char-at s i) "}")
+      (ret (ok (+ i 1)))
+      (ret (object-members s i c depth)))))
+
+(fn object-members :
+  (res :i64 json-error) ((s :str) (start :i64) (c (ptr :i64)) (depth :i64))
+  (let n (str-len s))
+  (letmut i start)
+  (letmut end :i64 -1)
+  (while (< end 0)
+    (set i (try (object-member s i c depth)))
+    (let separator (skip-space s i))
+    (if (= separator n)
+      (set end -1)
+      (if (= (char-at s separator) ",")
+        (set i (skip-space s (+ separator 1)))
+        (if (= (char-at s separator) "}")
+          (set end (+ separator 1))
+          (ret (err (unexpected separator)))))))
+  (if (< end 0)
+    (ret (err (truncated i)))
+    (ret (ok end))))
+
+(fn object-member :
+  (res :i64 json-error) ((s :str) (i :i64) (c (ptr :i64)) (depth :i64))
+  (if (>= i (str-len s))
+    (ret (err (truncated i)))
+    (ret (object-key s i c depth))))
+
+(fn object-key :
+  (res :i64 json-error) ((s :str) (i :i64) (c (ptr :i64)) (depth :i64))
+  (if (= (char-at s i) "\"")
+    (ret (object-colon s (try (parse-string s i)) c depth))
+    (ret (err (unexpected i)))))
+
+(fn object-colon :
+  (res :i64 json-error) ((s :str) (key-end :i64) (c (ptr :i64)) (depth :i64))
+  (count-member c)
+  (let colon (skip-space s key-end))
+  (if (>= colon (str-len s))
+    (ret (err (truncated colon)))
+    (if (= (char-at s colon) ":")
+      (ret (parse-value s
+             (+ colon 1) c
+             (+ depth 1)))
+      (ret (err (unexpected colon))))))
+
+(fn parse-array :
+  (res :i64 json-error) ((s :str) (open :i64) (c (ptr :i64)) (depth :i64))
+  (count-array c)
+  (note-depth c depth)
+  (let i (skip-space s (+ open 1)))
+  (if (>= i (str-len s))
+    (ret (err (truncated i)))
+    (if (= (char-at s i) "]")
+      (ret (ok (+ i 1)))
+      (ret (array-items s i c depth)))))
+
+(fn array-items :
+  (res :i64 json-error) ((s :str) (start :i64) (c (ptr :i64)) (depth :i64))
+  (let n (str-len s))
+  (letmut i start)
+  (letmut end :i64 -1)
+  (while (< end 0)
+    (set i (try (parse-value s i c (+ depth 1))))
+    (let separator (skip-space s i))
+    (if (= separator n)
+      (set end -1)
+      (if (= (char-at s separator) ",")
+        (set i (skip-space s (+ separator 1)))
+        (if (= (char-at s separator) "]")
+          (set end (+ separator 1))
+          (ret (err (unexpected separator)))))))
+  (if (< end 0)
+    (ret (err (truncated i)))
+    (ret (ok end))))
+
+(fn parse-document :
+  (res :i64 json-error) ((s :str) (c (ptr :i64)))
+  (let end (try (parse-value s 0 c 1)))
+  (let rest (skip-space s end))
+  (if (= rest (str-len s))
+    (ret (ok rest))
+    (ret (err (unexpected rest)))))
+
+(fn summary :i64 ((c (ptr :i64)))
+  (print "{\"objects\":")
+  (print (count-of c 0))
+  (print ",\"arrays\":")
+  (print (count-of c 1))
+  (print ",\"members\":")
+  (print (count-of c 2))
+  (print ",\"strings\":")
+  (print (count-of c 3))
+  (print ",\"numbers\":")
+  (print (count-of c 4))
+  (print ",\"booleans\":")
+  (print (count-of c 5))
+  (print ",\"nulls\":")
+  (print (count-of c 6))
+  (print ",\"depth\":")
+  (print (count-of c 7))
+  (println "}")
+  (ret 0))
+
+(fn report :i64 ((e json-error))
+  (ret (match e ((unexpected i) (print "invalid json: unexpected byte ") (println i) 2) ((truncated i) (print "invalid json: truncated at byte ") (println i) 2))))
+
+(fn main :i64 ()
+  (let text (read-all))
+  (let counts (alloc :i64 8))
+  (letmut i :i64 0)
+  (while (< i 8)
+    (set-deref (ptr-add (ptr counts) i) 0)
+    (set i (+ i 1)))
+  (let status (match (parse-document text (ptr counts)) ((ok end) (summary (ptr counts))) ((err e) (report e))))
+  (free counts)
+  (ret status))

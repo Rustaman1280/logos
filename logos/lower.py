@@ -177,7 +177,9 @@ three unsigned compares, then panics ``R0003``. ``str-concat`` is one call to
 ``:str`` owns nothing, so there is no one to hand the buffer back. ``str-eq``
 and ``=``/``!=`` on ``:str`` are the same lowering: compare the lengths, and
 only when they agree compare the bytes with ``memcmp``. ``!=`` inverts that
-answer.
+answer. ``read-all`` is one call to ``rt_read_all``, which reads standard input
+to end of file into a buffer of the same kind: process-lifetime, untracked,
+and released by nobody because no binding owns it.
 
 Vectors
 -------
@@ -438,6 +440,14 @@ _RT_STR_CONCAT = IrDecl(
     (_VOID_PTR, Prim("i64"), _VOID_PTR, Prim("i64"), Ptr(Prim("i64"))),
     _VOID_PTR,
 )
+
+#: ``unsigned char *rt_read_all(size_t *out_len, const char *path)``. The whole
+#: of standard input, in a buffer the runtime owns for the process's life — the
+#: same ownership ``rt_str_concat`` gives its result, for the same reason: a
+#: ``:str`` owns nothing, so a buffer it could not release would either leak or
+#: be blamed on a program that cannot free it. The length comes back through a
+#: slot, and ``path`` names the ``read-all`` node for a failed read (R0003).
+_RT_READ_ALL = IrDecl("rt_read_all", (Ptr(Prim("i64")), Ptr(Prim("u8"))), _VOID_PTR)
 
 #: ``int memcmp(const void *a, const void *b, size_t n)``: the byte comparison
 #: inside ``str-eq``. Declared with its real signature so the call is not a
@@ -1735,6 +1745,28 @@ class _Fn:
         self.emit(("sub", size, Prim("i64"), end, start))
         return self.str_value(view, size)
 
+    def read_all(self, node: Node) -> str:
+        """``(read-all)``: one runtime call, one string value.
+
+        The runtime reads until end of file and hands the byte count back
+        through a slot, exactly as ``rt_str_concat`` does: a two-word return
+        would cross the C ABI through an ``sret`` argument and the point of
+        this boundary is to keep it to scalars and pointers. The buffer is the
+        runtime's, untracked, so no ``free`` is owed for it.
+        """
+        items = node.items
+        if len(items) != 1:
+            raise diag(WRONG_ARITY, node.path, "'read-all' takes no arguments")
+        slot = self.slot(Prim("i64"), path=node.path)
+        self.lowering.declare(_RT_READ_ALL)
+        data = self.temp()
+        self.emit(
+            ("call", data, "rt_read_all", (slot, self._c_argument(node.path)))
+        )
+        length = self.temp()
+        self.emit(("load", length, Prim("i64"), slot))
+        return self.str_value(data, length)
+
     # -- vectors ----------------------------------------------------------
 
     def empty_vector(self, ty: Vec, path: str) -> str:
@@ -2520,6 +2552,8 @@ class _Fn:
             return self.str_eq_form(item)
         if kind == "str-slice":
             return self.str_slice(item)
+        if kind == "read-all":
+            return self.read_all(item)
         if kind == "vec-len":
             return self.vec_len(item)
         if kind == "vec-get":

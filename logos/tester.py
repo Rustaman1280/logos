@@ -36,16 +36,18 @@ alone.
 
 Baseline
 --------
-:func:`write_baseline` writes ``<suite root>/summary.txt``: one ``LEAKS N``
-line with the suite's total leak count, then one line per case,
+:func:`write_baseline` writes ``<suite root>/summary.txt``: a ``LEAKS N``
+line with the suite's total leak count, an ``OPTS -O0 -O2`` line naming the
+levels that total came from, then one line per case,
 ``<status> <encoded category>/<case> <detail>``, with statuses ``PASS`` and
 ``FAIL``. Case ids are percent-encoded so a path containing a space cannot
 split a line. A full run replaces the baseline; a filtered run merges into it,
-keeping every line it did not run. :func:`compare_baseline` reports a case that
-passed before and fails now, a case in the baseline that a full run no longer
-contains (even when its whole category directory went away), a new case with
-no baseline result, and a full run whose total leak count exceeds the
-recorded one. The suite root keeps its own baseline, so the repository's is
+rewriting the cases it ran and dropping a stale line under a category it
+covered in full. :func:`compare_baseline` reports a case that passed before and
+fails now, a case in the baseline that a full run no longer contains (even when
+its whole category directory went away), a new case with no baseline result,
+and a full run whose total leak count exceeds the recorded one at the same
+levels. The suite root keeps its own baseline, so the repository's is
 ``tests/summary.txt``.
 """
 
@@ -71,6 +73,12 @@ CATEGORIES = ("parse", "type", "exec", "mem", "thread", "generics", "regress", "
 #: The prefix of the baseline line that records the whole suite's leak total.
 LEAKS = "LEAKS "
 
+#: The prefix of the baseline line that records the optimisation levels the
+#: total came from, ``OPTS -O0 -O2``. One level's total and two levels' total
+#: count different numbers of executions, so they are only comparable when the
+#: recorded levels match the run's.
+LEVELS = "OPTS "
+
 #: The levels every case runs at unless the caller asks for a subset. The
 #: specification requires the whole corpus at both, so both is the default.
 OPTS = ("-O0", "-O2")
@@ -87,6 +95,9 @@ EXPECT_ERROR = re.compile(r"\(\s*expect-error\s+(E[0-9]{4})\s*\)")
 
 #: A clause value that must be an integer literal, not a float or an atom.
 INTEGER = re.compile(r"^[+-]?[0-9]+$")
+
+#: An optimisation level as the command line spells it: ``-O0``, ``-O2``.
+OPT_LEVEL = re.compile(r"^-O[0-9]+$")
 
 
 class SuiteError(Exception):
@@ -125,6 +136,15 @@ class Summary:
     leaks: int = 0
     cases: list[CaseResult] = field(default_factory=list)
     categories: tuple[str, ...] = ()
+    #: The optimisation levels this run executed, in the order it ran them.
+    #: The baseline records them beside its leak total, because a total taken
+    #: at one level is not comparable with a total taken at two.
+    opts: tuple[str, ...] = ()
+    #: Categories whose whole directory this run covered. A filtered update
+    #: may drop a baseline case under one of these that produced no result:
+    #: the category ran, and the case is gone. A category the run saw only
+    #: part of (a single file, a nested directory) is never in this set.
+    covered: tuple[str, ...] = ()
     #: True when the run covered a whole suite (no ``--only``, a directory
     #: root that is not itself one category). A full run is what the baseline
     #: records, so it is also what may report a deleted category missing and
@@ -177,6 +197,8 @@ def run_suite(
     root_path = Path(root)
     files, skipped = _discover(root_path, only)
     summary.categories = tuple(sorted({_category(path) for path in files}))
+    summary.covered = _covered(root_path, only)
+    summary.opts = tuple(levels)
     summary.skipped = skipped
     summary.full = (
         only is None
@@ -237,6 +259,25 @@ def _category_dir(path: Path) -> Path:
         if parent.name in CATEGORIES:
             return parent
     return path.parent
+
+
+def _covered(root: Path, only: str | None) -> tuple[str, ...]:
+    """The categories whose whole directory this run walked.
+
+    A suite root contains every category it knows; ``--only`` narrows that to
+    one. A category directory is the whole of that category. Anything else — a
+    single file, a nested directory, a directory with no category inside —
+    covers no category in full, so a merged update keeps every line it did not
+    see rather than deleting one on a guess.
+    """
+    if not root.is_dir():
+        return ()
+    if root.name in CATEGORIES:
+        return (root.name,) if only in (None, root.name) else ()
+    present = tuple(category for category in CATEGORIES if (root / category).is_dir())
+    if only is None:
+        return present
+    return (only,) if only in present else ()
 
 
 def _run_file(path: Path, opts: list[str], summary: Summary, timeout: float) -> None:
@@ -657,36 +698,62 @@ def baseline_path(root: str | Path) -> Path | None:
     return path / "summary.txt"
 
 
+@dataclass(frozen=True, slots=True)
+class _Baseline:
+    """What a baseline file records: one line per case, and two headers."""
+
+    records: list[tuple[str, str, str]]
+    total: int | None
+    #: The levels the total was taken at, or ``None`` when the file predates
+    #: the header. A total with no levels cannot be compared with any run.
+    opts: tuple[str, ...] | None
+
+
 def write_baseline(summary: Summary, path: Path) -> None:
     """Write the baseline, merging a filtered run into what is already there.
 
     A full run replaces the baseline: it is the record of the whole suite, so
-    it is also what drops a case that no longer exists and what records the
-    suite's leak total. A filtered run only knows the cases it ran, so it
-    rewrites those lines and keeps every other line and the recorded total
-    untouched; updating one category must never delete another's history.
+    it is also what drops a case that no longer exists, what records the
+    suite's leak total, and what records the levels the total came from. A
+    filtered run only knows the cases it ran, so it rewrites those lines and
+    keeps every other line and both headers untouched; updating one category
+    must never delete another's history.
+
+    The one exception is the filter's own ground: a category the run covered in
+    full but from which no case came back has lost that case, so its stale
+    line is dropped. Without that, deleting a fixture and merging the category
+    it lived in would leave a record the next full run reports as missing.
     """
     previous = None if summary.full else _read_baseline(path)
     lines: list[str] = []
     if summary.full:
         total = summary.leaks
+        levels = summary.opts
         lines = [_format_case(case.id, case.status, case.detail) for case in summary.cases]
     else:
-        records = previous[0] if previous is not None else []
-        total = previous[1] if previous is not None else None
+        records = previous.records if previous is not None else []
+        total = previous.total if previous is not None else None
+        levels = previous.opts if previous is not None else None
         current = {case.id: case for case in summary.cases}
         known = {case_id for _, case_id, _ in records}
+        covered = set(summary.covered)
         for status, case_id, detail in records:
             case = current.get(case_id)
             if case is None:
+                if case_id.split("/", 1)[0] in covered:
+                    continue
                 lines.append(f"{status} {_encode_id(case_id)} {detail}")
             else:
                 lines.append(_format_case(case.id, case.status, case.detail))
         for case in summary.cases:
             if case.id not in known:
                 lines.append(_format_case(case.id, case.status, case.detail))
+    header: list[str] = []
     if total is not None:
-        lines.insert(0, f"{LEAKS}{total}")
+        header.append(f"{LEAKS}{total}")
+    if levels:
+        header.append(f"{LEVELS}{' '.join(levels)}")
+    lines = header + lines
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
@@ -694,20 +761,17 @@ def write_baseline(summary: Summary, path: Path) -> None:
 def read_baseline(path: Path) -> dict[str, str] | None:
     """Read a baseline into ``{case id: status}``, or ``None`` if absent.
 
-    The leak-total line is not a case and is omitted here;
-    :func:`compare_baseline` reads it separately.
+    The header lines are not cases and are omitted here;
+    :func:`compare_baseline` reads them separately.
     """
     baseline = _read_baseline(path)
     if baseline is None:
         return None
-    records, _ = baseline
-    return {case_id: status for status, case_id, _ in records}
+    return {case_id: status for status, case_id, _ in baseline.records}
 
 
-def _read_baseline(
-    path: Path,
-) -> tuple[list[tuple[str, str, str]], int | None] | None:
-    """Parse the baseline's case records and its total leak count.
+def _read_baseline(path: Path) -> _Baseline | None:
+    """Parse the baseline's case records, its total and its levels.
 
     A line the harness cannot read is a broken input, not a usage error: it
     raises :class:`SuiteError` naming the file and line, which the caller
@@ -726,6 +790,7 @@ def _read_baseline(
         raise SuiteError(f"{path}: cannot read baseline: {error.strerror}") from None
     records: list[tuple[str, str, str]] = []
     total: int | None = None
+    opts: tuple[str, ...] | None = None
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -737,6 +802,15 @@ def _read_baseline(
                 )
             total = int(value)
             continue
+        if line.startswith(LEVELS):
+            values = line[len(LEVELS) :].split()
+            if not values or not all(OPT_LEVEL.match(value) for value in values):
+                raise SuiteError(
+                    f"{path}:{number}: levels must be spellings like -O0, "
+                    f"found '{line[len(LEVELS) :].strip()}'"
+                )
+            opts = tuple(values)
+            continue
         fields = line.split(" ", 2)
         if len(fields) < 2:
             raise SuiteError(f"{path}:{number}: baseline line needs a status and a case")
@@ -746,7 +820,7 @@ def _read_baseline(
                 f"{path}:{number}: baseline status must be PASS or FAIL, found '{status}'"
             )
         records.append((status, _decode_id(encoded), fields[2] if len(fields) > 2 else "-"))
-    return records, total
+    return _Baseline(records, total, opts)
 
 
 def _format_case(case_id: str, status: str, detail: str) -> str:
@@ -779,13 +853,17 @@ def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
 
     A full run whose total leak count exceeds the baseline's is a regression
     too: a leak that no individual ``(leaks N)`` clause names must not keep the
-    suite green. The problem names both totals.
+    suite green. The problem names both totals. The totals only compare when
+    the recorded levels and the run's levels are the same, because one level
+    runs half as many executions as two and its total is a different number for
+    an identical suite; a baseline with no levels line cannot be compared at
+    all and is not gated.
     """
     baseline = _read_baseline(path)
     if baseline is None:
         return []
-    records, total = baseline
-    previous = {case_id: status for status, case_id, _ in records}
+    total = baseline.total
+    previous = {case_id: status for status, case_id, _ in baseline.records}
     current = {case.id: case for case in summary.cases}
     scope = set(summary.categories)
     problems: list[tuple[str, str]] = []
@@ -804,7 +882,13 @@ def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
         if not (summary.full or not scope or category in scope):
             continue
         problems.append((case_id, "regression: passed in baseline, missing from this run"))
-    if summary.full and total is not None and summary.leaks > total:
+    if (
+        summary.full
+        and total is not None
+        and baseline.opts is not None
+        and baseline.opts == summary.opts
+        and summary.leaks > total
+    ):
         problems.append(
             ("suite/leaks", f"regression: leak total {summary.leaks} exceeds baseline {total}")
         )

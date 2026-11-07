@@ -17,8 +17,10 @@ Strings and vectors
 -------------------
 ``:str`` is a fat pointer of bytes: ``(str-len s)`` is its byte count,
 ``(str-concat a b)`` builds a new one, ``(str-slice s start end)`` is the bytes
-of ``[start, end)``, and ``(str-eq a b)`` is byte equality — the same answer
-``=`` gives, because ``=`` accepts ``:str`` too. ``(vec T)`` is a growable
+of ``[start, end)``, ``(str-eq a b)`` is byte equality — the same answer
+``=`` gives, because ``=`` accepts ``:str`` too — and ``(read-all)`` returns
+everything on standard input as one of those strings, in a buffer that owns
+nothing and never appears in the leak report. ``(vec T)`` is a growable
 array: it starts empty at ``(make (vec T))``, grows with ``(vec-push v x)``,
 reads with ``(vec-len v)`` and ``(vec-get v i)``, and releases its buffer with
 ``(vec-free v)``. The mutating forms — push, set, free — take a name, because
@@ -1619,6 +1621,8 @@ class _Checker:
             return self._str_eq(node, env)
         if kind == "str-slice":
             return self._str_slice(node, env)
+        if kind == "read-all":
+            return self._read_all(node, env)
         if kind == "vec-push":
             return self._vec_push(node, env)
         if kind == "vec-len":
@@ -2603,6 +2607,19 @@ class _Checker:
         self._str_operand(items[1], env, node, "str-slice")
         self._index(items[2], env, node, "slice index")
         self._index(items[3], env, node, "slice index")
+        return Prim("str")
+
+    def _read_all(self, node: Node, env: _Env) -> Ty:
+        """``(read-all)``: every byte on standard input, as one ``:str``.
+
+        The form takes nothing, because the process has one standard input and
+        a second reader would have to divide it between them. The bytes come
+        back the way a string the runtime builds does: a process-lifetime
+        buffer that owns nothing and never appears in the leak report, so the
+        program has nothing to free and no way to double free it.
+        """
+        if len(node.items) != 1:
+            raise diag(WRONG_ARITY, node.path, "'read-all' takes no arguments")
         return Prim("str")
 
     # -- vectors ----------------------------------------------------------

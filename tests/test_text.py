@@ -1045,5 +1045,70 @@ class VecExecTest(unittest.TestCase):
         self.assertTrue(done.stderr.startswith("vec/test/get-out-of-bounds/"))
 
 
+class ReadAllTest(unittest.TestCase):
+    """``(read-all)``: every byte on standard input, as one ``:str``.
+
+    The language had no input at all before this form. The three example
+    programs in ``examples/`` read their input through it, so its contract is
+    pinned here in three layers the way the rest of the string surface is: the
+    checker's type, the lowerer's runtime call, and real binaries that see a
+    pipe, an empty file and a NUL byte.
+    """
+
+    BUILD = ROOT / "build"
+
+    SOURCE = """\
+(mod read)
+
+(test reads
+  (expect (out "0\\n") (code 0))
+  (println (str-len (read-all))))
+"""
+
+    def target(self, opt: str) -> str:
+        self.BUILD.mkdir(parents=True, exist_ok=True)
+        source = self.BUILD / "read-all.fixture.logos"
+        source.write_text(self.SOURCE, encoding="utf-8")
+        name = str(self.BUILD / f"read-all.fixture-{opt[1:]}")
+        driver.run_test(str(source), "reads", name, opt=opt)
+        return name
+
+    def test_read_all_is_a_str(self):
+        cm = checked("(mod m)(fn f :str () (ret (read-all)))")
+        self.assertEqual(type_of(cm, "read-all"), Prim("str"))
+
+    def test_read_all_takes_no_arguments(self):
+        error = fail_on("(mod m)(fn f :str () (ret (read-all 1)))")
+        self.assertEqual(error.code, "E0102")
+        self.assertEqual(error.message, "'read-all' takes no arguments")
+
+    def test_the_lowering_calls_the_runtime(self):
+        module = lowered("(mod m)(fn main :void () (println (read-all)))")
+        main = next(fn for fn in module.functions if fn.name.endswith("main"))
+        self.assertIn("rt_read_all", callees(main))
+
+    def test_a_binary_reads_a_pipe_to_end_of_file(self):
+        for opt in ("-O0", "-O2"):
+            with self.subTest(opt=opt):
+                done = subprocess.run(
+                    [self.target(opt)], input=b"a\x00b\n", capture_output=True
+                )
+                self.assertEqual(done.stdout, b"4\n", done.stderr)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn(b"LEAK", done.stderr)
+
+    def test_empty_input_is_the_empty_string(self):
+        done = subprocess.run([self.target("-O0")], input=b"", capture_output=True)
+        self.assertEqual(done.stdout, b"0\n", done.stderr)
+
+    def test_the_buffer_grows_past_its_first_capacity(self):
+        # 200000 bytes is far beyond any first allocation, so this exercises
+        # the runtime's growth loop rather than one lucky read.
+        done = subprocess.run(
+            [self.target("-O2")], input=b"x" * 200000, capture_output=True
+        )
+        self.assertEqual(done.stdout, b"200000\n", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,15 @@
+(mod read)
+
+(test empty-standard-input
+  (expect (out "0\n")
+    (code 0)
+    (leaks 0))
+  (let text (read-all))
+  (println (str-len text)))
+
+(test reading-is-not-a-leak
+  (expect (out "")
+    (code 0)
+    (leaks 0))
+  (let text (read-all))
+  (print text))

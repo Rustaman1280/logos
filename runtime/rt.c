@@ -575,6 +575,53 @@ unsigned char *rt_str_from_i64(long long v, size_t *out_len) {
     return s.data;
 }
 
+unsigned char *rt_read_all(size_t *out_len, const char *path) {
+    size_t cap = 4096;
+    size_t len = 0;
+    unsigned char *buffer = malloc(cap);
+
+    if (buffer == NULL) {
+        rt_panic(path, "R0003", "out of memory");
+    }
+    for (;;) {
+        ssize_t n;
+
+        if (len == cap) {
+            /* Double the buffer, refusing a size that could not wrap back to
+             * something meaningful. A failed realloc leaves the old buffer
+             * live, so it is freed before the panic rather than at exit. */
+            unsigned char *grown;
+            if (cap > SIZE_MAX / 2) {
+                free(buffer);
+                rt_panic(path, "R0003", "standard input is too large");
+            }
+            grown = realloc(buffer, cap * 2);
+            if (grown == NULL) {
+                free(buffer);
+                rt_panic(path, "R0003", "out of memory");
+            }
+            buffer = grown;
+            cap *= 2;
+        }
+        n = read(STDIN_FILENO, buffer + len, cap - len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buffer);
+            rt_panic(path, "R0003", "read from standard input failed");
+        }
+        if (n == 0) {
+            break;
+        }
+        len += (size_t)n;
+    }
+    if (out_len != NULL) {
+        *out_len = len;
+    }
+    return buffer;
+}
+
 /* ---------------------------------------------------------------------------
  * Concurrency
  *

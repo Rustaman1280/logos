@@ -172,6 +172,16 @@ int rt_str_eq(const unsigned char *a, size_t an,
 /* Format v as decimal text in a new string and store its byte count. */
 unsigned char *rt_str_from_i64(long long v, size_t *out_len);
 
+/* Read standard input to end of file and store its byte count in *out_len.
+ * Returns a buffer holding exactly those bytes; NUL bytes inside are data, and
+ * empty input returns a zero-length buffer, never NULL. Like the other
+ * builders above, the buffer is malloc'ed and NEVER released: it lives for the
+ * life of the process and is deliberately not tracked by the leak tracker, so
+ * no program pays for reading its input and none can free a buffer it does not
+ * own. Panics with R0003 at `path` if a read fails or the input cannot be
+ * held; a panic from inside the runtime uses the `read-all` node's path. */
+unsigned char *rt_read_all(size_t *out_len, const char *path);
+
 /* ---------------------------------------------------------------------------
  * Concurrency
  *

@@ -553,7 +553,7 @@ class BaselineTest(unittest.TestCase):
             path = Path(tmp, "summary.txt")
             tester.write_baseline(summary, path)
             lines = path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines, ["LEAKS 0", "PASS exec/hello/prints -"])
+            self.assertEqual(lines, ["LEAKS 0", "OPTS -O0", "PASS exec/hello/prints -"])
             self.assertEqual(tester.read_baseline(path), {"exec/hello/prints": "PASS"})
 
     def test_a_case_that_passed_before_and_fails_now_is_a_regression(self):
@@ -775,6 +775,123 @@ class CliTest(unittest.TestCase):
             self.assertIn("category directory", err.getvalue())
             self.assertEqual(out.getvalue(), "")
             self.assertFalse((root / "exec" / "summary.txt").exists())
+
+
+class BaselineCoverageTest(unittest.TestCase):
+    """A merged update owns the category it ran, not just the cases it saw."""
+
+    def test_a_filtered_update_drops_a_case_deleted_from_that_category(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            gone = write(
+                root,
+                "exec",
+                "gone",
+                """\
+                (mod gone)
+
+                (test prints
+                  (expect (out "bye\\n") (code 0))
+                  (println "bye"))
+                """,
+            )
+            write(root, "mem", "fine", FINE)
+            baseline = root / "summary.txt"
+            tester.write_baseline(tester.run_suite(str(root), None, ["-O0"]), baseline)
+            self.assertIn("exec/gone/prints", tester.read_baseline(baseline) or {})
+
+            gone.unlink()
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["test", tmp, "--only", "exec", "--opt", "-O0", "--update-baseline"])
+            self.assertEqual(code, 0, err.getvalue())
+
+            entries = tester.read_baseline(baseline) or {}
+            self.assertNotIn("exec/gone/prints", entries)
+            self.assertIn("exec/hello/prints", entries)
+            self.assertIn("mem/fine/frees", entries)
+            # A full run right after the merge must not call the deleted case
+            # missing: that was the false regression this merge used to leave.
+            self.assertEqual(
+                tester.compare_baseline(tester.run_suite(str(root), None, ["-O0"]), baseline),
+                [],
+            )
+
+
+class BaselineRootTest(unittest.TestCase):
+    """--update-baseline writes the suite root's baseline and nothing else."""
+
+    def assert_refused(self, target: Path, needle: str) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["test", str(target), "--opt", "-O0", "--update-baseline"])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn(needle, err.getvalue())
+        self.assertFalse((target / "summary.txt").exists())
+
+    def test_update_baseline_refuses_a_nested_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            nested = root / "exec" / "nested"
+            nested.mkdir()
+            self.assert_refused(nested, "suite root")
+
+    def test_update_baseline_refuses_a_directory_outside_the_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            stray = root / "examples"
+            stray.mkdir()
+            self.assert_refused(stray, "suite root")
+
+
+class OptLevelBaselineTest(unittest.TestCase):
+    """The baseline records which levels its leak total came from."""
+
+    def test_the_header_records_the_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            baseline = root / "summary.txt"
+            tester.write_baseline(tester.run_suite(str(root), None, ["-O0"]), baseline)
+            self.assertIn("OPTS -O0", baseline.read_text(encoding="utf-8").splitlines())
+            tester.write_baseline(
+                tester.run_suite(str(root), None, ["-O0", "-O2"]), baseline
+            )
+            self.assertIn(
+                "OPTS -O0 -O2", baseline.read_text(encoding="utf-8").splitlines()
+            )
+
+    def test_a_single_level_total_does_not_gate_a_two_level_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "leaky", LEAKY)
+            baseline = root / "summary.txt"
+            one = tester.run_suite(str(root), None, ["-O0"])
+            tester.write_baseline(one, baseline)
+            self.assertEqual(one.leaks, 1)
+            both = tester.run_suite(str(root), None, ["-O0", "-O2"])
+            self.assertEqual(both.leaks, 2)
+            self.assertEqual(tester.compare_baseline(both, baseline), [])
+
+    def test_matching_levels_still_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "leaky", LEAKY)
+            baseline = root / "summary.txt"
+            tester.write_baseline(
+                tester.run_suite(str(root), None, ["-O0", "-O2"]), baseline
+            )
+            baseline.write_text(
+                baseline.read_text(encoding="utf-8").replace("LEAKS 2", "LEAKS 1"),
+                encoding="utf-8",
+            )
+            problems = tester.compare_baseline(
+                tester.run_suite(str(root), None, ["-O0", "-O2"]), baseline
+            )
+            self.assertEqual([case for case, _ in problems], ["suite/leaks"])
 
 
 if __name__ == "__main__":

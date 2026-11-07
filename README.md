@@ -45,7 +45,11 @@ adds threads and the synchronization that goes with them: `(spawn f args...)`,
 `(atomic T v)`/`atomic-add`/`atomic-load`/`atomic-store`, over pthreads. Shared
 mutable state is marked `(shared ...)`, and handing a thread an unmarked pointer
 or handle — or making one a channel element — is E0700. A pthread failure is R0005.
-Everything else reports a diagnostic at the construct.
+Everything else reports a diagnostic at the construct. Task 14 closes the
+surface: `(read-all)` returns every byte of standard input as a `:str`, so a
+program can be a filter as well as a printer, and the repository ships the
+proof: three real programs under `examples/`, a differential oracle under
+`tests/diff/` whose C twins are built with gcc, and `tools/accept.sh`.
 
 ## Requirements
 
@@ -53,6 +57,8 @@ Everything else reports a diagnostic at the construct.
 - Python 3.10 or newer (3.10.12 ships with Ubuntu 22.04; 3.14 also works)
 - clang 14 and lld: `apt-get install -y clang lld` (`lld` is unused so far;
   clang links through the system linker)
+- gcc 11 and jq 1.6 for `tools/accept.sh`: gcc builds the differential oracle's
+  C twins, jq is the JSON example's reference
 - GNU make
 
 ## Usage
@@ -63,21 +69,47 @@ python3 -m logos build examples/hello.logos   # build/hello, and build/hello.ll
 ./build/hello                                 # hello
 python3 -m logos test                         # run the directive-driven corpus
 python3 -m logos test --only exec --opt -O0   # one category, one optimisation level
+bash tools/accept.sh                          # corpus, gcc oracle, examples, fmt
 ```
 
 `logosc test` reads the `(expect ...)` directive in each `(test ...)` node and
 the module-level `(expect-error E0xxx)` of a negative case, runs every case at
 `-O0` and `-O2`, and writes to `tests/summary.txt` with `--update-baseline`.
-The baseline records one line per case plus the suite's leak total; a case
-that passed in the baseline and fails now is a regression and exits 1, as is a
-full run that leaks more than the baseline recorded. `--update-baseline` with
-`--only` merges: it rewrites the cases it ran and keeps the rest. A `.logos`
-file outside the known categories (`parse`, `type`, `exec`, `mem`, `thread`,
-`generics`, `regress`, `diff`) is reported and fails the run rather than being
-skipped.
+The baseline records the optimisation levels it ran (`OPTS -O0 -O2`), one line
+per case and the suite's leak total; a case that passed in the baseline and
+fails now is a regression and exits 1, as is a full run that leaks more than
+the baseline recorded at the same levels. `--update-baseline` with `--only`
+merges: it rewrites the cases it ran, drops the ones the category no longer
+contains, and keeps the rest. A `.logos` file outside the known categories
+(`parse`, `type`, `exec`, `mem`, `thread`, `generics`, `regress`, `diff`) is
+reported and fails the run rather than being skipped.
+
+`tools/accept.sh` is the end-to-end gate: the corpus, `tests/diff/run_diff.sh`
+(Logos against gcc at `-O0` and `-O2`), the three example programs against
+`wc`, `jq` and a C reference build, `logosc fmt` idempotency over every
+`.logos` file in the tree, and a generated 200-function program with structs,
+a generic and a thread that must compile in under five seconds. It exits 0
+only when every section prints PASS.
 
 The IR is always kept beside the binary under `build/`: it is the artefact to
 read when a compiled program misbehaves.
+
+## Examples
+
+| Program | What it does | Reference |
+| --- | --- | --- |
+| `examples/wc.logos` | counts lines, words and bytes from standard input | `wc -c -w -l` |
+| `examples/json.logos` | parses JSON and prints a structural summary | `jq` |
+| `examples/matrix.logos` | multiplies two 200x200 matrices on four threads | `examples/matrix_ref.c` |
+
+`wc` reads through `(read-all)` and prints GNU wc's three seven-wide columns in
+GNU's order: lines, words, bytes. `json` is a recursive-descent parser over
+`(res :i64 json-error)` that validates every value, including string escapes
+and number grammar, and counts objects, arrays, members, scalars and nesting
+depth. `matrix` fills two matrices from a fixed integer pattern, hands each of
+four threads fifty rows through `(shared (ptr :i64))`, and prints a checksum,
+a weighted checksum, the centre cell and the last cell. `examples/sample.json`
+is the JSON fixture the acceptance script feeds to both the program and jq.
 
 ## Development
 
@@ -94,7 +126,10 @@ make clean   # remove build output and caches
 | `logos/` | Python compiler front end and command line interface |
 | `runtime/rt.h` | Declarations of the C runtime reached through `extern` |
 | `runtime/rt.c` | C runtime implementation |
-| `tests/` | `unittest` suite |
+| `examples/` | Three real programs, their input fixture and the matrix reference |
+| `tests/` | `unittest` suite and the directive corpus |
+| `tests/diff/` | Programs with hand-written C twins, compared against gcc |
+| `tools/accept.sh` | The end-to-end acceptance gate |
 | `docs/superpowers/` | Design spec and implementation plan |
 
 ## License

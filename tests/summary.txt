@@ -1,4 +1,5 @@
 LEAKS 10
+OPTS -O0 -O2
 PASS parse/fixture/add-wraps -
 PASS parse/unknown-node -
 PASS type/arity -
@@ -41,6 +42,8 @@ PASS exec/loops/if-value -
 PASS exec/match/match-returns-a-value -
 PASS exec/match/match-arms-are-statements -
 PASS exec/match/match-arm-has-a-block-body -
+PASS exec/read/empty-standard-input -
+PASS exec/read/reading-is-not-a-leak -
 PASS exec/results/match-ok -
 PASS exec/results/match-err-payload -
 PASS exec/results/match-str-payload -

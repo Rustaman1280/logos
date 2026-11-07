@@ -147,17 +147,26 @@ def main(argv: list[str]) -> int:
 def _baseline_argument_problem(path: str) -> str | None:
     """Why ``--update-baseline`` cannot use ``path``, or ``None`` if it can.
 
-    A baseline belongs to a suite root. A single file has no suite, and a
-    category directory is not the suite root: writing ``<category>/summary.txt``
-    there would create a file that no run ever reads.
+    A baseline belongs to a suite root: a directory that contains at least one
+    known category directory. A single file has no suite, a category directory
+    is not the root of one, and a nested or unrelated directory would get a
+    ``summary.txt`` that no run ever reads. Writing one there is a stray file
+    that looks like a baseline, so all three are refused rather than served.
     """
     root = Path(path)
     if root.is_file():
         return "--update-baseline needs a directory, not a single file"
-    if root.is_dir() and root.name in tester.CATEGORIES:
+    if not root.is_dir():
+        return f"--update-baseline needs a directory, and '{path}' is not one"
+    if root.name in tester.CATEGORIES:
         return (
             f"--update-baseline needs the suite root, not the category "
             f"directory '{path}'"
+        )
+    if not any((root / category).is_dir() for category in tester.CATEGORIES):
+        return (
+            f"--update-baseline needs the suite root, a directory holding a "
+            f"category such as 'exec'; '{path}' is not one"
         )
     return None
 
