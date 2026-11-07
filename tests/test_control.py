@@ -437,15 +437,16 @@ class ControlFlowLoweringTest(unittest.TestCase):
         self.assertIn("%v.1.addr = alloca i8", llvm.emit(m))
 
     def test_a_type_with_no_layout_is_e0002_not_a_value_error(self):
-        # ``(vec T)`` has a layout now (Task 9); ``(opt T)`` is the vocabulary
-        # this backend still cannot spell, and it must still be a diagnostic.
+        # ``(vec T)``, ``(opt T)`` and ``(res T E)`` have layouts now;
+        # ``(shared T)`` belongs to a later task, and a type this backend
+        # cannot spell must still be a diagnostic with a path.
         with self.assertRaises(LogosError) as caught:
             lower.lower_module(
-                checked("(mod m)(fn f :void ((v :(opt :i64))) (ret))")
+                checked("(mod m)(fn f :void ((v :(shared :i64))) (ret))")
             )
         error = caught.exception
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
+        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
         self.assertEqual(error.path, "m/f/1/0")
 
     def test_a_constant_true_loop_has_no_exit_edge(self):

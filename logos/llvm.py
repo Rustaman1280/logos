@@ -44,7 +44,19 @@ from __future__ import annotations
 import re
 
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
-from logos.types import Arr, FnTy, Own, Prim, Ptr, StructRef, Ty, Vec
+from logos.types import (
+    Arr,
+    EnumRef,
+    FnTy,
+    Opt,
+    Own,
+    Prim,
+    Ptr,
+    Res,
+    StructRef,
+    Ty,
+    Vec,
+)
 
 #: Closed primitive spelling. ``:str`` is the frozen 16-byte fat pointer the
 #: spec defines. A ``(vec T)`` is a literal three-word struct, so its layout is
@@ -79,6 +91,12 @@ _UNQUOTED = re.compile(r"[-a-zA-Z$._][-a-zA-Z$._0-9]*\Z")
 #: answer always describes the module processed last.
 _STRUCTS: dict[str, tuple[Ty, ...]] = {}
 
+#: The payload word count of each enum the lowerer has materialised, by name.
+#: An enum's LLVM type is ``{ i32, [K x i64] }``, so ``K`` is all a type
+#: spelling needs; like ``_STRUCTS`` this table is rebuilt for every module and
+#: emitted IR never reads it.
+_ENUMS: dict[str, int] = {}
+
 
 def emit(m: IrModule) -> str:
     """Return the LLVM IR text for ``m``, trailing newline included.
@@ -90,6 +108,8 @@ def emit(m: IrModule) -> str:
     reset_structs()
     for struct in m.structs:
         register_struct(struct.name, struct.fields)
+    for enum in m.enums:
+        register_enum(enum.name, enum.words)
     return _Text(m).module()
 
 
@@ -128,6 +148,17 @@ def type_text(ty: Ty) -> str:
     kind of literal: two words, the environment pointer and the code pointer,
     both opaque, so any two function values are one layout whatever they take
     and return. The code pointer's real type is spelled only where it is called.
+
+    A ``(res T E)`` is ``{ i1, T, E }`` and a ``(opt T)`` is ``{ i1, T }``:
+    the tag first, then one slot per variant, the slot a variant does not use
+    left ``undef``. The tag is a real ``i1`` rather than a byte so a result
+    and an optional with the same payload are the same size.
+
+    An enum is ``{ i32, [K x i64] }`` — a tag and a payload area wide enough
+    for the largest variant, so one type holds every variant. ``K`` is the
+    enum's, not the value's, and the lowerer registers it by name: that is what
+    keeps two enums of different shapes apart while letting every value of one
+    enum be one LLVM type.
     """
     if isinstance(ty, Prim):
         spelled = _PRIM.get(ty.name)
@@ -141,8 +172,17 @@ def type_text(ty: Ty) -> str:
         return "{ i8*, i8* }"
     if isinstance(ty, Arr):
         return f"[{ty.n} x {type_text(ty.elem)}]"
+    if isinstance(ty, Res):
+        return f"{{ i1, {type_text(ty.ok)}, {type_text(ty.err)} }}"
+    if isinstance(ty, Opt):
+        return f"{{ i1, {type_text(ty.elem)} }}"
     if isinstance(ty, StructRef):
         return struct_name(ty.name)
+    if isinstance(ty, EnumRef):
+        words = _ENUMS.get(ty.name)
+        if words is None:
+            raise ValueError(f"no layout registered for enum '{ty.name}'")
+        return f"{{ i32, [{words} x i64] }}"
     raise ValueError(f"no LLVM layout for type {ty}")
 
 
@@ -183,11 +223,22 @@ def struct_name(name: str) -> str:
 def reset_structs() -> None:
     """Forget every registered layout, so the next module starts clean."""
     _STRUCTS.clear()
+    _ENUMS.clear()
 
 
 def register_struct(name: str, fields: "tuple[Ty, ...]") -> None:
     """Record a struct's layout so :func:`struct_llty` can spell it by name."""
     _STRUCTS[name] = tuple(fields)
+
+
+def register_enum(name: str, words: int) -> None:
+    """Record an enum's payload width so :func:`type_text` can spell it.
+
+    ``words`` counts eight-byte units of the payload area. The lowerer
+    registers every enum it materialises, before the type is printed, so a
+    spelling never has to guess at a width it was not told.
+    """
+    _ENUMS[name] = words
 
 
 def struct_llty(name: str) -> str:

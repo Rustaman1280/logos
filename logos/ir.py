@@ -96,6 +96,20 @@ class IrDecl:
 
 
 @dataclass(frozen=True, slots=True)
+class IrEnum:
+    """One enum type: its payload width, in eight-byte words.
+
+    An enum's LLVM type is ``{ i32, [words x i64] }`` — a tag and a payload
+    area wide enough for its largest variant. The width is a fact the spelling
+    pass cannot read off a name, so the module carries it: the same reason
+    ``IrStruct`` carries its fields.
+    """
+
+    name: str
+    words: int
+
+
+@dataclass(frozen=True, slots=True)
 class IrStruct:
     """One named struct type: its fields in declaration order.
 
@@ -142,9 +156,10 @@ class IrFn:
 class IrModule:
     """A whole translation unit.
 
-    ``declares`` and ``structs`` are the fields beyond the three the plan
-    names, and both have defaults, so ``IrModule(triple, globals, functions)``
-    still constructs a module with nothing to declare and no named types.
+    ``declares``, ``structs`` and ``enums`` are the fields beyond the three the
+    plan names, and all have defaults, so ``IrModule(triple, globals,
+    functions)`` still constructs a module with nothing to declare and no named
+    types.
     """
 
     triple: str
@@ -152,3 +167,4 @@ class IrModule:
     functions: list[IrFn]
     declares: list[IrDecl] = field(default_factory=list)
     structs: list[IrStruct] = field(default_factory=list)
+    enums: list[IrEnum] = field(default_factory=list)

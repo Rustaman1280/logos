@@ -787,13 +787,14 @@ class UnknownFormTest(unittest.TestCase):
         self.assertEqual(error.path, "m/f")
 
     def test_a_form_from_a_later_task_is_an_unknown_function(self):
-        # ``deref``, ``alloc`` and ``vec-push`` are forms now; ``ok`` arrives
-        # with results (Task 11), so it is still only a name with no rule.
+        # ``ok``, ``err``, ``some`` and ``none`` are forms now; ``spawn``
+        # arrives with threads (Task 12), so it is still only a name with no
+        # rule and reaches the call path.
         error = expect_error(
-            "(mod m)(fn f :i64 ((p :i32)) (ret (ok p)))", "E0103"
+            "(mod m)(fn f :i64 ((p :i32)) (ret (spawn p)))", "E0103"
         )
         self.assertEqual(error.path, "m/f/2/0")
-        self.assertIn("'ok'", error.message)
+        self.assertIn("'spawn'", error.message)
 
 
 class CorpusTest(unittest.TestCase):

@@ -443,14 +443,15 @@ class StructLoweringTest(unittest.TestCase):
         self.assertIn("store i64 5, i64* %t", text)
 
     def test_a_struct_field_with_no_layout_is_e0002_at_the_use(self):
-        # ``(vec T)`` is lowerable now; ``(opt T)`` is not, and a field that
-        # names it must be refused where the struct is materialised.
+        # ``(vec T)`` and ``(opt T)`` are lowerable now; ``(shared T)`` is not,
+        # and a field that names it must be refused where the struct is
+        # materialised.
         error = fail_on_lower(
-            "(mod m)(type box (struct (v (opt :i64))))"
+            "(mod m)(type box (struct (v (shared :i64))))"
             "(fn f :void ((b box)) (ret))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
+        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
         self.assertEqual(error.path, "m/f/1/0")
 
     def test_a_void_field_is_e0002_at_the_use(self):
@@ -469,13 +470,15 @@ class StructLoweringTest(unittest.TestCase):
         self.assertIn("%struct.e = type { }", text)
         self.assertIn("store %struct.e undef, %struct.e* %v.0.addr", text)
 
-    def test_an_enum_type_is_e0002_at_lower_time(self):
-        error = fail_on_lower(
-            "(mod m)(type e (enum (a)))"
+    def test_an_enum_is_a_tag_and_a_payload_area(self):
+        # Task 11 gives an enum a layout: one i32 tag and an area sized for
+        # its widest variant, so a value of any variant is one LLVM type.
+        text = emitted(
+            "(mod m)(type e (enum (a :i64) (b)))"
             "(fn f :void ((x e)) (ret))"
         )
-        self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "e is not lowered yet")
+        self.assertIn("define internal void @lg.m.f({ i32, [1 x i64] } %v.0) {", text)
+        self.assertIn("{ i32, [1 x i64] }* %v.0.addr", text)
 
     def test_a_struct_that_contains_itself_is_refused(self):
         error = fail_on_lower(

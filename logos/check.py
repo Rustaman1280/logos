@@ -5,14 +5,15 @@ Scope
 This pass checks what the language has so far: primitives, arithmetic,
 comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
 ``while``, ``match``, ``break``/``continue``, ``ret``, calls, struct field
-access, fixed arrays, manual memory, strings and growable vectors. A form from
-a later task (``ok``) is not special yet, so it reaches the call path and is
-reported as an unknown function: the vocabulary grows one task at a time, and a
-name is only a built-in once this module has a rule for it. ``print`` and
-``println`` are the built-in functions: each takes one value and writes it,
-formatted by the runtime. The value is any scalar with a formatter of its own —
-``:i64``, ``:u64``, ``:f64``, ``:bool``, ``:str`` — and nothing is converted to
-reach one, so a ``:i32`` is a type mismatch and not an implicit widening.
+access, fixed arrays, manual memory, strings, growable vectors, results,
+optionals and enums. A form from a later task (``spawn``) is not special yet,
+so it reaches the call path and is reported as an unknown function: the
+vocabulary grows one task at a time, and a name is only a built-in once this
+module has a rule for it. ``print`` and ``println`` are the built-in
+functions: each takes one value and writes it, formatted by the runtime. The
+value is any scalar with a formatter of its own — ``:i64``, ``:u64``,
+``:f64``, ``:bool``, ``:str`` — and nothing is converted to reach one, so a
+``:i32`` is a type mismatch and not an implicit widening.
 
 Strings and vectors
 -------------------
@@ -80,12 +81,15 @@ Control flow
 ------------
 ``if`` is an expression: both branches must have the same type and that type is
 the ``if``'s. ``while`` is a statement. ``match`` is an expression over an
-integer scrutinee whose arms are ``(pattern body...)``; a pattern is an integer
-literal or ``_``, every arm must have the same type, and the last item of a
-body is the arm's value. ``break`` and ``continue`` are statements with no
-operand and are only legal inside a loop, which this pass tracks as a depth on
-the enclosing environment: a helper ``fn`` starts at zero, because it is not
-inside the loop that lexically contains it.
+integer, an enum, a result or an optional, and its arms are ``(pattern
+body...)``; an integer pattern is a literal or ``_``, and a variant pattern is
+the variant's name or ``(variant binding)``. Every arm must have the same type,
+and the last item of a body is the arm's value. An integer match needs no
+``_`` — its domain is not enumerable — while the other three are closed sets
+and must name every variant (E0600). ``break`` and ``continue`` are statements
+with no operand and are only legal inside a loop, which this pass tracks as a
+depth on the enclosing environment: a helper ``fn`` starts at zero, because it
+is not inside the loop that lexically contains it.
 
 Purity
 ------
@@ -159,6 +163,41 @@ copies is the ceiling (E0500), and a type variable that no argument binds is
 E0501: at the call that cannot fix it, or at an annotation that names a
 variable the enclosing definition never declared.
 
+Results and optionals
+---------------------
+``(res T E)`` is a value of two variants, ``(ok v)`` and ``(err e)``, and
+``(opt T)`` is ``(some v)`` or ``(none)``. The error slot names a *declared
+enum* — ``(type parse-error (enum (bad-digit :u64) (overflow)))`` — and nothing
+else, because ``try`` needs one identity to compare; any other error type is
+E0101 where the result is spelled. An enum is a closed set of named variants,
+each with no payload (``overflow``) or one (``(bad-digit :u64)``); a variant is
+built by its bare name, ``(bad-digit 5)``, and matched by name, ``(bad-digit
+n)`` or ``overflow``.
+
+``(ok v)`` and ``(err e)`` take the result type the context expects — a
+``ret``'s return type or a ``let``'s annotation — because nothing else could
+choose the error enum; without one they are E0100. ``(some v)`` infers its
+element from ``v`` and ``(none)`` needs the annotation. ``(try e)`` yields the
+ok value of a result, and propagates the error by ``ret``ing it from the
+enclosing function: the function must return a result whose error type is
+exactly ``e``'s, or the ``try`` is E0601. There is no widening and no union.
+
+A result is an obligation: somebody has to look at its error slot. A ``match``
+over one must handle ``ok`` and ``err`` (or a ``_``), a match over an enum must
+name every variant, and a match over an optional must handle ``some`` and
+``none`` — a missing one is E0600. A result in statement position, or a
+binding never matched, tried, returned or handed to a callee, is E0602. The
+obligation follows the value through a copy, a capture, a ``ret`` and a call
+argument; ``set`` gives the binding a new one. Discharging it is not
+path-sensitive — handling a result inside one branch of an ``if`` is enough —
+because the question this answers is "was it looked at", not "was it looked at
+on every path". A result may not be stored in an aggregate — a struct field, an
+array or vector element, an enum payload, another result or an optional — until
+a place expression can carry the obligation with it: E0002 where the storage is
+spelled, and E0602 for a result handed to ``(ok ...)`` or ``(some ...)``, which
+would hide it one level down. Vectors that a tagged value would have to copy
+are refused (E0402) for the same reason a vector may not be a struct field.
+
 Closures
 --------
 ``(fn :R ((p :T)...) body...)`` is a value of type ``(fn (T) R)``: the same
@@ -201,11 +240,14 @@ from logos.diag import (
     LITERAL_RANGE,
     MISSING_RETURN,
     MOVE_IMMUTABLE,
+    NON_EXHAUSTIVE,
     NOT_A_STR,
     NOT_FOUND,
     NOT_MUTABLE,
+    TRY_MISMATCH,
     TYPE_MISMATCH,
     UNBOUND_TYPE_VAR,
+    UNHANDLED_RESULT,
     UNKNOWN_FIELD,
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
@@ -334,6 +376,7 @@ class CheckedModule:
     declared: dict[str, Ty] = field(default_factory=dict)
     instances: dict[str, Instance] = field(default_factory=dict)
     generic: frozenset[str] = frozenset()
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] = field(default_factory=dict)
 
 
 def mangle_instance(name: str, args: tuple[Ty, ...], where: str = "") -> str:
@@ -537,11 +580,17 @@ def match_shape(
             )
         pattern = item.items[0]
         if isinstance(pattern, Node):
-            raise diag(
-                UNKNOWN_NODE,
-                pattern.path,
-                "a match pattern is an integer literal or '_'",
-            )
+            # A list pattern is ``(variant name)``. Whether the scrutinee has
+            # variants at all is the checker's question, because only it knows
+            # the scrutinee's type; the shape read here just has to be a form
+            # with a name in front.
+            head = pattern.items[0] if pattern.items else None
+            if not isinstance(head, Token) or head.kind != ATOM:
+                raise diag(
+                    UNKNOWN_NODE,
+                    pattern.path,
+                    "a match pattern is a variant name, (variant name) or '_'",
+                )
         if len(item.items) < 2:
             raise diag(
                 WRONG_ARITY, item.path, "a match arm needs a pattern and a body"
@@ -608,6 +657,12 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
             raise diag(
                 UNKNOWN_NODE, field.path, "vector fields are not supported yet"
             )
+        if _stored_result(ty):
+            # A result is an obligation a name discharges; a field has no name
+            # at the point it is written, so the error slot would be dropped.
+            raise diag(
+                UNKNOWN_NODE, field.path, "result fields are not supported yet"
+            )
         fields.append((name, ty))
     return tuple(fields)
 
@@ -615,6 +670,156 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
 #: The one sentence E0502 carries, wherever a capturing closure would outlive
 #: the frame that owns its environment.
 _CLOSURE_ESCAPE = "a closure that captures cannot leave its function"
+
+#: Variant names the compiler gives a meaning of its own: ``(ok v)``, ``(err
+#: e)``, ``(some v)``, ``(none)`` and ``(try e)`` are forms, and ``print`` and
+#: ``println`` are the builtins. An enum variant of one of these names could
+#: not be constructed unambiguously, so the declaration is refused instead.
+RESERVED_VARIANTS = ("ok", "err", "some", "none", "try", "print", "println")
+
+
+def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None], ...]:
+    """The variants of an ``(enum ...)`` body, in declaration order.
+
+    One reader because two would drift: the checker validates every enum with
+    it and the lowerer reads the same list to put an index on each variant, so
+    the tag a constructor writes and the tag a pattern tests cannot disagree.
+
+    A variant is ``(name)`` or ``(name T)``. A repeated name is E0003, a
+    malformed variant is E0002, and an unresolvable type is E0101, each at the
+    variant's own path. A ``:void`` payload has no storage (E0100) and a
+    payload that is or contains a ``(vec T)`` is E0002: a vector is released
+    through its descriptor and an enum has no place expression, so such a
+    variant could never free its buffer.
+
+    The reserved names are E0003 here: ``ok``, ``err``, ``some``, ``none`` and
+    ``try`` build and propagate a result or an optional, and ``print`` and
+    ``println`` are the builtins, so a variant of one of those names could not
+    be told from the form.
+    """
+    variants: list[tuple[str, Ty | None]] = []
+    names: set[str] = set()
+    for variant in node.items[1:]:
+        if not isinstance(variant, Node) or not variant.items:
+            raise diag(
+                UNKNOWN_NODE, node.path, "an enum variant must be (name) or (name type)"
+            )
+        items = variant.items
+        name = _name(items[0], variant.path, "a variant")
+        if name in RESERVED_VARIANTS:
+            raise diag(
+                DUPLICATE, variant.path, f"variant '{name}' is reserved by the compiler"
+            )
+        if name in names:
+            raise diag(DUPLICATE, variant.path, f"duplicate variant '{name}'")
+        names.add(name)
+        if len(items) == 1:
+            variants.append((name, None))
+            continue
+        if len(items) == 2:
+            type_item = items[1]
+        elif len(items) == 3 and _marker(items[1]):
+            type_item = items[2]
+        else:
+            raise diag(
+                UNKNOWN_NODE,
+                variant.path,
+                "an enum variant must be (name) or (name type)",
+            )
+        ty = _read_type(type_item, types, variant.path, {})
+        if _is_void(ty):
+            raise diag(
+                TYPE_MISMATCH, variant.path, f"variant '{name}' cannot hold :void"
+            )
+        if holds_vector(ty):
+            raise diag(
+                UNKNOWN_NODE, variant.path, "vector payloads are not supported yet"
+            )
+        if _stored_result(ty):
+            raise diag(
+                UNKNOWN_NODE, variant.path, "result payloads are not supported yet"
+            )
+        variants.append((name, ty))
+    if not variants:
+        raise diag(UNKNOWN_NODE, node.path, "an enum needs at least one variant")
+    return tuple(variants)
+
+
+def pattern_variant(
+    pattern: Node | Token,
+    variants: tuple[tuple[str, Ty | None], ...] | list[tuple[str, Ty | None]],
+    *,
+    where: str = "",
+    owner: str = "this match",
+) -> tuple[str | None, str | None, Ty | None]:
+    """The variant a match pattern names, the name it binds and that type.
+
+    One reader because the checker proves coverage with it and the lowerer
+    picks a tag with it: a pattern the checker accepted must mean the same
+    variant to the backend, or an exhaustive match would test the wrong arms.
+
+    ``_`` is ``(None, None, None)``. A bare name is a payload-less variant —
+    ``overflow``. A list is a variant and the name its payload is bound to —
+    ``(bad-digit n)``, or ``(bad-digit _)`` to ignore it. The payload's type is
+    the variant's, so an arm binds it at exactly the type the enum declared.
+
+    ``where`` locates a diagnostic about a bare token, which carries no path of
+    its own; ``owner`` is how the message names the set, ``enum 'x'`` or ``a
+    result``.
+    """
+    if is_wildcard(pattern):
+        return (None, None, None)
+    table = {name: payload for name, payload in variants}
+    if isinstance(pattern, Token):
+        if pattern.kind != ATOM:
+            raise diag(
+                UNKNOWN_NODE,
+                where,
+                "a match pattern is a variant name, (variant name) or '_'",
+            )
+        name = pattern.value
+        if name not in table:
+            raise diag(TYPE_MISMATCH, where, f"{owner} has no variant '{name}'")
+        if table[name] is not None:
+            raise diag(
+                TYPE_MISMATCH,
+                where,
+                f"variant '{name}' holds a value: write ({name} name)",
+            )
+        return (name, None, None)
+    items = pattern.items
+    head = items[0] if items else None
+    if not isinstance(head, Token) or head.kind != ATOM:
+        raise diag(
+            UNKNOWN_NODE,
+            pattern.path or where,
+            "a match pattern is a variant name, (variant name) or '_'",
+        )
+    name = head.value
+    at = pattern.path or where
+    if name not in table:
+        raise diag(TYPE_MISMATCH, at, f"{owner} has no variant '{name}'")
+    payload = table[name]
+    if payload is None:
+        # ``(none)`` is the same pattern as ``none``, so a variant that takes
+        # no value may be written the way it is constructed.
+        if len(items) != 1:
+            raise diag(
+                WRONG_ARITY, at, f"variant '{name}' takes no value: write {name}"
+            )
+        return (name, None, None)
+    if len(items) != 2:
+        raise diag(
+            WRONG_ARITY, at, f"a pattern for variant '{name}' binds exactly one name"
+        )
+    bound = items[1]
+    if not isinstance(bound, Token) or bound.kind != ATOM:
+        raise diag(UNKNOWN_NODE, at, "a variant pattern binds one name or '_'")
+    if bound.value == "_":
+        return (name, None, payload)
+    if bound.value.startswith(":"):
+        raise diag(UNKNOWN_NODE, at, "a variant pattern binds a name, not a type")
+    return (name, bound.value, payload)
 
 
 @dataclass(slots=True)
@@ -633,6 +838,12 @@ class _Var:
     for a capturing closure: one made inside a loop and stored in a binding
     declared outside it would outlive its iteration, when the environment slot
     is overwritten by the next pass (E0502).
+
+    ``handled`` is the obligation a ``(res T E)`` carries: the value was made,
+    so somebody has to look at its error slot. ``match``, ``try``, ``ret`` and
+    handing it to a callee all discharge it; letting the block that declared it
+    end first is E0602 at ``path``. ``path`` is the binding's own node, so the
+    diagnostic points at the declaration and not at the block that ends.
     """
 
     ty: Ty
@@ -641,6 +852,8 @@ class _Var:
     param: bool = False
     decl_loop: int = 0
     origin_loop: int = 0
+    handled: bool = False
+    path: str = ""
 
 
 class _Env:
@@ -693,20 +906,59 @@ class _Env:
 
     @contextmanager
     def block(self) -> Iterator[None]:
-        """Check the form inside ``with`` as one nested block."""
+        """Check the form inside ``with`` as one nested block.
+
+        Leaving the block is where an unhandled result is caught: a ``(res
+        T E)`` declared in it and never matched, tried, returned or passed on
+        is E0602 at its declaration. The check runs only on the normal path —
+        an exception on the way out is already a diagnostic.
+        """
         self.scopes.append({})
         try:
             yield
-        finally:
+        except BaseException:
             self.scopes.pop()
+            raise
+        self._pending(self.scopes.pop())
+
+    def _pending(self, scope: dict[str, "_Var"]) -> None:
+        """Report the first result binding in ``scope`` that was never handled."""
+        for name, var in scope.items():
+            if isinstance(var.ty, Res) and not var.handled:
+                raise diag(
+                    UNHANDLED_RESULT,
+                    var.path,
+                    f"the result of '{name}' is never handled: match it or 'try' it",
+                )
+
+    def finish(self) -> None:
+        """Check the function block's own results, which no ``block`` closes."""
+        self._pending(self.scopes[0])
 
     def define(
-        self, name: str, ty: Ty, *, mutable: bool, path: str, param: bool = False
+        self,
+        name: str,
+        ty: Ty,
+        *,
+        mutable: bool,
+        path: str,
+        param: bool = False,
+        handled: bool = False,
     ) -> None:
         block = self.scopes[-1]
         if name in block:
             raise diag(DUPLICATE, path, f"duplicate definition '{name}'")
-        block[name] = _Var(ty, mutable, param=param, decl_loop=self.loop)
+        block[name] = _Var(
+            ty, mutable, param=param, decl_loop=self.loop, handled=handled, path=path
+        )
+
+    def find(self, name: str) -> _Var | None:
+        """The binding ``name`` holds in this environment, without capturing."""
+        for block in reversed(self.scopes):
+            var = block.get(name)
+            if var is not None:
+                return var
+        return None
 
     def lookup(self, name: str, where: str = "") -> _Var | None:
         """The binding ``name`` stands for, capturing it if this is a closure.
@@ -743,7 +995,14 @@ class _Env:
             mutable=False,
             param=True,
             origin_loop=found.origin_loop,
+            # The obligation of a result moves into the closure with the copy,
+            # and the outer binding is discharged by it: the closure's body is
+            # then checked for handling what it captured.
+            handled=not isinstance(found.ty, Res),
+            path=found.path,
         )
+        if isinstance(found.ty, Res):
+            found.handled = True
         self.scopes[0][name] = copy
         self.captures.append((name, found.ty))
         return copy
@@ -769,17 +1028,19 @@ class _Env:
 class _Visible:
     """The names one module can see.
 
-    ``own_*`` are this module's definitions; ``types``, ``fns`` and ``structs``
-    add the own definitions of each direct import, and nothing deeper, because
-    an import is not transitive.
+    ``own_*`` are this module's definitions; ``types``, ``fns``, ``structs`` and
+    ``enums`` add the own definitions of each direct import, and nothing deeper,
+    because an import is not transitive.
     """
 
     own_types: dict[str, Ty]
     own_fns: dict[str, FnTy]
     own_structs: dict[str, tuple[tuple[str, Ty], ...]]
+    own_enums: dict[str, tuple[tuple[str, Ty | None], ...]]
     types: dict[str, Ty]
     fns: dict[str, FnTy]
     structs: dict[str, tuple[tuple[str, Ty], ...]]
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]]
 
 
 #: ``expect`` and ``expect-leak`` are harness directives, not expressions. The
@@ -798,6 +1059,12 @@ PRINTERS = ("print", "println")
 #: A narrower integer needs an explicit cast, because there is no implicit
 #: conversion anywhere in the language and printing is no exception.
 PRINTABLE = ("i64", "u64", "f64", "bool", "str")
+
+#: The forms that build and propagate a result or an optional: ``(ok v)``,
+#: ``(err e)``, ``(some v)``, ``(none)`` and ``(try e)``. Like the printers they
+#: live outside the function namespace, and a user definition of one of these
+#: names shadows the form.
+RESULT_FORMS = ("ok", "err", "some", "none", "try")
 
 #: Built-in function names. A name is here once this module has a rule for it.
 BUILTINS = PRINTERS
@@ -839,6 +1106,10 @@ class _Checker:
         self.declared: dict[str, Ty] = {}
         self._types: dict[str, Ty] = {}
         self._structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        self._enums: dict[str, tuple[tuple[str, Ty | None], ...]] = {}
+        #: Every variant name a visible enum declares, and the enums that
+        #: declare it: the constructor namespace, spelled bare.
+        self._variants: dict[str, list[tuple[str, Ty | None]]] = {}
         self._seen: dict[str, _Visible] = {}
         self._active: list[str] = []
         #: Which body's record the checker is writing: the module's own, or one
@@ -864,6 +1135,14 @@ class _Checker:
         visible = self._visible(self.module)
         self._types = visible.types
         self._structs = visible.structs
+        self._enums = visible.enums
+        for enum_name, variants in visible.enums.items():
+            for variant, payload in variants:
+                # A variant name is a constructor: one visible enum declaring
+                # it is what `(bad-digit 5)` means. Two is a question only the
+                # source can answer, so the ambiguity is reported where the
+                # constructor is used.
+                self._variants.setdefault(variant, []).append((enum_name, payload))
         self._bodies = {name: node for name, node in self.module.fns.items()}
         for node in self.module.fns.values():
             self._check_fn(node, visible.fns)
@@ -881,6 +1160,7 @@ class _Checker:
             self.declared,
             dict(self._instances),
             frozenset(self._params),
+            dict(visible.enums),
         )
 
     # -- namespaces ------------------------------------------------------
@@ -901,6 +1181,7 @@ class _Checker:
             inherited: dict[str, Ty] = {}
             inherited_fns: dict[str, FnTy] = {}
             inherited_structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+            inherited_enums: dict[str, tuple[tuple[str, Ty | None], ...]] = {}
             for imported in module.imports.values():
                 # Only the import's own names cross the boundary: a module
                 # never inherits its imports' imports.
@@ -908,6 +1189,7 @@ class _Checker:
                 inherited.update(visible.own_types)
                 inherited_fns.update(visible.own_fns)
                 inherited_structs.update(visible.own_structs)
+                inherited_enums.update(visible.own_enums)
             own_types = {
                 name: _declared(name, node) for name, node in module.types.items()
             }
@@ -917,12 +1199,17 @@ class _Checker:
             # may name a type declared after it. The fields themselves are read
             # second, once every name they might mention exists.
             own_structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+            own_enums: dict[str, tuple[tuple[str, Ty | None], ...]] = {}
             for name, node in module.types.items():
                 body = node.items[2] if len(node.items) > 2 else None
                 if isinstance(body, Node) and body.kind == "struct":
                     own_structs[name] = struct_shape(body, types)
+                elif isinstance(body, Node) and body.kind == "enum":
+                    own_enums[name] = enum_shape(body, types)
             structs = dict(inherited_structs)
             structs.update(own_structs)
+            enums = dict(inherited_enums)
+            enums.update(own_enums)
             own_fns: dict[str, FnTy] = {}
             for name, node in module.fns.items():
                 if name.startswith("rt_"):
@@ -934,7 +1221,9 @@ class _Checker:
                 own_fns[name] = self._signature(node, types)
             fns = dict(inherited_fns)
             fns.update(own_fns)
-            visible = _Visible(own_types, own_fns, own_structs, types, fns, structs)
+            visible = _Visible(
+                own_types, own_fns, own_structs, own_enums, types, fns, structs, enums
+            )
         finally:
             self._active.pop()
         self._seen[module.name] = visible
@@ -1015,7 +1304,8 @@ class _Checker:
             if item.kind == "fn":
                 self._check_helper(item, env)
                 continue
-            self._expr(item, env)
+            self._statement(item, env)
+        env.finish()
 
     def _check_helper(self, node: Node, env: _Env) -> None:
         """A ``fn`` private to one test: same rules, test-local visibility."""
@@ -1064,17 +1354,37 @@ class _Checker:
 
         Shared by a function body, a test helper and a closure body: all three
         are a block of forms whose last promise is the declared return type.
+        The block's own result bindings are discharged here too, because the
+        function block is the one scope no ``with env.block()`` ever closes.
         """
         for item in statements:
             if not isinstance(item, Node):
                 raise diag(UNKNOWN_NODE, path, "a statement must be a form")
-            self._expr(item, env)
+            self._statement(item, env)
         if env.ret != Prim("void") and not _contains_ret(statements):
             raise diag(
                 MISSING_RETURN,
                 path,
                 f"{env.label} must return {env.ret} but has no 'ret'",
             )
+        env.finish()
+
+    def _statement(self, node: Node, env: _Env) -> Ty:
+        """Check one statement, refusing a result that is thrown away.
+
+        A ``(res T E)`` in statement position — ``(parse x)`` on its own, an
+        ``if`` whose arms produce results — is the value the error slot exists
+        for, dropped on the floor. E0602 says so here, where the shape is
+        visible; a binding is caught when its block ends.
+        """
+        ty = self._expr(node, env)
+        if isinstance(ty, Res):
+            raise diag(
+                UNHANDLED_RESULT,
+                node.path,
+                f"this {ty} is never handled: match it or 'try' it",
+            )
+        return ty
 
     # -- expressions -----------------------------------------------------
 
@@ -1155,7 +1465,7 @@ class _Checker:
             return self._ptr_add(node, env)
         head = node.items[0] if node.items else None
         if isinstance(head, Token) and head.kind == ATOM:
-            return self._call(node, env)
+            return self._call(node, env, expected)
         raise diag(UNKNOWN_NODE, node.path, f"unknown node '{kind}'")
 
     def _value(
@@ -1215,6 +1525,19 @@ class _Checker:
                         "a module boundary",
                     )
                 return bare
+            variant = self._variant_type(token.value, where)
+            if variant is not None:
+                # A payload-less variant is a value wherever a name is: `let e
+                # overflow` is the same value `(overflow)` builds.
+                enum, payload = variant
+                if payload is not None:
+                    raise diag(
+                        TYPE_MISMATCH,
+                        where,
+                        f"variant '{token.value}' holds a value: "
+                        f"write ({token.value} name)",
+                    )
+                return EnumRef(enum)
             raise diag(NOT_FOUND, where, f"unknown name '{token.value}'")
         raise diag(UNKNOWN_NODE, where, "expected a value")
 
@@ -1339,6 +1662,11 @@ class _Checker:
             path=node.path,
         )
         env.scopes[-1][name].origin_loop = origin
+        if isinstance(bound, Res):
+            # The obligation follows the value: a result copied into a second
+            # binding is the new binding's to handle, and the source is not
+            # reported for it.
+            self._handled(init, env)
         return Prim("void")
 
     def _set(self, node: Node, env: _Env) -> Ty:
@@ -1382,6 +1710,10 @@ class _Checker:
             # copies.
             raise diag(CLOSURE_ESCAPE, node.path, _CLOSURE_ESCAPE)
         var.origin_loop = origin
+        if isinstance(var.ty, Res):
+            # A new result replaces the old one: the obligation is the new
+            # value's, so the binding is pending again.
+            var.handled = False
         return Prim("void")
 
     def _branches(self, env: _Env, branches: list[Callable[[], Ty]]) -> list[Ty]:
@@ -1474,7 +1806,7 @@ class _Checker:
                             raise diag(
                                 UNKNOWN_NODE, node.path, "a statement must be a form"
                             )
-                        self._expr(statement, env)
+                        self._statement(statement, env)
             finally:
                 env.loop -= 1
             return Prim("void")
@@ -1523,24 +1855,97 @@ class _Checker:
         return Prim("bool")
 
     def _match(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        """``match``: an integer, an enum, a result or an optional.
+
+        An integer's arms are literals because no finite list of them covers
+        the domain; a fall-through is the runtime's R0003. An enum, a result
+        and an optional are *closed* — their variants are declared — so the
+        same fall-through is statically impossible and a missing arm is E0600.
+        A ``_`` arm covers whatever is left, which is why a match on one of
+        them may be written either way.
+
+        A result is a two-variant set — ``(ok v)`` and ``(err e)`` — and an
+        optional is ``(some v)`` and ``(none)``: the same reader handles all
+        three, so a match cannot be exhaustive for one and not the other.
+        """
         scrutinee, arms = match_shape(node)
         ty = self._value(scrutinee, env, None, node.path)
-        if not _integer(ty):
-            raise diag(
-                TYPE_MISMATCH,
-                _at(scrutinee, node),
-                f"'match' needs an integer, found {ty}",
+        if isinstance(ty, Prim) and ty.name in INTEGERS:
+            return self._integer_match(node, env, expected, ty, arms)
+        variants = self._variants_of(ty, node)
+        # Whichever family this is, every arm's pattern is read once here and
+        # the plan is reused: the tag the arm tests and the name it binds come
+        # from the same reading.
+        plans: list[tuple[str | None, tuple[str, Ty, str] | None]] = []
+        seen: set[str] = set()
+        for pattern, _ in arms:
+            name, binding, payload = pattern_variant(
+                pattern, variants, where=node.path, owner=_owner(ty)
             )
-        result: Ty | None = None
+            if name is not None:
+                if name in seen:
+                    raise diag(
+                        UNKNOWN_NODE,
+                        _at(pattern, node),
+                        f"an arm for '{name}' can never match",
+                    )
+                seen.add(name)
+            plans.append(
+                (
+                    name,
+                    (binding, payload, _at(pattern, node)) if binding else None,
+                )
+            )
+        if not any(is_wildcard(pattern) for pattern, _ in arms):
+            missing = [name for name, _ in variants if name not in seen]
+            if missing:
+                raise diag(
+                    NON_EXHAUSTIVE,
+                    node.path,
+                    f"this match on {ty} does not handle "
+                    + ", ".join(f"'{name}'" for name in missing),
+                )
+        if isinstance(ty, Res):
+            # A matched result has been looked at; the obligation is gone even
+            # if only one arm could run in practice.
+            self._handled(scrutinee, env)
+        branches: list[Callable[[], Ty]] = []
+        for (_, body), plan in zip(arms, plans):
+            branches.append(
+                lambda body=body, plan=plan: self._arm(
+                    body, env, expected, node, plan[1]
+                )
+            )
+        return self._arm_types(env, branches, node)
+
+    def _integer_match(
+        self,
+        node: Node,
+        env: _Env,
+        expected: Ty | None,
+        ty: Ty,
+        arms: list[tuple[Node | Token, tuple[Node | Token, ...]]],
+    ) -> Ty:
+        """A match over integers: literals, ``_``, and the R0003 fall-through."""
         branches: list[Callable[[], Ty]] = []
         for pattern, body in arms:
             self._pattern(pattern, ty, node)
             branches.append(
-                lambda body=body: self._arm(body, env, expected, node)
+                lambda body=body: self._arm(body, env, expected, node, None)
             )
-        # Every arm is checked from the pre-match state and the arms' moves are
-        # unioned at the join: exactly one arm runs, but which one is not known
-        # here, so a value freed in any arm is gone afterwards.
+        return self._arm_types(env, branches, node)
+
+    def _arm_types(
+        self, env: _Env, branches: list[Callable[[], Ty]], node: Node
+    ) -> Ty:
+        """Check a match's arms as one statement, and give the match their type.
+
+        Every arm is checked from the pre-match state and the arms' moves are
+        unioned at the join: exactly one arm runs, but which one is not known
+        here, so a value freed in any arm is gone afterwards.
+        """
+        result: Ty | None = None
+        # ``arms`` is non-empty: ``match_shape`` refuses a match without one.
         for arm in self._branches(env, branches):
             if result is None:
                 result = arm
@@ -1552,7 +1957,6 @@ class _Checker:
                 )
             else:
                 result = _merge_functions(result, arm)
-        # ``arms`` is non-empty: ``match_shape`` refuses a match without one.
         if result is not None and holds_vector(result, self._structs):
             # R7, the same rule as ``if``: an arm still owns the buffer the
             # result descriptor names, so the result would be a second owner.
@@ -1563,11 +1967,34 @@ class _Checker:
             )
         return result  # type: ignore[return-value]
 
+    def _variants_of(
+        self, ty: Ty, node: Node
+    ) -> tuple[tuple[str, Ty | None], ...]:
+        """The closed set of variants a scrutinee of ``ty`` can be."""
+        if isinstance(ty, EnumRef):
+            variants = self._enums.get(ty.name)
+            if variants is None:
+                raise diag(UNKNOWN_TYPE, node.path, f"unknown type '{ty.name}'")
+            return variants
+        if isinstance(ty, Res):
+            return (("ok", ty.ok), ("err", ty.err))
+        if isinstance(ty, Opt):
+            return (("some", ty.elem), ("none", None))
+        raise diag(
+            TYPE_MISMATCH,
+            node.path,
+            f"'match' needs an integer, an enum, a result or an optional, found {ty}",
+        )
+
     def _pattern(self, pattern: Node | Token, ty: Ty, owner: Node) -> None:
         """One arm's pattern: an integer literal that fits ``ty``, or ``_``."""
         where = _at(pattern, owner)
         if not isinstance(pattern, Token):
-            raise diag(UNKNOWN_NODE, where, "a match pattern is an integer literal or '_'")
+            raise diag(
+                UNKNOWN_NODE,
+                where,
+                f"'{ty}' has no variants: a match pattern is an integer literal or '_'",
+            )
         if pattern.kind == NUMBER:
             got = _number(pattern, ty, where)
             if not compatible(ty, got):
@@ -1585,17 +2012,24 @@ class _Checker:
         env: _Env,
         expected: Ty | None,
         owner: Node,
+        binding: tuple[str, Ty, str] | None = None,
     ) -> Ty:
         """The type of one arm: its last item, after the statements before it.
 
         The arm is one block: a ``let`` in it is visible to the items after it
-        and to nothing outside the arm.
+        and to nothing outside the arm, and so is a payload a variant pattern
+        bound. It is a fresh, immutable binding at exactly the variant's type,
+        which is what makes ``(bad-digit n)`` read ``n`` as the ``:u64`` the
+        enum declared.
         """
         with env.block():
+            if binding is not None:
+                name, ty, path = binding
+                env.define(name, ty, mutable=False, path=path)
             for statement in body[:-1]:
                 if not isinstance(statement, Node):
                     raise diag(UNKNOWN_NODE, owner.path, "a statement must be a form")
-                self._expr(statement, env)
+                self._statement(statement, env)
             return self._value(body[-1], env, expected, owner.path)
 
     def _ret(self, node: Node, env: _Env) -> Ty:
@@ -1624,6 +2058,10 @@ class _Checker:
         if isinstance(env.ret, Own):
             # Returning an owning pointer hands it to the caller.
             self._consume(args[0], env, node.path)
+        if isinstance(env.ret, Res):
+            # The value leaves the function: its error slot is the caller's to
+            # handle, which is exactly what the annotated return type says.
+            self._handled(args[0], env)
         return Prim("void")
 
     # -- structs and fixed arrays ----------------------------------------
@@ -2309,6 +2747,196 @@ class _Checker:
                 f"a value containing a vector is not copyable; '{item.value}' moved",
             )
 
+    # -- results and optionals --------------------------------------------
+
+    def _result_form(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        """``(ok v)``, ``(err e)``, ``(some v)``, ``(none)`` and ``(try e)``.
+
+        One entry point because the five are one family: each builds or
+        consumes a tagged value whose tag the compiler owns. ``ok`` and ``err``
+        need the result type the context expects — there is no widening and no
+        inference to invent an error enum — while ``some`` infers an element
+        for itself and ``none`` cannot.
+        """
+        kind = node.kind
+        if kind == "try":
+            return self._try(node, env)
+        if kind == "none":
+            return self._none(node, env, expected)
+        if kind == "some":
+            return self._some(node, env, expected)
+        return self._ok_or_err(node, env, expected)
+
+    def _ok_or_err(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        """``(ok v)`` or ``(err e)`` at the result type the context declares."""
+        args = node.items[1:]
+        if len(args) != 1:
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes one value")
+        if not isinstance(expected, Res):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                f"cannot infer the result type of '{node.kind}': "
+                "annotate the binding or the return type",
+            )
+        value = self._value(
+            args[0], env, expected.ok if node.kind == "ok" else expected.err, node.path
+        )
+        wanted = expected.ok if node.kind == "ok" else expected.err
+        if not _fits(wanted, value):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(args[0], node),
+                f"'{node.kind}' expects {wanted}, found {value}",
+            )
+        self._refuse_carried(value, args[0], node, "a result")
+        return expected
+
+    def _some(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        """``(some v)``: an optional, at the annotation's element or v's own type."""
+        args = node.items[1:]
+        if len(args) != 1:
+            raise diag(WRONG_ARITY, node.path, "'some' takes one value")
+        elem = expected.elem if isinstance(expected, Opt) else None
+        value = self._value(args[0], env, elem, node.path)
+        if elem is not None and not _fits(elem, value):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(args[0], node),
+                f"'some' expects {elem}, found {value}",
+            )
+        self._refuse_carried(value, args[0], node, "an optional")
+        return Opt(elem if elem is not None else value)
+
+    def _none(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
+        """``(none)``: the empty optional. Its element is the annotation's."""
+        if len(node.items) != 1:
+            raise diag(WRONG_ARITY, node.path, "'none' takes no values")
+        if not isinstance(expected, Opt):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                "cannot infer the element type of 'none': annotate the binding "
+                "or the return type",
+            )
+        return expected
+
+    def _try(self, node: Node, env: _Env) -> Ty:
+        """``(try e)``: the ok value, or an early ``(err e)`` for the caller.
+
+        Propagation is exact: the enclosing function must return a result whose
+        error type is *the same* enum. There is no widening and no union, so a
+        different error type is E0601 and the source maps it in a ``match``.
+        """
+        args = node.items[1:]
+        if len(args) != 1:
+            raise diag(WRONG_ARITY, node.path, "'try' takes one result")
+        inner = self._value(args[0], env, None, node.path)
+        if not isinstance(inner, Res):
+            raise diag(
+                TRY_MISMATCH, node.path, f"'try' needs a result, found {inner}"
+            )
+        if not isinstance(env.ret, Res):
+            raise diag(
+                TRY_MISMATCH,
+                node.path,
+                f"{env.label} returns {env.ret}, so it cannot propagate {inner}",
+            )
+        if not compatible(env.ret.err, inner.err):
+            raise diag(
+                TRY_MISMATCH,
+                node.path,
+                f"cannot 'try' a result whose error is {inner.err}: "
+                f"{env.label} returns {env.ret}",
+            )
+        # The error is the caller's to handle now; the ok value is this
+        # expression's.
+        self._handled(args[0], env)
+        return inner.ok
+
+    def _handled(self, item: Node | Token, env: _Env) -> None:
+        """Discharge a result binding's obligation (see :meth:`_Env.finish`)."""
+        if not (isinstance(item, Token) and item.kind == ATOM):
+            return
+        var = env.find(item.value)
+        if var is not None and isinstance(var.ty, Res):
+            var.handled = True
+
+    def _refuse_carried(self, ty: Ty, item: Node | Token, node: Node, what: str) -> None:
+        """Refuse a vector or a result carried inside a tagged value.
+
+        A tagged value is copied where it is built, and a vector's descriptor
+        has no copy: the enum's payload or the result's slot would be a second
+        owner of a buffer nothing could release. A result inside one would be
+        an obligation with no name to discharge it, which is E0602 — the value
+        its error slot exists for, hidden one level down. Both are refused at
+        the construction, where the source still names the inner value.
+        """
+        if holds_vector(ty, self._structs):
+            raise diag(
+                VEC_MOVE,
+                _at(item, node),
+                f"a vector cannot be carried in {what} yet",
+            )
+        if _stored_result(ty):
+            raise diag(
+                UNHANDLED_RESULT,
+                _at(item, node),
+                f"this result cannot be carried in {what}: handle it first",
+            )
+
+    def _variant_type(self, name: str, where: str) -> tuple[str, Ty | None] | None:
+        """The enum and payload a variant name declares, or ``None``.
+
+        Shared by the two spellings of a constructor: the form ``(bad 5)`` and
+        the bare atom ``overflow``. Two visible enums declaring one name is
+        ambiguous — the constructor would have to guess which type to build —
+        so it is E0005 at the use.
+        """
+        found = self._variants.get(name)
+        if not found:
+            return None
+        if len(found) > 1:
+            enums = ", ".join(sorted(enum for enum, _ in found))
+            raise diag(
+                NOT_FOUND,
+                where,
+                f"variant '{name}' is declared by more than one enum ({enums})",
+            )
+        return found[0]
+
+    def _construct(self, node: Node, env: _Env) -> Ty | None:
+        """``(variant v)`` or ``variant``: a value of the enum that declares it.
+
+        The variant namespace is the module's visible enums, like a C enum's
+        enumerators. A payload-less variant is written bare, ``overflow``; a
+        variant that carries a value is written as a form, ``(bad 5)``.
+        """
+        name = node.kind
+        found = self._variant_type(name, node.path)
+        if found is None:
+            return None
+        enum, payload = found
+        args = node.items[1:]
+        if payload is None:
+            if args:
+                raise diag(
+                    WRONG_ARITY, node.path, f"variant '{name}' takes no value"
+                )
+        else:
+            if len(args) != 1:
+                raise diag(
+                    WRONG_ARITY, node.path, f"variant '{name}' takes one value"
+                )
+            value = self._value(args[0], env, payload, node.path)
+            if not _fits(payload, value):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(args[0], node),
+                    f"variant '{name}' holds {payload}, found {value}",
+                )
+        return EnumRef(enum)
+
     def _printer(self, node: Node, env: _Env) -> Ty:
         """``print``/``println`` of one scalar the runtime formats.
 
@@ -2334,13 +2962,18 @@ class _Checker:
             )
         return Prim("void")
 
-    def _call(self, node: Node, env: _Env) -> Ty:
+    def _call(self, node: Node, env: _Env, expected: Ty | None = None) -> Ty:
         """A call: through a binding's ``(fn ...)`` type, or by name.
 
         A name that a binding shadows is that binding — a function value called
         indirectly. A name in the function namespace is a definition; when its
         signature mentions a type variable the call is an instantiation, and
         when it does not it is the plain direct call it always was.
+
+        A name that is neither is one of the compiler's own forms — the
+        printers, ``ok``/``err``/``some``/``none``/``try`` — or an enum
+        variant, which is a constructor. A user definition of one of those
+        names shadows the form, exactly as ``print`` already does.
         """
         name = node.kind
         var = env.lookup(name, node.path)
@@ -2354,6 +2987,11 @@ class _Checker:
         if found is None:
             if name in PRINTERS:
                 return self._printer(node, env)
+            if name in RESULT_FORMS:
+                return self._result_form(node, env, expected)
+            constructed = self._construct(node, env)
+            if constructed is not None:
+                return constructed
             raise diag(UNKNOWN_FUNCTION, node.path, f"unknown function '{name}'")
         if name in self._params:
             return self._generic_call(node, env, name, found)
@@ -2404,6 +3042,10 @@ class _Checker:
                 # The callee owns what it is handed: the argument moves into
                 # the parameter and the caller's binding is empty afterwards.
                 self._consume(arg, env, node.path)
+            if isinstance(param, Res):
+                # The callee's parameter carries the obligation now, and its
+                # own body is checked for it.
+                self._handled(arg, env)
         return sig.ret
 
     # -- generics ---------------------------------------------------------
@@ -2469,6 +3111,8 @@ class _Checker:
                 self._consume(arg, env, node.path)
             elif isinstance(concrete, Own):
                 self._consume(arg, env, node.path)
+            if isinstance(concrete, Res):
+                self._handled(arg, env)
         target = self._instantiate(node, name, bindings)
         self._record.call_targets[node.path] = target.name
         return target.ret
@@ -2817,16 +3461,47 @@ def resolve_type(
     if isinstance(ty, Own):
         return Own(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Opt):
-        return Opt(resolve_type(ty.elem, types, path, bindings))
+        elem = resolve_type(ty.elem, types, path, bindings)
+        if holds_vector(elem):
+            # Same reason a vector may not be a struct field: a tagged value is
+            # copied where it is built, and a vector's descriptor has no copy.
+            raise diag(
+                UNKNOWN_NODE, path, "a vector cannot be inside an optional yet"
+            )
+        if _stored_result(elem):
+            # An optional is storage, and a result's obligation is discharged
+            # through a name; nesting one here would drop it.
+            raise diag(
+                UNKNOWN_NODE, path, "a result cannot be inside an optional yet"
+            )
+        return Opt(elem)
     if isinstance(ty, Shared):
         return Shared(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Vec):
-        return Vec(resolve_type(ty.elem, types, path, bindings))
+        elem = resolve_type(ty.elem, types, path, bindings)
+        if _stored_result(elem):
+            raise diag(
+                UNKNOWN_NODE, path, "a result cannot be a vector element yet"
+            )
+        return Vec(elem)
     if isinstance(ty, Res):
-        return Res(
-            resolve_type(ty.ok, types, path, bindings),
-            resolve_type(ty.err, types, path, bindings),
-        )
+        ok = resolve_type(ty.ok, types, path, bindings)
+        err = resolve_type(ty.err, types, path, bindings)
+        if not isinstance(err, EnumRef):
+            # The error slot is a declared enum and nothing else: `try` needs
+            # one identity to compare, and a primitive or a struct has none.
+            raise diag(
+                UNKNOWN_TYPE,
+                path,
+                f"the error type of a result must be a declared enum, found {err}",
+            )
+        if holds_vector(ok):
+            raise diag(UNKNOWN_NODE, path, "a vector cannot be inside a result yet")
+        if _stored_result(ok):
+            raise diag(
+                UNKNOWN_NODE, path, "a result cannot be inside a result yet"
+            )
+        return Res(ok, err)
     if isinstance(ty, FnTy):
         params = tuple(
             resolve_type(param, types, path, bindings) for param in ty.params
@@ -2844,6 +3519,8 @@ def resolve_type(
         # is not a place this language can name, so a vector stored there
         # could never release its buffer. Refused where the array is spelled.
         raise diag(UNKNOWN_NODE, path, "vector array elements are not supported yet")
+    if _stored_result(elem):
+        raise diag(UNKNOWN_NODE, path, "a result cannot be an array element yet")
     return Arr(elem, ty.n)
 
 
@@ -2992,6 +3669,22 @@ def _pointee(ty: Ty) -> Ty | None:
     return None
 
 
+def _stored_result(ty: Ty) -> bool:
+    """Whether ``ty`` *is* a result, or an array or optional of one.
+
+    A result is an obligation, and the checker discharges it through the names
+    it can see: a binding, a parameter, a ``ret``, an argument, an arm's value.
+    A slot in an aggregate has no name, so a result stored there would be
+    dropped without ever being matched — refused where the storage is spelled,
+    until places can carry an obligation.
+    """
+    if isinstance(ty, Res):
+        return True
+    if isinstance(ty, (Arr, Vec, Opt)):
+        return _stored_result(ty.elem)
+    return False
+
+
 def _is_void(ty: Ty) -> bool:
     return isinstance(ty, Prim) and ty.name == "void"
 
@@ -3036,6 +3729,17 @@ def _merge_functions(a: Ty, b: Ty) -> Ty:
 def _at(item: Node | Token, owner: Node) -> str:
     """The path a diagnostic should name: the item's, else its owner's."""
     return item.path if isinstance(item, Node) and item.path else owner.path
+
+
+def _owner(ty: Ty) -> str:
+    """How a message names the set of variants a value of ``ty`` can be."""
+    if isinstance(ty, EnumRef):
+        return f"enum '{ty.name}'"
+    if isinstance(ty, Res):
+        return "a result"
+    if isinstance(ty, Opt):
+        return "an optional"
+    return str(ty)
 
 
 def _count(n: int, noun: str) -> str:

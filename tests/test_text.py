@@ -857,11 +857,13 @@ class VecLoweringTest(unittest.TestCase):
         self.assertIn("{ %struct.p*, i64, i64 }", text)
 
     def test_a_vector_of_an_unlowered_type_is_e0002(self):
+        # ``(opt T)`` has a layout now; ``(shared T)`` belongs to a later task
+        # and must still be a diagnostic at the node that named it.
         error = fail_on_lower(
-            "(mod m)(fn f :void ((v (vec (res :i64 :i64)))) (ret))"
+            "(mod m)(fn f :void ((v (vec (shared :i64)))) (ret))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(res :i64 :i64) is not lowered yet")
+        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
 
 
 class FormattingLoweringTest(unittest.TestCase):

@@ -160,6 +160,28 @@ propagates only when the caller's error type is exactly the same type;
 otherwise the caller maps it explicitly in a `match`. There is no error
 widening and no union type in v1.
 
+An enum is a closed set of named variants, each with no payload or one:
+
+```
+(type parse-error (enum (bad-digit :u64) (overflow)))
+```
+
+A variant is built by its bare name — `(bad-digit c)` with a value, `overflow`
+without — and matched by name: `((bad-digit n) ...)` binds the payload to `n`
+for that arm, `(overflow ...)` carries none. A match over an enum, a result or
+an optional must name every variant, or end with `_`; a missing one is E0600.
+`(res T E)` matches as `(ok v)`/`(err e)` and `(opt T)` as `(some v)`/`(none)`.
+A `try` whose error type is not the enclosing function's is E0601, and a result
+in statement position or in a binding nobody handles is E0602. A result may not
+be stored in an aggregate yet — a struct field, an array or vector element, an
+enum payload, another result or an optional — because the obligation is
+discharged through a name and those slots have none: the storage is E0002 and a
+result handed to `(ok ...)` or `(some ...)` is E0602.
+
+In memory a result is `{ i1, T, E }`, an optional is `{ i1, T }` and an enum is
+`{ i32, [K x i64] }` — a tag and a payload area wide enough for its widest
+variant — so one type holds every variant and the tag is what a `match` tests.
+
 ### Closures
 
 `(fn (x :T) body)` creates a function value that captures the names it

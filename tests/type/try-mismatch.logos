@@ -1,0 +1,11 @@
+(mod try-mismatch)
+
+(type parse-error (enum (bad :u64) (overflow)))
+(type io-error (enum (nope)))
+
+(fn parse :(res :i64 parse-error) ()
+  (ret (err (bad 1))))
+
+(fn caller :(res :i64 io-error) ()
+  (let v (try (parse)))
+  (ret (ok v)))

@@ -7,11 +7,40 @@ and ``set``, ``ret``, calls, ``if``, ``while``, ``match``, ``break``/
 ``continue``, comparisons, ``and``/``or``/``not``, ``print``/``println`` over
 every printable scalar, checked integer division, structs (``make``, ``get``,
 ``set-field``), fixed arrays (``make``, ``arr-get``, ``arr-set``), strings
-(``str-len``, ``str-concat``, ``str-eq``, ``str-slice``) and vectors
-(``make``, ``vec-push``, ``vec-len``, ``vec-get``, ``vec-set``, ``vec-free``). A
-construct the checker accepts but this pass does not lower yet is reported as
-a diagnostic at its own path — never a ``KeyError`` or a ``ValueError``, and
-never silently miscompiled.
+(``str-len``, ``str-concat``, ``str-eq``, ``str-slice``), vectors
+(``make``, ``vec-push``, ``vec-len``, ``vec-get``, ``vec-set``, ``vec-free``)
+and the tagged values of results and optionals (``ok``, ``err``, ``some``,
+``none``, ``try``). A construct the checker accepts but this pass does not
+lower yet is reported as a diagnostic at its own path — never a ``KeyError``
+or a ``ValueError``, and never silently miscompiled.
+
+Results, optionals and enums
+----------------------------
+A result is ``{ i1, T, E }`` and an optional is ``{ i1, T }``: the tag first,
+then one slot per variant. ``(ok v)`` writes the tag and the ok slot,
+``(err e)`` the tag and the error slot, the unused slot staying ``undef``;
+``(some v)`` and ``(none)`` are the same shape with one slot. A ``match`` over
+one extracts the tag, tests it with a single ``icmp``, and reads the payload
+with ``extractvalue`` — no memory round trip, because both payloads are fields.
+
+``(try e)`` is the one form that returns: it tests the tag, and on the error
+path builds an ``(err e)`` of the *enclosing function's* return type and
+executes ``ret`` from the new block. The checker has already proved the two
+error types are the same enum, so the payload carries across unchanged. The ok
+path extracts the payload and continues in the block the expression was
+written in, which is what lets ``(try ...)`` sit inside a longer expression.
+
+An enum is ``{ i32, [K x i64] }`` — a tag and a payload area wide enough for
+its widest variant, so every variant is one LLVM type and a value passes
+between functions without a new type per variant. ``K`` is registered by the
+enclosing declaration, like a struct's field list, and ``sizeof_of`` uses the
+same rule. A variant with a payload is built in a stack slot: the tag stored at
+field 0, the payload at the first byte of the area through a bitcast pointer,
+then the slot loaded as a value. A variant without one is a single
+``insertvalue`` of its tag. Binding a payload in an arm reverses that: the
+value is stored, the area re-read through a pointer of the variant's own type
+and the result bound to a fresh slot. The tag is what makes the different
+interpretations safe — only the arm whose test passed reads the area.
 
 Structs and arrays
 ------------------
@@ -229,6 +258,7 @@ from logos import llvm
 from logos.check import (
     BUILTINS,
     DIRECTIVES,
+    RESULT_FORMS,
     CheckedModule,
     Closure,
     Instance,
@@ -239,6 +269,7 @@ from logos.check import (
     is_wildcard,
     let_shape,
     match_shape,
+    pattern_variant,
 )
 from logos.diag import (
     ARRAY_BOUNDS,
@@ -249,10 +280,12 @@ from logos.diag import (
     MISSING_RETURN,
     NOT_A_STR,
     NOT_FOUND,
+    TRY_MISMATCH,
     TYPE_MISMATCH,
     UNKNOWN_FIELD,
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
+    UNKNOWN_TYPE,
     WRONG_ARITY,
     diag,
 )
@@ -260,6 +293,7 @@ from logos.ir import (
     TRIPLE,
     IrBlock,
     IrDecl,
+    IrEnum,
     IrFn,
     IrGlobal,
     IrModule,
@@ -267,7 +301,21 @@ from logos.ir import (
 )
 from logos.lexer import ATOM, NUMBER, STRING, Token
 from logos.nodes import Node
-from logos.types import INTEGERS, Arr, FnTy, Own, Prim, Ptr, StructRef, Ty, Vec
+from logos.types import (
+    INTEGERS,
+    Arr,
+    EnumRef,
+    FnTy,
+    Opt,
+    Own,
+    Prim,
+    Ptr,
+    Res,
+    StructRef,
+    Ty,
+    Vec,
+    compatible,
+)
 
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
@@ -377,24 +425,27 @@ _MEMCPY = IrDecl("memcpy", (_VOID_PTR, _VOID_PTR, Prim("i64")), _VOID_PTR)
 
 
 def lowered_type(
-    ty: Ty, path: str, structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None
+    ty: Ty,
+    path: str,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
 ) -> Ty:
     """Return ``ty`` if the printer has a layout for it, else raise E0002.
 
     The checker's type vocabulary is larger than this backend's: a parameter,
-    binding or result may name ``(vec :i64)``, ``(own T)`` or ``(res T E)`` and
-    still type-check. Materialising one would reach
+    binding or result may name ``(vec :i64)``, ``(own T)`` or ``(shared T)``
+    and still type-check. Materialising one would reach
     :func:`logos.llvm.type_text` and escape as a bare ``ValueError`` with no
     node path, so every place that materialises a type passes through here and
     the refusal is a diagnostic at the node that named it.
 
-    A struct or an array is lowerable only when every type inside it is, so
-    ``structs`` supplies the field lists and the walk descends. An enum has no
-    layout yet: it reaches ``type_text`` as an unsupported type and is refused
-    the same way. A struct that contains itself by value is refused too, because
-    no finite LLVM type spells an infinite one.
+    A struct, an enum, a result, an optional or an array is lowerable only when
+    every type inside it is, so ``structs`` and ``enums`` supply the
+    declarations and the walk descends. A struct that contains itself by value
+    — directly, or through an enum payload — is refused too, because no finite
+    LLVM type spells an infinite one.
     """
-    bad, cycle = _unlowered(ty, structs or {}, ())
+    bad, cycle = _unlowered(ty, structs or {}, enums or {}, ())
     if cycle is not None:
         raise diag(UNKNOWN_NODE, path, f"struct '{cycle}' contains itself by value")
     if bad is not None:
@@ -403,7 +454,10 @@ def lowered_type(
 
 
 def _unlowered(
-    ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]], stack: tuple[str, ...]
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]],
+    stack: tuple[str, ...],
 ) -> tuple[Ty | None, str | None]:
     """The first type in ``ty`` with no layout, and any value cycle found.
 
@@ -421,22 +475,53 @@ def _unlowered(
     runs — so the case is here to keep the message true, not to allow it.)
     """
     if isinstance(ty, (Ptr, Own)):
-        bad, _ = _unlowered(ty.elem, structs, stack)
+        bad, _ = _unlowered(ty.elem, structs, enums, stack)
         return bad, None
     if isinstance(ty, Vec):
         # A vector's element has to have a layout: ``(vec :void)`` has no
-        # storage for an element, and ``(vec (res ...))`` would print a struct
-        # the backend cannot spell. The stack still grows through the element
-        # so the walk terminates, but a cycle it finds is not reported: it is
-        # one pointer deep, not a type that contains itself by value.
+        # storage for an element, and ``(vec (shared :i64))`` would print a
+        # type the backend cannot spell. The stack still grows through the
+        # element so the walk terminates, but a cycle it finds is not reported:
+        # it is one pointer deep, not a type that contains itself by value.
         if _is_void(ty.elem):
             return ty.elem, None
-        bad, _ = _unlowered(ty.elem, structs, stack)
+        bad, _ = _unlowered(ty.elem, structs, enums, stack)
         return bad, None
+    if isinstance(ty, Opt):
+        # ``{ i1, T }``: the tag needs no room, but T is stored beside it and
+        # has to have a layout, and ``(opt :void)`` has nothing to store.
+        if _is_void(ty.elem):
+            return ty.elem, None
+        return _unlowered(ty.elem, structs, enums, stack)
+    if isinstance(ty, Res):
+        # ``{ i1, T, E }``: both slots are storage, whatever variant the value
+        # actually is, so both are walked.
+        for part in (ty.ok, ty.err):
+            if _is_void(part):
+                return part, None
+            bad, cycle = _unlowered(part, structs, enums, stack)
+            if bad is not None or cycle is not None:
+                return bad, cycle
+        return None, None
+    if isinstance(ty, EnumRef):
+        if ty.name in stack:
+            return None, ty.name
+        variants = enums.get(ty.name)
+        if variants is None:
+            return ty, None
+        for _, payload in variants:
+            if payload is None:
+                continue
+            if _is_void(payload):
+                return payload, None
+            bad, cycle = _unlowered(payload, structs, enums, stack + (ty.name,))
+            if bad is not None or cycle is not None:
+                return bad, cycle
+        return None, None
     if isinstance(ty, Arr):
         if _is_void(ty.elem):
             return ty.elem, None
-        return _unlowered(ty.elem, structs, stack)
+        return _unlowered(ty.elem, structs, enums, stack)
     if isinstance(ty, FnTy):
         # A function value is two opaque words, but the type it is called
         # through is spelled at the call: every parameter and the result must
@@ -446,10 +531,10 @@ def _unlowered(
                 # A parameter is a storage location, and no ``void`` value
                 # exists to put in it.
                 return param, None
-            bad, cycle = _unlowered(param, structs, stack)
+            bad, cycle = _unlowered(param, structs, enums, stack)
             if bad is not None or cycle is not None:
                 return bad, cycle
-        return _unlowered(ty.ret, structs, stack)
+        return _unlowered(ty.ret, structs, enums, stack)
     try:
         llvm.type_text(ty)
     except ValueError:
@@ -465,7 +550,7 @@ def _unlowered(
                 # A field is a storage location, and no ``void`` value exists
                 # to put in it.
                 return field, None
-            bad, cycle = _unlowered(field, structs, stack + (ty.name,))
+            bad, cycle = _unlowered(field, structs, enums, stack + (ty.name,))
             if bad is not None or cycle is not None:
                 return bad, cycle
     return None, None
@@ -554,6 +639,10 @@ class _Lower:
         #: this backend cannot spell, and a module should not fail to build
         #: over a struct it never touched.
         self.structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        #: Every enum a function materialises, by name, with its payload width
+        #: in eight-byte words. Like ``structs`` it is dependency-first and only
+        #: holds what was used: a declaration nothing touches is not emitted.
+        self.enum_widths: dict[str, int] = {}
         #: The type record shared by everything that is not a copy: the
         #: module's own functions and its tests.
         self.body = Types(cm.expr_types, cm.call_targets, cm.closures, cm.declared)
@@ -597,31 +686,103 @@ class _Lower:
         """The global holding ``text`` as a NUL-terminated C string."""
         return self.intern(text.encode("utf-8") + b"\0")
 
+    def variant_tag(
+        self, name: str, where: str
+    ) -> tuple[EnumRef, int, Ty | None] | None:
+        """The enum, tag index and payload of a variant name, or ``None``.
+
+        The checker has already resolved a constructor's name and refused an
+        ambiguous one; this answers for the backend from the declarations it
+        lowered, and reports the same ambiguity rather than picking an enum,
+        because a pick would build a value of a type the checker never saw.
+        """
+        found: list[tuple[str, int, Ty | None]] = []
+        for enum, variants in self.cm.enums.items():
+            for index, (variant, payload) in enumerate(variants):
+                if variant == name:
+                    found.append((enum, index, payload))
+        if not found:
+            return None
+        if len(found) > 1:
+            raise diag(
+                NOT_FOUND,
+                where,
+                f"variant '{name}' is declared by more than one enum ("
+                + ", ".join(sorted(enum for enum, _, _ in found))
+                + ")",
+            )
+        enum, index, payload = found[0]
+        return (EnumRef(enum), index, payload)
+
     def declare(self, decl: IrDecl) -> None:
         if decl not in self.declares:
             self.declares.append(decl)
 
     def use_type(self, ty: Ty, path: str) -> None:
-        """Refuse a type with no layout, and record the structs it needs.
+        """Refuse a type with no layout, and record the types it needs.
 
         Validation is the public :func:`lowered_type`, which descends into
-        struct fields and array elements. Collection is separate and post-order,
-        so ``%struct.line`` is printed after ``%struct.pair``, the type it
-        contains: a definition may then be read top to bottom.
+        struct fields, enum payloads and array elements. Registration is
+        separate and post-order, so ``%struct.line`` is printed after
+        ``%struct.pair``, the type it contains: a definition may then be read
+        top to bottom. An enum is registered before validation because its
+        layout is ``{ i32, [K x i64] }`` and ``K`` is a fact about the
+        declaration the type spelling cannot read for itself.
         """
-        lowered_type(ty, path, self.cm.structs)
+        self._register_enums(ty)
+        lowered_type(ty, path, self.cm.structs, self.cm.enums)
         self._collect(ty)
 
+    def _register_enums(self, ty: Ty, stack: tuple[str, ...] = ()) -> None:
+        """Record the payload width of every enum ``ty`` names, innermost first.
+
+        ``K`` is the largest payload of the enum, in eight-byte words, so a
+        payload that is itself an enum has to be measured first. ``stack``
+        holds the type names being walked, which is what stops a struct that
+        points at itself from walking forever.
+        """
+        if isinstance(ty, EnumRef):
+            if ty.name in stack:
+                return
+            variants = self.cm.enums.get(ty.name)
+            if variants is None:
+                return
+            for _, payload in variants:
+                if payload is not None:
+                    self._register_enums(payload, stack + (ty.name,))
+            words = enum_words(ty.name, self.cm.enums, self.cm.structs)
+            llvm.register_enum(ty.name, words)
+            self.enum_widths[ty.name] = words
+        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt)):
+            self._register_enums(ty.elem, stack)
+        elif isinstance(ty, Res):
+            self._register_enums(ty.ok, stack)
+            self._register_enums(ty.err, stack)
+        elif isinstance(ty, FnTy):
+            for param in ty.params:
+                self._register_enums(param, stack)
+            self._register_enums(ty.ret, stack)
+        elif isinstance(ty, StructRef):
+            if ty.name in stack:
+                return
+            for _, field in self.cm.structs.get(ty.name, ()):
+                self._register_enums(field, stack + (ty.name,))
+
     def _collect(self, ty: Ty, stack: tuple[str, ...] = ()) -> None:
-        """Record every struct ``ty`` names, dependencies first.
+        """Record every struct and enum ``ty`` names, dependencies first.
 
         A struct reached only through a pointer is collected too: a signature,
         a field or an array element names it as ``%struct.point*``, and clang
         refuses a use of an identified type that is never defined. ``stack``
-        holds the structs currently being collected, so a pointer back to one
-        of them stops there instead of walking forever: a struct that contains
-        a pointer to itself is finite (``%struct.node = type { %struct.node*
-        }``), unlike a struct that contains itself by value.
+        holds the types currently being collected, so a pointer back to one of
+        them stops there instead of walking forever: a struct that contains a
+        pointer to itself is finite (``%struct.node = type { %struct.node* }``),
+        unlike a struct that contains itself by value.
+
+        An enum is collected through its payloads as well: an enum whose
+        payload names a struct spells that struct's identified type inside the
+        value, so the definition has to be emitted too. It has no definition
+        line of its own — ``{ i32, [K x i64] }`` is a literal.
         """
         if isinstance(ty, StructRef):
             if ty.name in self.structs or ty.name in stack:
@@ -633,8 +794,17 @@ class _Lower:
                 self._collect(field, stack + (ty.name,))
             self.structs[ty.name] = fields
             llvm.register_struct(ty.name, tuple(fty for _, fty in fields))
-        elif isinstance(ty, (Arr, Ptr, Own, Vec)):
+        elif isinstance(ty, EnumRef):
+            if ty.name in stack:
+                return
+            for _, payload in self.cm.enums.get(ty.name, ()):
+                if payload is not None:
+                    self._collect(payload, stack + (ty.name,))
+        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt)):
             self._collect(ty.elem, stack)
+        elif isinstance(ty, Res):
+            self._collect(ty.ok, stack)
+            self._collect(ty.err, stack)
         elif isinstance(ty, FnTy):
             for param in ty.params:
                 self._collect(param, stack)
@@ -729,10 +899,13 @@ class _Lower:
         self.ir.functions.append(fn)
 
     def close(self) -> IrModule:
-        """Finish the module: its struct definitions, then its declarations."""
+        """Finish the module: its struct and enum definitions, then its declares."""
         self.ir.structs = [
             IrStruct(name, tuple(fty for _, fty in fields))
             for name, fields in self.structs.items()
+        ]
+        self.ir.enums = [
+            IrEnum(name, words) for name, words in self.enum_widths.items()
         ]
         self.ir.declares = list(self.declares)
         return self.ir
@@ -1010,6 +1183,188 @@ class _Fn:
         dest = self.temp()
         self.emit(("trunc", dest, Prim("i64"), _ENTRY_RET, value))
         return dest
+
+    # -- results, optionals and enums ------------------------------------
+
+    def result_value(self, node: Node) -> str:
+        """``(ok v)`` or ``(err e)``: the tag, then one of the two slots.
+
+        The unused slot stays ``undef``: a result is ``{ i1, T, E }`` and only
+        one of the two payloads exists. Nothing reads the other, because every
+        read of a payload is guarded by the tag the match tested.
+        """
+        ty = self.type_of(node)
+        if not isinstance(ty, Res):
+            raise diag(UNKNOWN_NODE, node.path, f"'{node.kind}' is not a result here")
+        if len(node.items) != 2:
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes one value")
+        self.lowering.use_type(ty, node.path)
+        if node.kind == "ok":
+            part, index, tag = ty.ok, 1, "true"
+        else:
+            part, index, tag = ty.err, 2, "false"
+        value = self.value(node.items[1], node.path)
+        partial = self.temp()
+        self.emit(("insertvalue", partial, ty, "undef", Prim("bool"), tag, 0))
+        whole = self.temp()
+        self.emit(("insertvalue", whole, ty, partial, part, value, index))
+        return whole
+
+    def optional_value(self, node: Node) -> str:
+        """``(some v)`` or ``(none)``: ``{ i1, T }`` with the tag set."""
+        ty = self.type_of(node)
+        if not isinstance(ty, Opt):
+            raise diag(
+                UNKNOWN_NODE, node.path, f"'{node.kind}' is not an optional here"
+            )
+        self.lowering.use_type(ty, node.path)
+        if node.kind == "none":
+            if len(node.items) != 1:
+                raise diag(WRONG_ARITY, node.path, "'none' takes no values")
+            whole = self.temp()
+            self.emit(("insertvalue", whole, ty, "undef", Prim("bool"), "false", 0))
+            return whole
+        if len(node.items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'some' takes one value")
+        value = self.value(node.items[1], node.path)
+        partial = self.temp()
+        self.emit(("insertvalue", partial, ty, "undef", Prim("bool"), "true", 0))
+        whole = self.temp()
+        self.emit(("insertvalue", whole, ty, partial, ty.elem, value, 1))
+        return whole
+
+    def enum_value(self, node: Node, tag: tuple[EnumRef, int, Ty | None]) -> str:
+        """``(variant v)``: a tag and the payload the variant carries.
+
+        A payload is written into the enum's payload area through a typed
+        pointer: the aggregate is built in a stack slot, the tag stored first,
+        then the payload at the area's first byte. Loading the slot yields the
+        one value the whole enum has, whatever variant it is.
+        """
+        enum, index, payload = tag
+        ty = self.type_of(node)
+        if not isinstance(ty, EnumRef):
+            raise diag(UNKNOWN_NODE, node.path, f"'{node.kind}' is not a variant here")
+        self.lowering.use_type(ty, node.path)
+        if payload is None:
+            if len(node.items) != 1:
+                raise diag(
+                    WRONG_ARITY, node.path, f"variant '{node.kind}' takes no value"
+                )
+        elif len(node.items) != 2:
+            raise diag(WRONG_ARITY, node.path, f"variant '{node.kind}' takes one value")
+        if payload is None:
+            whole = self.temp()
+            self.emit(("insertvalue", whole, ty, "undef", Prim("i32"), str(index), 0))
+            return whole
+        value = self.value(node.items[1], node.path)
+        slot = self.slot(ty, path=node.path)
+        tag_address = self.temp()
+        self.emit(
+            ("gep", tag_address, ty, slot, (("i32", "0"), ("i32", "0")))
+        )
+        self.emit(("store", Prim("i32"), str(index), tag_address))
+        area = self.temp()
+        self.emit(("gep", area, ty, slot, (("i32", "0"), ("i32", "1"))))
+        words = enum_words(ty.name, self.cm.enums, self.cm.structs)
+        address = self.temp()
+        pointer = Ptr(Arr(Prim("i64"), words))
+        self.emit(("bitcast", address, pointer, Ptr(payload), area))
+        self.emit(("store", payload, value, address))
+        whole = self.temp()
+        self.emit(("load", whole, ty, slot))
+        return whole
+
+    def try_expr(self, node: Node) -> str:
+        """``(try e)``: test the tag, return the error or yield the ok value.
+
+        On the error path the enclosing function returns at once with an
+        ``(err e)`` of its own error type — the checker has already proved the
+        two are the same enum, so the payload carries across unchanged. On the
+        ok path the payload is extracted and execution continues in the block
+        the expression was written in.
+        """
+        ty = self.type_of(node)
+        if len(node.items) != 2:
+            raise diag(WRONG_ARITY, node.path, "'try' takes one result")
+        arg = node.items[1]
+        inner = self.type_of_item(arg, node.path)
+        if (
+            not isinstance(inner, Res)
+            or not isinstance(self.ret, Res)
+            or not compatible(inner.err, self.ret.err)
+        ):
+            # The checker refuses this before lowering; the message keeps a
+            # hand-built tree from reaching the printer as a ValueError.
+            raise diag(
+                TRY_MISMATCH,
+                node.path,
+                f"cannot 'try' {inner} in a function returning {self.ret}",
+            )
+        value = self.value(arg, node.path)
+        self.labels += 1
+        label = f"try{self.labels}"
+        ok_block, err_block = f"{label}.ok", f"{label}.err"
+        failed = self.temp()
+        self.emit(("extractvalue", failed, inner, Prim("bool"), value, 0))
+        self.block.term = ("cbr", failed, ok_block, err_block)
+        self.new_block(err_block)
+        error = self.temp()
+        self.emit(("extractvalue", error, inner, inner.err, value, 2))
+        partial = self.temp()
+        self.emit(("insertvalue", partial, self.ret, "undef", Prim("bool"), "false", 0))
+        whole = self.temp()
+        self.emit(
+            ("insertvalue", whole, self.ret, partial, self.ret.err, error, 2)
+        )
+        self.block.term = ("ret", self.ret, whole)
+        self.new_block(ok_block)
+        payload = self.temp()
+        self.emit(("extractvalue", payload, inner, ty, value, 1))
+        return payload
+
+    def bind_payload(
+        self,
+        variant: str,
+        name: str,
+        payload: Ty,
+        tested: Ty,
+        value: str,
+        memory: str | None,
+        path: str,
+    ) -> None:
+        """Bind one arm's payload name to the value the tag says is there.
+
+        A result and an optional carry their payload in a field, so one
+        ``extractvalue`` reads it. An enum has a uniform payload area, so the
+        value is stored and the area re-read through a pointer of the variant's
+        own type — the same bytes ``enum_value`` wrote.
+        """
+        if isinstance(tested, Res):
+            index = 1 if variant == "ok" else 2
+            extracted = self.temp()
+            self.emit(("extractvalue", extracted, tested, payload, value, index))
+        elif isinstance(tested, Opt):
+            extracted = self.temp()
+            self.emit(("extractvalue", extracted, tested, payload, value, 1))
+        else:
+            if memory is None or not isinstance(tested, EnumRef):
+                raise diag(
+                    UNKNOWN_NODE, path, "a variant binding needs the enum in memory"
+                )
+            words = enum_words(tested.name, self.cm.enums, self.cm.structs)
+            area = self.temp()
+            self.emit(
+                ("gep", area, tested, memory, (("i32", "0"), ("i32", "1")))
+            )
+            address = self.temp()
+            pointer = Ptr(Arr(Prim("i64"), words))
+            self.emit(("bitcast", address, pointer, Ptr(payload), area))
+            extracted = self.temp()
+            self.emit(("load", extracted, payload, address))
+        slot = self.slot(payload, path=path)
+        self.emit(("store", payload, extracted, slot))
+        self.vars[name] = (payload, slot)
 
     # -- structs and fixed arrays ----------------------------------------
 
@@ -1471,14 +1826,14 @@ class _Fn:
         self.panic(node.path, ARRAY_BOUNDS, "vector capacity overflows")
 
         self.new_block(room)
-        size = sizeof_of(ty.elem, self.cm.structs)
+        size = sizeof_of(ty.elem, self.cm.structs, self.cm.enums)
         self.no_overflow(bigger, size, node.path)
         if size == 1:
             bytes_ = bigger
         else:
             bytes_ = self.temp()
             self.emit(("mul", bytes_, Prim("i64"), bigger, str(size)))
-        align = align_of(ty.elem, self.cm.structs)
+        align = align_of(ty.elem, self.cm.structs, self.cm.enums)
         self.lowering.declare(_RT_ALLOC)
         raw = self.temp()
         path = self._c_argument(node.path)
@@ -1555,7 +1910,7 @@ class _Fn:
                 WRONG_ARITY, node.path, "alloc takes a type and an element count"
             )
         count = self.index64(items[2], node.path, "alloc count")
-        size = sizeof_of(ty.elem, self.cm.structs)
+        size = sizeof_of(ty.elem, self.cm.structs, self.cm.enums)
         self.no_overflow(count, size, node.path)
         if size == 1:
             bytes_ = count
@@ -1563,7 +1918,7 @@ class _Fn:
             bytes_ = self.temp()
             self.emit(("mul", bytes_, Prim("i64"), count, str(size)))
         path = self._c_argument(node.path)
-        align = align_of(ty.elem, self.cm.structs)
+        align = align_of(ty.elem, self.cm.structs, self.cm.enums)
         self.lowering.declare(_RT_ALLOC)
         raw = self.temp()
         self.emit(("call", raw, "rt_alloc", (bytes_, str(align), path)))
@@ -1790,6 +2145,18 @@ class _Fn:
             return self.closure(item)
         if kind in _STATEMENTS:
             raise diag(UNKNOWN_NODE, item.path, f"'{kind}' is a statement, not a value")
+        # The result forms are the compiler's own, unless a definition or a
+        # binding has taken the name — the same precedence the checker uses.
+        if (
+            kind in RESULT_FORMS
+            and kind not in self.vars
+            and kind not in self.cm.fn_sigs
+        ):
+            if kind in ("ok", "err"):
+                return self.result_value(item)
+            if kind in ("some", "none"):
+                return self.optional_value(item)
+            return self.try_expr(item)
         # A binding of a function type is called through its value, whether the
         # checker found it there or in the function namespace; the checker
         # resolves in that order, so this pass reads it the same way.
@@ -1803,6 +2170,9 @@ class _Fn:
             return self.call(item)
         if kind in BUILTINS:
             return self.builtin(item)
+        tag = self.lowering.variant_tag(kind, item.path)
+        if tag is not None and kind not in self.vars:
+            return self.enum_value(item, tag)
         if kind == "":
             raise diag(UNKNOWN_NODE, item.path, "a form must start with a name")
         raise diag(
@@ -1826,6 +2196,17 @@ class _Fn:
                 # A function's name is a value: its code address with no
                 # environment, which is what a closure with no captures has.
                 return self.fn_value(token.value, where)
+            tag = self.lowering.variant_tag(token.value, where)
+            if tag is not None and tag[2] is None and token.value not in self.vars:
+                # A payload-less variant is a value: its tag and nothing else.
+                # A binding of the same name shadows it, as it does in the
+                # checker, where scope is searched before the variant set.
+                self.lowering.use_type(tag[0], where)
+                whole = self.temp()
+                self.emit(
+                    ("insertvalue", whole, tag[0], "undef", Prim("i32"), str(tag[1]), 0)
+                )
+                return whole
             return self.load(token.value, where)
         raise diag(UNKNOWN_NODE, where, f"a {token.kind.lower()} is not a value")
 
@@ -2084,57 +2465,129 @@ class _Fn:
         """``(match e (pat body...)...)``: a chain of tests over one scrutinee.
 
         The scrutinee is evaluated once. Each non-wildcard arm becomes a test
-        block comparing it with the arm's literal and branching to that arm's
-        body or to the next test; a ``_`` arm branches straight to its body.
-        Without a ``_`` arm the chain ends on ``rt_panic``: the checker cannot
-        yet prove an integer match exhaustive, and inventing a value or falling
-        into undefined behaviour would both be worse than the panic.
+        block comparing its tag with the arm's and branching to that arm's body
+        or to the next test; a ``_`` arm branches straight to its body. An
+        integer arm tests a literal, an enum arm tests its variant's index, and
+        a result or an optional tests the one-bit tag ``(ok ...)`` and
+        ``(some ...)`` share.
+
+        An integer match may leave an arm out — no finite list of literals
+        covers the domain — and its fall-through is the runtime's R0003. An
+        enum, result or optional match is proved exhaustive by the checker, so
+        it has no fall-through at all: the last test's else edge is the join.
         """
         scrutinee, arms = match_shape(node)
         ty = self.type_of(node)
         value = self.value(scrutinee, node.path)
         tested = self.type_of_item(scrutinee, node.path)
-        if not (isinstance(tested, Prim) and tested.name in INTEGERS):
+        variants: tuple[tuple[str, Ty | None], ...] | None = None
+        index_of: dict[str, str] = {}
+        if isinstance(tested, Prim) and tested.name in INTEGERS:
+            tag_ty, tag_value = tested, value
+        elif isinstance(tested, EnumRef):
+            variants = self.cm.enums.get(tested.name)
+            if variants is None:
+                raise diag(UNKNOWN_TYPE, node.path, f"unknown type '{tested.name}'")
+            tag_ty = Prim("i32")
+            index_of = {name: str(index) for index, (name, _) in enumerate(variants)}
+            tag = self.temp()
+            self.emit(("extractvalue", tag, tested, tag_ty, value, 0))
+            tag_value = tag
+        elif isinstance(tested, Res):
+            variants = (("ok", tested.ok), ("err", tested.err))
+            tag_ty = Prim("bool")
+            index_of = {"ok": "true", "err": "false"}
+            tag = self.temp()
+            self.emit(("extractvalue", tag, tested, tag_ty, value, 0))
+            tag_value = tag
+        elif isinstance(tested, Opt):
+            variants = (("some", tested.elem), ("none", None))
+            tag_ty = Prim("bool")
+            index_of = {"some": "true", "none": "false"}
+            tag = self.temp()
+            self.emit(("extractvalue", tag, tested, tag_ty, value, 0))
+            tag_value = tag
+        else:
             raise diag(
                 UNKNOWN_NODE,
                 node.path,
                 f"'match' on {tested} is not lowered by this backend yet",
             )
+        # An enum payload lives in a memory area rather than a field, so the
+        # value is stored once and every arm reads the word it expects.
+        memory = None
+        if isinstance(tested, EnumRef):
+            memory = self.slot(tested, path=node.path)
+            self.emit(("store", tested, value, memory))
+        plan: list[tuple[str, str | None, Ty | None, str] | None] = []
+        for pattern, _ in arms:
+            if is_wildcard(pattern):
+                plan.append(None)
+                continue
+            if variants is None:
+                if not isinstance(pattern, Token) or pattern.kind != NUMBER:
+                    raise diag(
+                        UNKNOWN_NODE,
+                        node.path,
+                        "a match pattern is an integer literal or '_'",
+                    )
+                plan.append(("", None, None, str(int(pattern.value))))
+                continue
+            name, binding, payload = pattern_variant(
+                pattern, variants, where=node.path, owner=str(tested)
+            )
+            plan.append((name or "", binding, payload, index_of[name or ""]))
         self.labels += 1
-        tag = f"match{self.labels}"
-        join, none = f"{tag}.join", f"{tag}.none"
+        tag_name = f"match{self.labels}"
+        join, none = f"{tag_name}.join", f"{tag_name}.none"
         slot = None if _is_void(ty) else self.slot(ty, path=node.path)
         wildcard = any(is_wildcard(pattern) for pattern, _ in arms)
         fell = False
-        self.block.term = ("br", f"{tag}.test0")
-        for index, (pattern, _) in enumerate(arms):
-            self.new_block(f"{tag}.test{index}")
-            if is_wildcard(pattern):
-                self.block.term = ("br", f"{tag}.body{index}")
+        self.block.term = ("br", f"{tag_name}.test0")
+        for index, arm_plan in enumerate(plan):
+            self.new_block(f"{tag_name}.test{index}")
+            if arm_plan is None:
+                self.block.term = ("br", f"{tag_name}.body{index}")
                 continue
-            if not isinstance(pattern, Token) or pattern.kind != NUMBER:
-                # ``match_shape`` refuses anything else, so this keeps the
-                # lowerer's own reading total: no ``AttributeError`` from a
-                # list pattern and no ``ValueError`` from ``int``.
-                raise diag(
-                    UNKNOWN_NODE,
-                    node.path,
-                    "a match pattern is an integer literal or '_'",
-                )
-            following = none if index + 1 == len(arms) else f"{tag}.test{index + 1}"
+            if index + 1 < len(arms):
+                following = f"{tag_name}.test{index + 1}"
+            elif variants is not None:
+                # The checker proved every variant covered, so the last test
+                # cannot fail: its else edge joins the result directly instead
+                # of reaching for a panic block that could never run.
+                following = join
+            else:
+                following = none
             test = self.temp()
-            self.emit(("icmp", test, "eq", tested, value, str(int(pattern.value))))
-            self.block.term = ("cbr", test, f"{tag}.body{index}", following)
+            self.emit(("icmp", test, "eq", tag_ty, tag_value, arm_plan[3]))
+            self.block.term = ("cbr", test, f"{tag_name}.body{index}", following)
         for index, (_, body) in enumerate(arms):
-            self.new_block(f"{tag}.body{index}")
+            self.new_block(f"{tag_name}.body{index}")
             with self.scope():
+                arm_plan = plan[index]
+                if (
+                    arm_plan is not None
+                    and arm_plan[1] is not None
+                    and arm_plan[2] is not None
+                ):
+                    self.bind_payload(
+                        arm_plan[0],
+                        arm_plan[1],
+                        arm_plan[2],
+                        tested,
+                        value,
+                        memory,
+                        node.path,
+                    )
                 arm = self.arm_value(body, node.path, statement=slot is None)
             if slot is not None and arm:
                 self.emit(("store", ty, arm, slot))
             if self.block.term is None:
                 self.block.term = ("br", join)
                 fell = True
-        if not wildcard:
+        if not wildcard and variants is None:
+            # An integer match may fall through: no finite arm list covers its
+            # domain, so the unmatched path panics. A closed set never does.
             self.new_block(none)
             self.panic(node.path, MATCH_NO_ARM, "no match arm matched")
         self.new_block(join)
@@ -2412,6 +2865,9 @@ class _Fn:
             symbol=symbol,
             internal=True,
         )
+        # The return type is materialised by the ``define`` line: a closure
+        # that returns a result or an enum names it here first.
+        self.lowering.use_type(info.ret, node.path)
         builder = _Fn(
             self.lowering,
             fn,
@@ -2565,7 +3021,45 @@ _SIZES = {
 _FLOATS = ("f32", "f64")
 
 
-def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
+def enum_words(
+    name: str,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]],
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+) -> int:
+    """How many eight-byte words an enum's payload area must hold.
+
+    The largest variant decides it: every value of the enum is one LLVM type,
+    so the area is sized for the widest payload any variant carries. An enum
+    with no payloads needs none, and its type is ``{ i32, [0 x i64] }``.
+    """
+    size = 0
+    for _, payload in enums.get(name, ()):
+        if payload is not None:
+            size = max(size, sizeof_of(payload, structs, enums))
+    return (size + 7) // 8
+
+
+def _fields_size(
+    fields: "tuple[Ty, ...]",
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]],
+) -> int:
+    """C layout for one field list: each field padded to its own alignment."""
+    offset = 0
+    align = 1
+    for field in fields:
+        field_align = align_of(field, structs, enums)
+        offset = (offset + field_align - 1) // field_align * field_align
+        offset += sizeof_of(field, structs, enums)
+        align = max(align, field_align)
+    return (offset + align - 1) // align * align
+
+
+def sizeof_of(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+) -> int:
     """The size in bytes of one ``ty``, as LLVM lays it out.
 
     A struct is its fields in declaration order, each padded to its own
@@ -2573,7 +3067,13 @@ def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
     the rule LLVM applies to an identified struct. An empty struct is zero
     bytes here, because ``{ }`` is zero bytes; the language never allocates one
     more widely than that, and nothing reads through such a pointer.
+
+    A tagged value is laid out from the fields ``type_text`` spells: a
+    ``(res T E)`` is ``{ i1, T, E }`` and a ``(opt T)`` is ``{ i1, T }``, so
+    the same padding rule answers both. An enum is ``{ i32, [K x i64] }``,
+    eight bytes of tag area and ``K`` words of payload.
     """
+    enums = enums or {}
     if isinstance(ty, Prim):
         return _SIZES.get(ty.name, 1)
     if isinstance(ty, (Ptr, Own)):
@@ -2585,22 +3085,28 @@ def sizeof_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
         # ``{ T*, i64, i64 }``: a buffer pointer and two counts.
         return 24
     if isinstance(ty, Arr):
-        return ty.n * sizeof_of(ty.elem, structs)
+        return ty.n * sizeof_of(ty.elem, structs, enums)
+    if isinstance(ty, EnumRef):
+        # The tag, then the payload area: ``{ i32, [K x i64] }`` pads the i32
+        # out to the array's alignment, so the tag costs one word.
+        return 8 + 8 * enum_words(ty.name, enums, structs)
+    if isinstance(ty, Opt):
+        return _fields_size((Prim("bool"), ty.elem), structs, enums)
+    if isinstance(ty, Res):
+        return _fields_size((Prim("bool"), ty.ok, ty.err), structs, enums)
     if isinstance(ty, StructRef):
         fields = structs.get(ty.name, ())
-        offset = 0
-        align = 1
-        for _, field in fields:
-            field_align = align_of(field, structs)
-            offset = (offset + field_align - 1) // field_align * field_align
-            offset += sizeof_of(field, structs)
-            align = max(align, field_align)
-        return (offset + align - 1) // align * align
+        return _fields_size(tuple(field for _, field in fields), structs, enums)
     return 1
 
 
-def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
+def align_of(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]],
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+) -> int:
     """The alignment in bytes of one ``ty``: what ``rt_alloc`` is asked for."""
+    enums = enums or {}
     if isinstance(ty, Prim):
         if ty.name in _FLOATS:
             return 4 if ty.name == "f32" else 8
@@ -2618,11 +3124,19 @@ def align_of(ty: Ty, structs: dict[str, tuple[tuple[str, Ty], ...]]) -> int:
     if isinstance(ty, Vec):
         # A pointer and two counts: the alignment is the pointer's.
         return 8
+    if isinstance(ty, EnumRef):
+        # The payload area is sixteen-byte words at best eight-byte aligned,
+        # and so is the tag.
+        return 8
     if isinstance(ty, Arr):
-        return align_of(ty.elem, structs)
+        return align_of(ty.elem, structs, enums)
+    if isinstance(ty, Opt):
+        return max(1, align_of(ty.elem, structs, enums))
+    if isinstance(ty, Res):
+        return max(1, align_of(ty.ok, structs, enums), align_of(ty.err, structs, enums))
     if isinstance(ty, StructRef):
         fields = structs.get(ty.name, ())
-        return max([align_of(field, structs) for _, field in fields] or [1])
+        return max([align_of(field, structs, enums) for _, field in fields] or [1])
     return 1
 
 

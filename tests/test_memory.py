@@ -478,21 +478,21 @@ class PtrLayoutGapTest(unittest.TestCase):
 
     def test_a_struct_behind_a_pointer_with_no_layout_is_e0002(self):
         error = fail_on_emit(
-            "(mod m)(type bad (struct (xs (opt :i64))))"
+            "(mod m)(type bad (struct (xs (shared :i64))))"
             "(fn f :void ((p (ptr bad))))"
         )
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.path, "m/f/1/0")
-        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
+        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
 
     def test_an_own_pointer_to_an_unlowered_type_is_e0002(self):
         error = fail_on_emit(
-            "(mod m)(type bad (struct (xs (opt :i64))))"
+            "(mod m)(type bad (struct (xs (shared :i64))))"
             "(fn f :void ((p (own bad))))"
         )
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.path, "m/f/1/0")
-        self.assertEqual(error.message, "(opt :i64) is not lowered yet")
+        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
 
     def test_a_struct_that_points_at_itself_is_still_finite(self):
         text = emitted(

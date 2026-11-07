@@ -33,7 +33,13 @@ byte equality) and growable vectors (`(vec T)` with `make`, `vec-push`,
 `vec-len`, `vec-get`, `vec-set`, `vec-free`), and gives `print`/`println` a
 formatter for every scalar it prints: `:i64`, `:u64`, `:f64`, `:bool` and
 `:str`. A narrower integer still needs a cast, because nothing in the language
-converts implicitly. Everything else reports a diagnostic at the construct.
+converts implicitly. Task 11 adds results and optionals: `(res T E)` with
+`(ok v)`/`(err e)`, `(opt T)` with `(some v)`/`(none)`, `(try e)` to propagate
+an error the caller declares, error types as declared enums with payloads
+(`(type parse-error (enum (bad-digit :u64) (overflow)))`), and exhaustive
+`match` over an enum, a result or an optional. A missing variant is E0600, a
+`try` whose error types differ is E0601, and a result nobody handles is E0602.
+Everything else reports a diagnostic at the construct.
 
 ## Requirements
 

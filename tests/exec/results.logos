@@ -1,0 +1,186 @@
+(mod results)
+
+(type parse-error (enum (bad-digit :u64) (bad-text :str) (overflow)))
+
+(type parse-failure (enum (other :i64)))
+
+(fn parse-digit :
+  (res :i64 parse-error) ((c :u64))
+  (if (< c 10)
+    (ret (ok 7))
+    (ret (err (bad-digit c)))))
+
+(fn parse-text :
+  (res :i64 parse-error) ((s :str))
+  (if (= (str-len s) 0)
+    (ret (err (bad-text "empty")))
+    (ret (ok 1))))
+
+(fn sum-two :
+  (res :i64 parse-error) ((a :u64) (b :u64))
+  (let x (try (parse-digit a)))
+  (let y (try (parse-digit b)))
+  (ret (ok (+ x y))))
+
+(fn unwrap-or :i64 ((r : (res :i64 parse-error)) (fallback :i64))
+  (match r ((ok v) (ret v)) ((err e) (ret fallback))))
+
+(fn find :
+  (opt :i64) ((v :i64))
+  (if (> v 0)
+    (ret (some v))
+    (ret (none))))
+
+(type holder (struct (failure parse-error)))
+
+(test match-ok
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (match (parse-digit 3) ((ok v) (println v)) ((err e) (println 0))))
+
+(test match-err-payload
+  (expect (out "42\n")
+    (code 0)
+    (leaks 0))
+  (match (parse-digit 42) ((ok v) (println v)) ((err e) (match e ((bad-digit n) (println n)) ((bad-text s) (println s)) (overflow (println 0))))))
+
+(test match-str-payload
+  (expect (out "empty\n")
+    (code 0)
+    (leaks 0))
+  (match (parse-text "") ((ok v) (println v)) ((err e) (match e ((bad-digit n) (println n)) ((bad-text s) (println s)) (overflow (println 0))))))
+
+(test try-success
+  (expect (out "14\n")
+    (code 0)
+    (leaks 0))
+  (match (sum-two 3 4) ((ok v) (println v)) ((err e) (println 0))))
+
+(test try-propagates
+  (expect (out "42\n")
+    (code 0)
+    (leaks 0))
+  (match (sum-two 3 42) ((ok v) (println v)) ((err e) (match e ((bad-digit n) (println n)) ((bad-text s) (println s)) (overflow (println 0))))))
+
+(test optional-some
+  (expect (out "5\n")
+    (code 0)
+    (leaks 0))
+  (match (find 5) ((some v) (println v)) ((none) (println 0))))
+
+(test optional-none
+  (expect (out "0\n")
+    (code 0)
+    (leaks 0))
+  (match (find -1) ((some v) (println v)) ((none) (println 0))))
+
+(test optional-binding
+  (expect (out "9\n")
+    (code 0)
+    (leaks 0))
+  (let o (some 9))
+  (match o ((some v) (println v)) (none (println 0))))
+
+(test enum-payload-less
+  (expect (out "99\n")
+    (code 0)
+    (leaks 0))
+  (let e overflow)
+  (match e ((bad-digit n) (println n)) ((bad-text s) (println s)) (overflow (println 99))))
+
+(test enum-in-a-struct-field
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (let h (make holder (bad-digit 7)))
+  (match (get h failure) ((bad-digit n) (println n)) ((bad-text s) (println s))
+    (overflow (println 0))))
+
+(test result-through-a-parameter
+  (expect (out "5\n")
+    (code 0)
+    (leaks 0))
+  (println (unwrap-or (parse-digit 42) 5)))
+
+(test result-in-a-binding
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (let r (parse-digit 3))
+  (println (unwrap-or r 0)))
+
+(test match-produces-a-value
+  (expect (out "0\n")
+    (code 0)
+    (leaks 0))
+  (let v (match (parse-digit 42) ((ok x) x) ((err e) 0)))
+  (println v))
+
+(test wildcard-covers-an-enum
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (let e (bad-digit 7))
+  (match e ((bad-digit n) (println n)) (_ (println 0))))
+
+(type inner (enum (a :i64) (b)))
+
+(type nested (enum (wrap inner) (plain)))
+
+(test enum-payload-of-an-enum
+  (expect (out "5\n")
+    (code 0)
+    (leaks 0))
+  (let x (wrap (a 5)))
+  (match x ((wrap y) (match y ((a n) (println n)) (b (println 0)))) (plain (println 0))))
+
+(test enum-in-a-vector
+  (expect (out "2\n1\n")
+    (code 0)
+    (leaks 0))
+  (letmut v
+    (vec inner)
+    (make (vec inner)))
+  (vec-push v (a 1))
+  (vec-push v b)
+  (println (vec-len v))
+  (match (vec-get v 0) ((a n) (println n))
+    (b (println 0)))
+  (vec-free v))
+
+(test alloc-of-an-enum
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (letmut p (alloc inner 3))
+  (set-deref p (a 7))
+  (match (deref p) ((a n) (println n))
+    (b (println 0)))
+  (free p))
+
+(fn add-two :
+  (res :i64 parse-error) ((a :u64) (b :u64))
+  (ret (ok (+ (try (parse-digit a))
+             (try (parse-digit b))))))
+
+(fn sum-upto :
+  (res :i64 parse-error) ()
+  (letmut i :u64 0)
+  (letmut total :i64 0)
+  (while (< i 3)
+    (set total (+ total (try (parse-digit i))))
+    (set i (+ i 1)))
+  (ret (ok total)))
+
+(test try-inside-one-expression
+  (expect (out "14\n")
+    (code 0)
+    (leaks 0))
+  (println (match (add-two 3 4) ((ok v) v) ((err e) 0))))
+
+(test try-inside-a-loop
+  (expect (out "21\n")
+    (code 0)
+    (leaks 0))
+  (println (match (sum-upto) ((ok v) v) ((err e) 0))))

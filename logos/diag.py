@@ -20,9 +20,10 @@ quote it.
   longer names anything. It is exactly that case: a free of an address no
   ``alloc`` ever produced is ``R0004``, not a double free.
 * ``R0003`` failed runtime check — emitted by the lowerer for a ``match`` on
-  an integer whose arms have no ``_``: Task 11 makes that a static diagnostic
-  (E0600) once exhaustiveness is checked, and until then the unmatched path
-  panics instead of returning a fabricated value. The same code is emitted for
+  an integer whose arms have no ``_``: an integer match has no static
+  exhaustiveness, so the unmatched path panics instead of returning a
+  fabricated value. A match over an enum, a result or an optional is proved
+  exhaustive by the checker and never reaches this. The same code is emitted for
   an index outside ``0..n`` — of a fixed array, of a vector, or of a string
   slice — for an allocation count or a string length whose byte size would
   overflow, and for an allocation the allocator could not satisfy: all are
@@ -68,6 +69,9 @@ CODES = {
     "E0500": "instantiation limit reached",
     "E0501": "unbound type variable",
     "E0502": "closure escapes its function",
+    "E0600": "non-exhaustive match",
+    "E0601": "try type mismatch",
+    "E0602": "unhandled result",
 }
 
 UNBALANCED = "E0001"
@@ -107,13 +111,32 @@ UNBOUND_TYPE_VAR = "E0501"
 #: would leave a call reading a dead slot.
 CLOSURE_ESCAPE = "E0502"
 
+#: A ``match`` whose arms do not name every variant of the enum, result or
+#: optional it tests. Unlike an integer match — whose domain no finite arm list
+#: covers — these are closed sets, so the fall-through path is statically
+#: impossible and the compiler says so instead of emitting a panic.
+NON_EXHAUSTIVE = "E0600"
+
+#: A ``try`` that cannot propagate: its operand is not a result, the enclosing
+#: function returns no result, or the two error types are not the same enum.
+#: There is no error widening, so a different error type has to be mapped
+#: explicitly in a ``match``.
+TRY_MISMATCH = "E0601"
+
+#: A ``(res T E)`` that is produced and then dropped — a result in statement
+#: position, or a binding whose value is never matched, tried, returned or
+#: handed to a callee. The whole point of the error slot is that a caller must
+#: look at it.
+UNHANDLED_RESULT = "E0602"
+
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is
 #: ``MATCH_NO_ARM``.
 DIVISION_BY_ZERO = "R0001"
 
-#: The runtime check a ``match`` with no ``_`` arm reaches when no literal
-#: matches. Task 11 turns this into the static E0600 non-exhaustive match.
+#: The runtime check an integer ``match`` with no ``_`` arm reaches when no
+#: literal matches. An enum, result or optional match is E0600 instead: its
+#: variants are a closed set the checker can prove covered.
 MATCH_NO_ARM = "R0003"
 
 #: The runtime check an array index outside ``0..n`` reaches. The same code as

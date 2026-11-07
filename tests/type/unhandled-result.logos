@@ -1,0 +1,9 @@
+(mod unhandled-result)
+
+(type parse-error (enum (bad :u64)))
+
+(fn parse :(res :i64 parse-error) ((x :i64))
+  (ret (ok x)))
+
+(fn caller :void ()
+  (parse 1))
