@@ -13,6 +13,22 @@ resolver and type checker lower a typed syntax tree to a small flat IR, which is
 printed as LLVM IR text. `clang` compiles that text and links it against the C
 runtime in `runtime/`.
 
+## Learn it
+
+Start with `docs/LOGOS.md`: one dense reference, cheat sheet first, then one
+complete executable chapter per feature in learning order. It is generated from
+the compiler's own tables and every example is run by the test harness at `-O0`
+and `-O2`, so it cannot drift from the implementation.
+
+- `docs/LOGOS.md` — the manual, generated; do not edit it by hand.
+- `logosc guide --json` — the machine-readable manifest: forms, types,
+  operators, builtins, reserved names, diagnostic codes and test categories.
+- `logosc guide --check` — proves the committed manual is current; exits 1 with
+  a diff summary when it is stale.
+- `docs/manual/` — the numbered chapter sources the manual embeds.
+
+Regenerate after changing the compiler with `logosc guide > docs/LOGOS.md`.
+
 ## Status
 
 Logos v1 is complete for one target: x86_64 Linux. The language, the compiler
@@ -98,6 +114,9 @@ reads freed memory, uses an uninitialised value, or behaves differently at
 python3 -m logos version                      # logos 0.1.0
 python3 -m logos build examples/hello.logos   # build/hello, and build/hello.ll
 ./build/hello                                 # hello
+python3 -m logos guide                        # the generated manual
+python3 -m logos guide --json                 # the machine-readable manifest
+python3 -m logos guide --check                # fail if docs/LOGOS.md is stale
 python3 -m logos test                         # run the directive-driven corpus
 python3 -m logos test --only exec --opt -O0   # one category, one optimisation level
 bash tools/accept.sh                          # corpus, gcc oracle, examples, fmt
@@ -168,6 +187,8 @@ make clean   # remove build output and caches
 | `runtime/rt.h` | Declarations of the C runtime reached through `extern` |
 | `runtime/rt.c` | C runtime implementation |
 | `examples/` | Three real programs, their input fixture and the matrix reference |
+| `docs/LOGOS.md` | The generated manual: cheat sheet, executable chapters, reference tables |
+| `docs/manual/` | The numbered chapter sources the manual embeds |
 | `tests/` | `unittest` suite and the directive corpus |
 | `tests/diff/` | Programs with hand-written C twins, compared against gcc |
 | `tools/accept.sh` | The end-to-end acceptance gate |
