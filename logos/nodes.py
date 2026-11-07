@@ -86,6 +86,20 @@ class Node:
                 yield from item.walk()
 
 
+def find(root: Node, path: str) -> Node | None:
+    """The node at ``path``, or ``None``.
+
+    The empty path is the file itself. Every other path is compared against
+    the ones :func:`assign_paths` set, so the two cannot drift.
+    """
+    if path == "":
+        return root
+    for node in root.walk():
+        if node.path == path:
+            return node
+    return None
+
+
 def assign_paths(root: Node) -> Node:
     """Set ``path`` on ``root`` and every node below it, and return ``root``."""
     root.path = ""

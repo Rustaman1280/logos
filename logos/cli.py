@@ -1,9 +1,10 @@
 """Command line entry point for the Logos toolchain.
 
 ``build`` compiles a file to a native binary, ``test`` runs the directive-driven
-corpus, and ``fmt`` rewrites source in canonical form. ``show`` and ``patch``
-still parse their arguments and report that they are not implemented yet, so the
-command surface is fixed before the passes behind them exist.
+corpus, and ``fmt`` rewrites source in canonical form. ``show`` prints one node
+and ``patch`` replaces one node, both addressed by the node paths of
+``logos.nodes``; a patch reformats the whole file, so everything outside the
+replaced subtree comes back in the same canonical bytes ``fmt`` would write.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 from logos import __version__, driver, tester
 from logos.diag import LogosError
 from logos.fmt import render
+from logos.nodes import Node, assign_paths, find
 from logos.parser import parse
 
 PROG = "logosc"
@@ -104,13 +106,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     show = sub.add_parser("show", help="print one node of a Logos file")
-    show.add_argument("path", metavar="PATH", help="source file and node path, as FILE:NODE")
+    show.add_argument("file", metavar="FILE", help="Logos source file")
+    show.add_argument(
+        "path",
+        metavar="PATH",
+        help="node path such as hello/main/2/0 (the empty path is the file)",
+    )
 
     patch = sub.add_parser("patch", help="replace one node of a Logos file")
+    patch.add_argument("file", metavar="FILE", help="Logos source file")
     patch.add_argument(
         "path",
         metavar="PATH",
-        help="source file and node path, as FILE:NODE",
+        help="node path such as hello/main/2/0",
     )
 
     sub.add_parser("version", help="print the compiler version")
@@ -139,6 +147,12 @@ def main(argv: list[str]) -> int:
 
     if args.command == "test":
         return _test(args.path, args.only, args.opt, args.update_baseline)
+
+    if args.command == "show":
+        return _show(args.file, args.path)
+
+    if args.command == "patch":
+        return _patch(args.file, args.path)
 
     print(f"{args.command}: not implemented")
     return 0
@@ -312,6 +326,85 @@ def _format_stdin() -> int:
         print(error.render(), file=sys.stderr)
         return 1
     sys.stdout.write(canonical)
+    return 0
+
+
+def _load(source: str) -> "tuple[Node | None, int]":
+    """Parse ``source``, printing any read or parse failure the usual way.
+
+    Returns ``(tree, 0)`` on success and ``(None, 1)`` after writing one line
+    to stderr, so ``show`` and ``patch`` report a bad file exactly as ``fmt``
+    does rather than raising out of ``main``.
+    """
+    try:
+        text = Path(source).read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"logos: {source}: {error.strerror}", file=sys.stderr)
+        return None, 1
+    try:
+        return parse(text, source), 0
+    except LogosError as error:
+        print(error.render(), file=sys.stderr)
+        return None, 1
+
+
+def _show(source: str, path: str) -> int:
+    """Print the canonical form of the one node at ``path``."""
+    root, status = _load(source)
+    if root is None:
+        return status
+    target = find(root, path)
+    if target is None:
+        print(
+            f"logos: show: no node at path '{path}' in {source}",
+            file=sys.stderr,
+        )
+        return 1
+    sys.stdout.write(render(target))
+    return 0
+
+
+def _patch(source: str, path: str) -> int:
+    """Replace the node at ``path`` with the one form read from stdin.
+
+    The file is parsed and the path is checked before stdin is read, so a bad
+    path is reported without waiting on input. The replacement keeps its new
+    shape and then every path in the file is assigned again from scratch, so a
+    later ``show`` or ``patch`` addresses the result by its new positions.
+    """
+    root, status = _load(source)
+    if root is None:
+        return status
+    target = find(root, path)
+    if target is None:
+        print(
+            f"logos: patch: no node at path '{path}' in {source}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        replacement = parse(sys.stdin.read(), "<stdin>")
+    except LogosError as error:
+        print(error.render(), file=sys.stderr)
+        return 1
+    forms = [item for item in replacement.items if isinstance(item, Node)]
+    if len(replacement.items) != 1 or len(forms) != 1:
+        print(
+            "logos: patch: stdin must hold exactly one form",
+            file=sys.stderr,
+        )
+        return 1
+    new = forms[0]
+    target.kind = new.kind
+    target.items = new.items
+    target.line = new.line
+    target.col = new.col
+    assign_paths(root)
+    try:
+        Path(source).write_text(render(root), encoding="utf-8")
+    except OSError as error:
+        print(f"logos: {source}: {error.strerror}", file=sys.stderr)
+        return 1
     return 0
 
 

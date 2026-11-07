@@ -117,5 +117,70 @@ class CliFmtTest(unittest.TestCase):
             self.assertEqual(broken.read_text(encoding="utf-8"), "(mod x")
 
 
+class CliShowPatchTest(unittest.TestCase):
+    NESTED = (
+        "(mod m)\n"
+        "\n"
+        "(fn f :i64 ((a :i64))\n"
+        "  (ret (+ a 1)))\n"
+        "\n"
+        "(fn g :i64 ((b :i64))\n"
+        "  (ret (* b 2)))\n"
+    )
+
+    def _file(self, tmp, text=None):
+        path = pathlib.Path(tmp, "m.logos")
+        path.write_text(self.NESTED if text is None else text, encoding="utf-8")
+        return path
+
+    def test_show_prints_only_the_named_subtree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["show", str(path), "m/f/2/0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "(+ a 1)\n")
+
+    def test_show_on_a_bad_path_exits_one_and_names_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["show", str(path), "m/f/9"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("m/f/9", err.getvalue())
+
+    def test_patch_replaces_one_node_and_leaves_the_rest_canonical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            with patch("sys.stdin", io.StringIO("(+ a 41)\n")):
+                code = main(["patch", str(path), "m/f/2/0"])
+            self.assertEqual(code, 0)
+            expected = self.NESTED.replace("(+ a 1)", "(+ a 41)")
+            self.assertEqual(path.read_text(encoding="utf-8"), expected)
+
+    def test_fmt_is_idempotent_after_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            with patch("sys.stdin", io.StringIO("(+ a 41)\n")):
+                self.assertEqual(main(["patch", str(path), "m/f/2/0"]), 0)
+            once = path.read_text(encoding="utf-8")
+            self.assertEqual(main(["fmt", str(path)]), 0)
+            self.assertEqual(path.read_text(encoding="utf-8"), once)
+
+    def test_patch_on_a_bad_path_exits_one_and_names_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            out, err = io.StringIO(), io.StringIO()
+            with patch("sys.stdin", io.StringIO("(+ a 41)\n")):
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = main(["patch", str(path), "m/f/9"])
+            self.assertEqual(code, 1)
+            self.assertIn("m/f/9", err.getvalue())
+            self.assertEqual(path.read_text(encoding="utf-8"), self.NESTED)
+
+
 if __name__ == "__main__":
     unittest.main()
