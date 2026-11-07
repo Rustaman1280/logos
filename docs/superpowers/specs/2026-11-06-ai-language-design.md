@@ -146,6 +146,10 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   `set-deref`, a `try` and a `match` scrutinee. Reading the source
   afterwards is E0300 and a second transfer of it is E0402, so two owners
   never exist.
+- An owner lives only in a direct binding or a function parameter. It may
+  not be a struct field, an array element, an enum payload, or an inner
+  owner, and no expression may read one out of a place, because a place
+  read copies the pointer and creates a second owner.
 - A `(vec T)` may not be a struct field or a fixed-array element yet,
   because no place expression exists to release its buffer.
 - A `:str` owns nothing. Concatenation produces a process-lifetime buffer,
