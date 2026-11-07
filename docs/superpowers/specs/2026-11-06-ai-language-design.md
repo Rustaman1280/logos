@@ -138,6 +138,9 @@ Nothing here is undefined behaviour, so a C oracle can check it:
 - A `(vec T)` is not copyable, and neither is a type that contains one.
   Binding such a value moves it; reading the source afterwards is E0300.
   Two bindings never share a buffer.
+- The same holds for any type that contains an `(own T)` at any depth:
+  `(opt (own T))`, `(res (own T) E)`, a struct with an owning field. Any
+  transfer or construction moves the source, so two owners never exist.
 - A `(vec T)` may not be a struct field or a fixed-array element yet,
   because no place expression exists to release its buffer.
 - A `:str` owns nothing. Concatenation produces a process-lifetime buffer,
