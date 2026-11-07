@@ -1,0 +1,20 @@
+(mod arrays)
+
+(type point (struct (x :i64) (y :i64)))
+
+(test arrays
+  (expect (out "3\n9\n4\n")
+    (code 0)
+    (leaks 0))
+  (letmut a
+    (arr :i64 3)
+    (make (arr :i64 3) 1 2 3))
+  (println (arr-get a 2))
+  (arr-set a 0 9)
+  (println (arr-get a 0))
+  (letmut ps
+    (arr point 2)
+    (make (arr point 2)
+      (make point 1 2)
+      (make point 3 4)))
+  (println (get (arr-get ps 1) y)))

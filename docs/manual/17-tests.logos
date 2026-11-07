@@ -1,0 +1,10 @@
+(mod testing)
+
+(fn square :i64 ((n :i64))
+  (ret (* n n)))
+
+(test square
+  (expect (out "9\n")
+    (code 0)
+    (leaks 0))
+  (println (square 3)))

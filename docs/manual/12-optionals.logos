@@ -1,0 +1,14 @@
+(mod optionals)
+
+(fn find :
+  (opt :i64) ((v :i64))
+  (if (> v 0)
+    (ret (some v))
+    (ret (none))))
+
+(test optionals
+  (expect (out "5\n0\n")
+    (code 0)
+    (leaks 0))
+  (match (find 5) ((some v) (println v)) ((none) (println 0)))
+  (match (find -1) ((some v) (println v)) ((none) (println 0))))

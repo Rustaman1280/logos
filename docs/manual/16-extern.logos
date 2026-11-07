@@ -1,0 +1,14 @@
+(mod cextern)
+
+(extern fn getpid :i64 ())
+
+(extern fn write :i64 ((fd :i64) (text :str)))
+
+(test extern
+  (expect (out "pid ok\nhi2\n")
+    (code 0)
+    (leaks 0))
+  (if (> (getpid) 0)
+    (println "pid ok")
+    (println "pid bad"))
+  (println (write 1 "hi")))

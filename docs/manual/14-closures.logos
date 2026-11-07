@@ -1,0 +1,19 @@
+(mod closures)
+
+(fn apply :U ((f (fn (:T) :U)) (x :T))
+  (ret (f x)))
+
+(test closures
+  (expect (out "10\n12\n8\n15\n")
+    (code 0)
+    (leaks 0))
+  (let k 10)
+  (let read (fn :i64 ()
+              (ret k)))
+  (println (read))
+  (println (apply (fn :i64 ((n :i64))
+                    (ret (* n 3))) 4))
+  (let add (fn :i64 ((n :i64))
+             (ret (+ n k))))
+  (println (add -2))
+  (println (add 5)))

@@ -1,0 +1,15 @@
+(mod strings)
+
+(test strings
+  (expect (out "5\nhello, ai\nell\nabcdef\n6\n5\ntrue\nfalse\ntrue\n")
+    (code 0)
+    (leaks 0))
+  (println (str-len "hello"))
+  (println (str-concat "hello" ", ai"))
+  (println (str-slice "hello" 1 4))
+  (println "abcdef")
+  (println (str-len "héllo"))
+  (println (str-len "é→"))
+  (println (= "abc" "abc"))
+  (println (= "abc" "abd"))
+  (println (str-eq (str-slice "abcdef" 1 4) "bcd")))

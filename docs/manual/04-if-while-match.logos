@@ -1,0 +1,17 @@
+(mod control)
+
+(fn classify :str ((n :i64))
+  (ret (match n (0 "zero") (-1 "minus") (_ "many"))))
+
+(test control
+  (expect (out "small\n0\n1\n2\nzero\nminus\nmany\n")
+    (code 0)
+    (leaks 0))
+  (println (if (< 1 2) "small" "big"))
+  (letmut i :i64 0)
+  (while (< i 3)
+    (println i)
+    (set i (+ i 1)))
+  (println (classify 0))
+  (println (classify -1))
+  (println (classify 9)))

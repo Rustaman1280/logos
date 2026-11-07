@@ -1,0 +1,18 @@
+(mod functions)
+
+(fn add :i64 ((a :i64) (b :i64))
+  (ret (+ a b)))
+
+(fn greet :str ((name :str))
+  (ret (str-concat "hi " name)))
+
+(fn announce :void ((n :i64))
+  (println n))
+
+(test calls
+  (expect (out "7\nhi ai\n5\n")
+    (code 0)
+    (leaks 0))
+  (println (add 3 4))
+  (println (greet "ai"))
+  (announce 5))

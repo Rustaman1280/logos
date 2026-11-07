@@ -1,0 +1,20 @@
+(mod generics)
+
+(fn id :T ((x :T))
+  (ret x))
+
+(fn first :T ((a :T) (b :U))
+  (ret a))
+
+(fn twice :i64 ((n :i64))
+  (ret (* 2 (id n))))
+
+(test generics
+  (expect (out "42\n3\n7\nx\n42\n")
+    (code 0)
+    (leaks 0))
+  (println (id 42))
+  (println (str-len (id "abc")))
+  (println (first 7 "x"))
+  (println (first "x" 7))
+  (println (twice 21)))

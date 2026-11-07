@@ -1,0 +1,20 @@
+(mod results)
+
+(type parse-error (enum (bad :i64) (empty)))
+
+(fn checked :
+  (res :i64 parse-error) ((n :i64))
+  (if (> n 0)
+    (ret (ok n))
+    (ret (err (bad n)))))
+
+(fn doubled :
+  (res :i64 parse-error) ((n :i64))
+  (ret (ok (* 2 (try (checked n))))))
+
+(test results
+  (expect (out "42\n-1\n")
+    (code 0)
+    (leaks 0))
+  (match (doubled 21) ((ok v) (println v)) ((err _) (println 0)))
+  (match (doubled -1) ((ok v) (println v)) ((err e) (match e ((bad n) (println n)) (empty (println 0))))))

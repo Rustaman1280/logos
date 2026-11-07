@@ -1,0 +1,23 @@
+(mod structs)
+
+(type point (struct (x :i64) (y :i64)))
+
+(type segment (struct (from point) (to point)))
+
+(fn total :i64 ((p point))
+  (ret (+ (get p x)
+         (get p y))))
+
+(test structs
+  (expect (out "3\n7\n7\n")
+    (code 0)
+    (leaks 0))
+  (letmut p point (make point 1 2))
+  (println (total p))
+  (set-field p x 5)
+  (println (total p))
+  (let s segment (make segment
+                   (make point 1 2)
+                   (make point 3 4)))
+  (let end-point (get s to))
+  (println (total end-point)))

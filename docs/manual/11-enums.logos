@@ -1,0 +1,14 @@
+(mod enums)
+
+(type shape (enum (circle :i64) (square :i64) (dot)))
+
+(fn area :i64 ((s shape))
+  (ret (match s ((circle r) (* r r 3)) ((square n) (* n n)) (dot 0))))
+
+(test enums
+  (expect (out "12\n9\n0\n")
+    (code 0)
+    (leaks 0))
+  (println (area (circle 2)))
+  (println (area (square 3)))
+  (println (area dot)))
