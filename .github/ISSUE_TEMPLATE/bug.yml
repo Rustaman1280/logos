@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a compiler, checker, code-generation or runtime defect.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A minimal reproduction is the fastest route to a fix. Please reduce the
+        program until removing anything makes the problem disappear.
+
+  - type: textarea
+    id: program
+    attributes:
+      label: Minimal Logos program
+      description: The smallest complete `.logos` file that shows the problem.
+      placeholder: |
+        (mod repro)
+
+        (fn main :i64 ()
+          (println "hello")
+          (ret 0))
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command that triggers the problem.
+      placeholder: python3 -m logos build repro.logos
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected output
+      description: What should happen, including the exit status if it matters.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual output or diagnostic code
+      description: |
+        Paste the output, the diagnostic code (for example `E0300` or `R0001`),
+        or both. Include the node path or `file:line:column` the compiler
+        printed.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: optimisation
+    attributes:
+      label: Optimisation level(s)
+      description: Which levels show the problem? Select every one that applies.
+      multiple: true
+      options:
+        - "-O0"
+        - "-O2"
+    validations:
+      required: true
