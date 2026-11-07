@@ -14,4 +14,7 @@ dependencies = []
 logosc = "logos.cli:run"
 
 [tool.setuptools]
-packages = ["logos"]
+packages = ["logos", "runtime"]
+
+[tool.setuptools.package-data]
+runtime = ["rt.c", "rt.h"]

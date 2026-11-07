@@ -40,8 +40,23 @@ ROOT = Path(__file__).resolve().parents[1]
 #: Where the emitted IR is kept.
 BUILD_DIR = ROOT / "build"
 
+
+def _runtime_file(name: str) -> Path:
+    """The runtime source ``name``, from the install if one shipped it.
+
+    An installed toolchain has ``logos`` and ``runtime`` as sibling packages, so
+    the runtime lands beside the compiler; a source tree has ``runtime/`` at the
+    same level as ``logos/``. Looking beside this file covers both, and the
+    repository path is the fallback for a tree that was never installed.
+    """
+    installed = Path(__file__).resolve().parent.parent / "runtime" / name
+    if installed.is_file():
+        return installed
+    return ROOT / "runtime" / name
+
+
 #: The C runtime, linked into every Logos binary.
-RUNTIME_C = ROOT / "runtime" / "rt.c"
+RUNTIME_C = _runtime_file("rt.c")
 
 #: Extra link inputs. Neither is used yet; both are unconditional so a program
 #: that starts a thread does not need a different build command.
