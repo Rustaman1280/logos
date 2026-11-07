@@ -181,7 +181,7 @@ class LoweringTest(unittest.TestCase):
             checked(
                 "(mod m)\n"
                 "(fn main :void ()\n"
-                '  (let total :i64 41)\n'
+                '  (let _ :i64 41)\n'
                 '  (println "x"))\n'
             )
         )
@@ -219,7 +219,7 @@ class LoweringTest(unittest.TestCase):
                 "(fn main :void ()\n"
                 "  (let x :i64 2)\n"
                 "  (let y :i64 3)\n"
-                "  (let z :i64 (add x y))\n"
+                "  (let _ :i64 (add x y))\n"
                 '  (println "z"))\n'
             )
         )
@@ -237,7 +237,7 @@ class LoweringTest(unittest.TestCase):
                 "(fn add :i64 ((a :i64) (b :i64))\n"
                 "  (ret (+ a b)))\n"
                 "(fn main :void ()\n"
-                "  (let x :i64 (add 1 2))\n"
+                "  (let _ :i64 (add 1 2))\n"
                 '  (println "hi"))\n'
             )
         )
@@ -403,7 +403,7 @@ class CheckedDivisionTest(unittest.TestCase):
         source = (
             "(mod dz)\n\n"
             "(fn main :void ()\n"
-            "  (let x :i64 (/ 1 0))\n"
+            "  (let _ :i64 (/ 1 0))\n"
             '  (println "after"))\n'
         )
         path = write_source("dz", source)
@@ -421,7 +421,7 @@ class CheckedDivisionTest(unittest.TestCase):
         source = (
             "(mod dm)\n\n"
             "(fn main :void ()\n"
-            "  (let x :i64 (% 1 0))\n"
+            "  (let _ :i64 (% 1 0))\n"
             '  (println "after"))\n'
         )
         path = write_source("dm", source)
@@ -515,7 +515,7 @@ class SymbolTest(unittest.TestCase):
             "(fn write :i64 ((fd :i64) (buf :i64) (len :i64))\n"
             "  (ret len))\n\n"
             "(fn main :void ()\n"
-            "  (let n :i64 (write 1 2 3))\n"
+            "  (let _ :i64 (write 1 2 3))\n"
             '  (println "hi"))\n'
         )
         path = write_source("inter", source)
@@ -616,7 +616,7 @@ class IntegerWidthTest(unittest.TestCase):
         for width, text in failing:
             with self.subTest(width=width, literal=text):
                 with self.assertRaises(LogosError) as caught:
-                    checked(f"(mod m)\n(fn f :void () (let x :{width} {text}))\n")
+                    checked(f"(mod m)\n(fn f :void () (let _ :{width} {text}))\n")
                 self.assertEqual(caught.exception.code, "E0106")
                 self.assertEqual(
                     caught.exception.message, f"literal {text} does not fit :{width}"
@@ -635,7 +635,7 @@ class IntegerWidthTest(unittest.TestCase):
         )
         for width, text in passing:
             with self.subTest(width=width, literal=text):
-                checked(f"(mod m)\n(fn f :void () (let x :{width} {text}))\n")
+                checked(f"(mod m)\n(fn f :void () (let _ :{width} {text}))\n")
 
     def test_an_unannotated_literal_must_fit_i64(self):
         with self.assertRaises(LogosError) as caught:
@@ -698,7 +698,7 @@ class IRNameTest(unittest.TestCase):
             "(mod kw)\n\n"
             "(fn main :void ()\n"
             "  (let len :i64 2)\n"
-            "  (let x? :i64 (+ len 1))\n"
+            "  (let _ :i64 (+ len 1))\n"
             '  (println "kw"))\n'
         )
         path = write_source("kw", source)

@@ -29,7 +29,7 @@ PAIR = (
     "(mod m)"
     "(type pair (struct (a :u8) (b :i64)))"
     "(type line (struct (from pair) (n :i64)))"
-    '(fn main :void () (let p pair (make pair 1 2)) (let l line (make line p 3))'
+    '(fn main :void () (let p pair (make pair 1 2)) (let _ line (make line p 3))'
     ' (println "x"))'
 )
 
@@ -98,7 +98,7 @@ class LayoutTest(unittest.TestCase):
     def test_fields_keep_declaration_order(self):
         text = emitted(
             "(mod m)(type odd (struct (b :i64) (a :u8)))"
-            "(fn main :void () (let o odd (make odd 1 2)))"
+            "(fn main :void () (let _ odd (make odd 1 2)))"
         )
         self.assertIn("%struct.odd = type { i64, i8 }", text)
 
@@ -118,11 +118,11 @@ class LayoutTest(unittest.TestCase):
         """A reused struct name answers for the module processed last."""
         first = (
             "(mod a)(type pair (struct (a :i64)))"
-            '(fn main :void () (let p pair (make pair 1)) (println "x"))'
+            '(fn main :void () (let _ pair (make pair 1)) (println "x"))'
         )
         second = (
             "(mod b)(type pair (struct (a :u8) (b :i64)))"
-            '(fn main :void () (let p pair (make pair 1 2)) (println "x"))'
+            '(fn main :void () (let _ pair (make pair 1 2)) (println "x"))'
         )
         lower.lower_module(checked(first))
         self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i64 }")
@@ -132,11 +132,11 @@ class LayoutTest(unittest.TestCase):
     def test_struct_llty_describes_the_module_just_emitted(self):
         first = (
             "(mod a)(type pair (struct (a :i64)))"
-            '(fn main :void () (let p pair (make pair 1)) (println "x"))'
+            '(fn main :void () (let _ pair (make pair 1)) (println "x"))'
         )
         second = (
             "(mod b)(type pair (struct (a :u8) (b :i64)))"
-            '(fn main :void () (let p pair (make pair 1 2)) (println "x"))'
+            '(fn main :void () (let _ pair (make pair 1 2)) (println "x"))'
         )
         emitted(first)
         self.assertEqual(llvm.struct_llty("pair"), "%struct.pair = type { i64 }")
@@ -175,7 +175,7 @@ class LayoutTest(unittest.TestCase):
     def test_a_fixed_array_is_an_llvm_array(self):
         text = emitted(
             "(mod m)(fn main :void ()"
-            " (let a (arr :i64 3) (make (arr :i64 3) 1 2 3)))"
+            " (let _ (arr :i64 3) (make (arr :i64 3) 1 2 3)))"
         )
         self.assertIn("%v.0.addr = alloca [3 x i64]", text)
         self.assertIn("insertvalue [3 x i64] undef", text)
@@ -232,14 +232,14 @@ class StructCheckTest(unittest.TestCase):
     def test_make_records_the_struct_type(self):
         cm = checked(
             "(mod m)(type point (struct (x :i64) (y :i64)))"
-            "(fn f :void () (let p point (make point 1 2)))"
+            "(fn f :void () (let _ point (make point 1 2)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "make")], StructRef("point"))
 
     def test_get_records_the_field_type(self):
         cm = checked(
             "(mod m)(type point (struct (x :i64) (y :u8)))"
-            "(fn f :void ((p point)) (let y :u8 (get p y)))"
+            "(fn f :void ((p point)) (let _ :u8 (get p y)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "get")], Prim("u8"))
 
@@ -314,7 +314,7 @@ class StructCheckTest(unittest.TestCase):
     def test_make_of_an_enum_is_refused_until_results_exist(self):
         error = fail_on(
             "(mod m)(type e (enum (a)))"
-            "(fn f :void () (let x e (make e)))"
+            "(fn f :void () (let _ e (make e)))"
         )
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.message, "'make' of enum 'e' is not lowered yet")
@@ -350,7 +350,7 @@ class ArrayCheckTest(unittest.TestCase):
     def test_make_builds_a_fixed_array(self):
         cm = checked(
             "(mod m)(fn f :void ()"
-            " (let a (arr :i64 3) (make (arr :i64 3) 1 2 3)))"
+            " (let _ (arr :i64 3) (make (arr :i64 3) 1 2 3)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "make")], Arr(Prim("i64"), 3))
 
@@ -412,7 +412,7 @@ class StructLoweringTest(unittest.TestCase):
         fn = lower.lower_module(
             checked(
                 "(mod m)(type point (struct (x :i64) (y :u8)))"
-                "(fn f :void () (let p point (make point 1 2)))"
+                "(fn f :void () (let _ point (make point 1 2)))"
             )
         ).functions[0]
         inserts = instructions(fn, "insertvalue")
@@ -468,7 +468,7 @@ class StructLoweringTest(unittest.TestCase):
     def test_an_empty_struct_is_an_empty_aggregate(self):
         text = emitted(
             "(mod m)(type e (struct))"
-            "(fn main :void () (let x e (make e)) (println \"x\"))"
+            "(fn main :void () (let _ e (make e)) (println \"x\"))"
         )
         self.assertIn("%struct.e = type { }", text)
         self.assertIn("store %struct.e undef, %struct.e* %v.0.addr", text)
@@ -495,7 +495,7 @@ class StructLoweringTest(unittest.TestCase):
         text = emitted(
             "(mod m)(type point (struct (x :i64)))"
             "(fn id point ((p point)) (ret p))"
-            "(fn main :void () (let p point (make point 1)) (let q point (id p))"
+            "(fn main :void () (let p point (make point 1)) (let _ point (id p))"
             ' (println "x"))'
         )
         self.assertIn("define internal %struct.point @lg.m.id(%struct.point %v.0)", text)
@@ -549,7 +549,7 @@ class ArrayLoweringTest(unittest.TestCase):
 
     def test_a_zero_length_array_is_constructed_with_no_inserts(self):
         text = emitted(
-            "(mod m)(fn main :void () (let a (arr :i64 0) (make (arr :i64 0))))"
+            "(mod m)(fn main :void () (let _ (arr :i64 0) (make (arr :i64 0))))"
         )
         self.assertIn("%v.0.addr = alloca [0 x i64]", text)
         self.assertIn("store [0 x i64] undef, [0 x i64]* %v.0.addr", text)

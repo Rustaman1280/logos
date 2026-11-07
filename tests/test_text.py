@@ -176,7 +176,7 @@ class VecCheckTest(unittest.TestCase):
     def test_make_builds_an_empty_vector(self):
         cm = checked(
             "(mod m)(fn f :void ()"
-            " (letmut v (vec :i64) (make (vec :i64))))"
+            " (letmut _ (vec :i64) (make (vec :i64))))"
         )
         self.assertEqual(type_of(cm, "make"), Vec(Prim("i64")))
 
@@ -802,7 +802,7 @@ class VecLoweringTest(unittest.TestCase):
 
     def test_make_builds_a_null_descriptor(self):
         text = emitted(
-            "(mod m)(fn f :void () (letmut v (vec :i64) (make (vec :i64))))"
+            "(mod m)(fn f :void () (letmut _ (vec :i64) (make (vec :i64))))"
         )
         self.assertIn("insertvalue { i64*, i64, i64 } undef, i64* null, 0", text)
         self.assertIn(", i64 0, 1", text)
@@ -876,7 +876,7 @@ class VecLoweringTest(unittest.TestCase):
     def test_a_vector_of_a_struct_collects_the_struct(self):
         text = emitted(
             "(mod m)(type p (struct (x :i64)))"
-            "(fn f :void () (letmut v (vec p) (make (vec p))))"
+            "(fn f :void () (letmut _ (vec p) (make (vec p))))"
         )
         self.assertIn("%struct.p = type { i64 }", text)
         self.assertIn("{ %struct.p*, i64, i64 }", text)

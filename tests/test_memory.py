@@ -97,13 +97,13 @@ class AllocCheckTest(unittest.TestCase):
     """``alloc`` gives an owning pointer; the count is an integer."""
 
     def test_alloc_has_the_own_type(self):
-        cm = checked("(mod m)(fn f :void () (let p (alloc :i64 4)))")
+        cm = checked("(mod m)(fn f :void () (let _ (alloc :i64 4)))")
         self.assertEqual(cm.expr_types[path_of(cm, "alloc")], Own(Prim("i64")))
 
     def test_alloc_of_a_struct_owns_the_struct(self):
         cm = checked(
             "(mod m)(type point (struct (x :i64)))"
-            "(fn f :void () (let p (alloc point 2)))"
+            "(fn f :void () (let _ (alloc point 2)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "alloc")], Own(StructRef("point")))
 
@@ -185,13 +185,13 @@ class PointerCheckTest(unittest.TestCase):
 
     def test_deref_reads_an_owning_pointers_element(self):
         cm = checked(
-            "(mod m)(fn f :void () (let p (alloc :i32 1)) (let x :i32 (deref p)))"
+            "(mod m)(fn f :void () (let p (alloc :i32 1)) (let _ :i32 (deref p)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "deref")], Prim("i32"))
 
     def test_deref_reads_a_raw_pointers_element(self):
         cm = checked(
-            "(mod m)(fn f :void ((p (ptr :u8))) (let x :u8 (deref p)))"
+            "(mod m)(fn f :void ((p (ptr :u8))) (let _ :u8 (deref p)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "deref")], Prim("u8"))
 
@@ -219,14 +219,14 @@ class PointerCheckTest(unittest.TestCase):
 
     def test_ptr_yields_the_same_element_as_a_raw_pointer(self):
         cm = checked(
-            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let q (ptr p)))"
+            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let _ (ptr p)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "ptr")], Ptr(Prim("i64")))
 
     def test_ptr_add_yields_a_raw_pointer(self):
         cm = checked(
             "(mod m)(fn f :void () (let p (alloc :i64 2))"
-            " (let q (ptr-add p 1)))"
+            " (let _ (ptr-add p 1)))"
         )
         self.assertEqual(cm.expr_types[path_of(cm, "ptr-add")], Ptr(Prim("i64")))
 
@@ -426,7 +426,7 @@ class MemoryLoweringTest(unittest.TestCase):
 
     def test_alloc_calls_rt_alloc_with_bytes_an_alignment_and_a_path(self):
         m = lower.lower_module(
-            checked("(mod m)(fn f :void () (let p (alloc :i64 4)))")
+            checked("(mod m)(fn f :void () (let _ (alloc :i64 4)))")
         )
         fn = m.functions[0]
         call = [ins for ins in calls(fn) if ins[2] == "rt_alloc"][0]
@@ -439,12 +439,12 @@ class MemoryLoweringTest(unittest.TestCase):
         self.assertTrue(any(g.data == b"m/f/2/1\x00" for g in m.globals))
 
     def test_alloc_declares_rt_alloc(self):
-        text = emitted("(mod m)(fn f :void () (let p (alloc :i64 1)))")
+        text = emitted("(mod m)(fn f :void () (let _ (alloc :i64 1)))")
         self.assertIn("declare i8* @rt_alloc(i64, i64, i8*)", text)
 
     def test_the_size_guard_refuses_a_count_that_would_overflow(self):
         m = lower.lower_module(
-            checked("(mod m)(fn f :void ((n :i64)) (let p (alloc :i64 n)))")
+            checked("(mod m)(fn f :void ((n :i64)) (let _ (alloc :i64 n)))")
         )
         fn = m.functions[0]
         guards = [ins for ins in instructions(fn, "icmp") if ins[2] == "ugt"]
@@ -457,7 +457,7 @@ class MemoryLoweringTest(unittest.TestCase):
         # (type pair (struct (a :u8) (b :i64))) is sixteen bytes in C.
         text = emitted(
             "(mod m)(type pair (struct (a :u8) (b :i64)))"
-            "(fn f :void () (let p (alloc pair 3)))"
+            "(fn f :void () (let _ (alloc pair 3)))"
         )
         self.assertIn("mul i64 3, 16", text)
 
@@ -481,7 +481,7 @@ class MemoryLoweringTest(unittest.TestCase):
         # allocator is asked for count * layout size, not for a guess.
         text = emitted(
             "(mod m)(type record (struct (tag :i32) (pad :i32) (lo :i64) (hi :i64)))"
-            "(fn f :void () (let p (alloc record 2)))"
+            "(fn f :void () (let _ (alloc record 2)))"
         )
         self.assertIn("mul i64 2, 24", text)
         self.assertIn(", i64 8, i8* %t", text)
@@ -494,7 +494,7 @@ class MemoryLoweringTest(unittest.TestCase):
 
     def test_deref_is_a_typed_load(self):
         text = emitted(
-            "(mod m)(fn f :void () (let p (alloc :i32 1)) (let x :i32 (deref p)))"
+            "(mod m)(fn f :void () (let p (alloc :i32 1)) (let _ :i32 (deref p)))"
         )
         self.assertIn("load i32, i32* %t", text)
 
@@ -506,14 +506,14 @@ class MemoryLoweringTest(unittest.TestCase):
 
     def test_ptr_add_is_a_gep_with_the_element_stride(self):
         text = emitted(
-            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let q (ptr-add p 1)))"
+            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let _ (ptr-add p 1)))"
         )
         self.assertIn("= getelementptr i64, i64* %t", text)
         self.assertRegex(text, r"getelementptr i64, i64\* %t\d+, i64 1")
 
     def test_ptr_is_a_conversion_with_no_instruction(self):
         text = emitted(
-            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let q (ptr p)))"
+            "(mod m)(fn f :void () (let p (alloc :i64 2)) (let _ (ptr p)))"
         )
         self.assertNotIn("bitcast i64*", text)
         self.assertIn("store i64* %t", text)

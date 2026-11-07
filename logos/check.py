@@ -351,6 +351,7 @@ from logos.diag import (
     UNKNOWN_FUNCTION,
     UNKNOWN_NODE,
     UNKNOWN_TYPE,
+    UNUSED_BINDING,
     USE_AFTER_MOVE,
     VEC_MOVE,
     WRONG_ARITY,
@@ -1081,6 +1082,12 @@ class _Var:
     handing it to a callee all discharge it; letting the block that declared it
     end first is E0602 at ``path``. ``path`` is the binding's own node, so the
     diagnostic points at the declaration and not at the block that ends.
+
+    ``used`` records that a read reached this binding. A write does not set it
+    — ``set``, ``set-field`` and ``arr-set`` write through a name without
+    reading its value — which is what makes a ``letmut`` that is only ever
+    assigned E0107. A parameter is never reported, because its name belongs to
+    the signature rather than to the body.
     """
 
     ty: Ty
@@ -1090,6 +1097,7 @@ class _Var:
     decl_loop: int = 0
     origin_loop: int = 0
     handled: bool = False
+    used: bool = False
     path: str = ""
 
 
@@ -1160,7 +1168,22 @@ class _Env:
         except BaseException:
             self.scopes.pop()
             raise
-        self._pending(self.scopes.pop())
+        scope = self.scopes.pop()
+        self._pending(scope)
+        self._unused(scope)
+
+    def _unused(self, scope: dict[str, "_Var"]) -> None:
+        """Report the first binding in ``scope`` that was never read.
+
+        A binding named ``_`` is the opt-out: the name says the value is
+        deliberately dismissed. Parameters never reach here as candidates
+        because ``param`` is set, and writes never set ``used``, so a plain
+        ``letmut`` assigned and never read is reported just like a ``let``.
+        """
+        for name, var in scope.items():
+            if var.param or var.used or name == "_":
+                continue
+            raise diag(UNUSED_BINDING, var.path, f"unused binding '{name}'")
 
     def _pending(self, scope: dict[str, "_Var"]) -> None:
         """Report the first result binding in ``scope`` that was never handled."""
@@ -1175,6 +1198,7 @@ class _Env:
     def finish(self) -> None:
         """Check the function block's own results, which no ``block`` closes."""
         self._pending(self.scopes[0])
+        self._unused(self.scopes[0])
 
     def define(
         self,
@@ -1246,6 +1270,7 @@ class _Env:
             handled=not isinstance(found.ty, Res),
             path=found.path,
         )
+        found.used = True
         if isinstance(found.ty, Res):
             found.handled = True
         self.scopes[0][name] = copy
@@ -1805,6 +1830,7 @@ class _Checker:
                 raise diag(UNKNOWN_NODE, where, f"type name '{token.value}' is not a value")
             var = env.lookup(token.value, where)
             if var is not None:
+                var.used = True
                 if var.moved:
                     # The binding is empty: whatever it used to own has been
                     # transferred or released, so reading it would read a
@@ -2637,6 +2663,9 @@ class _Checker:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
             raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
+        # The aggregate is used as a place: its storage is what the write
+        # reaches, so the binding has been read even though no value was.
+        var.used = True
         if not isinstance(var.ty, StructRef):
             raise diag(
                 TYPE_MISMATCH,
@@ -2710,6 +2739,8 @@ class _Checker:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
         if not var.mutable:
             raise diag(NOT_MUTABLE, node.path, f"cannot set immutable binding '{name}'")
+        # The array is used as a place, exactly like a struct field write.
+        var.used = True
         if not isinstance(var.ty, Arr):
             raise diag(
                 TYPE_MISMATCH,
@@ -2856,6 +2887,10 @@ class _Checker:
         var = env.lookup(name, node.path)
         if var is None:
             raise diag(NOT_FOUND, node.path, f"unknown name '{name}'")
+        # A vector operation acts on the descriptor it names — push rewrites
+        # it, free releases its buffer, set writes through it — so the name is
+        # read even though the descriptor itself is the thing written back.
+        var.used = True
         if var.moved:
             # The value was moved or released, so the descriptor holds
             # nothing: writing through this name would touch a buffer another
@@ -3851,6 +3886,7 @@ class _Checker:
         name = node.kind
         var = env.lookup(name, node.path)
         if var is not None:
+            var.used = True
             if not isinstance(var.ty, FnTy):
                 raise diag(
                     TYPE_MISMATCH, node.path, f"'{name}' is not a function: found {var.ty}"

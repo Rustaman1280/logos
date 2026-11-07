@@ -198,7 +198,7 @@ class InstantiationTest(unittest.TestCase):
     def test_two_call_sites_with_different_types_make_two_copies(self):
         cm = checked(
             '(mod m)(fn id :T ((x :T)) (ret x))'
-            '(fn f :i64 () (let a (id 1)) (let b (id "s")) (ret a))'
+            '(fn f :i64 () (let a (id 1)) (let _ (id "s")) (ret a))'
         )
         self.assertEqual(list(cm.instances), ["id$i64", "id$str"])
 

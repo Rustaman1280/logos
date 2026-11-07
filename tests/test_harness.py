@@ -66,7 +66,7 @@ LEAKY = """\
 
 (test leaks
   (expect (code 0) (leaks 1))
-  (let p (alloc :i64 4)))
+  (let _ (alloc :i64 4)))
 """
 
 
@@ -135,7 +135,7 @@ class DirectiveTest(unittest.TestCase):
 
                 (test one-block
                   (expect (code 0) (leaks 1))
-                  (let p (alloc :i64 4)))
+                  (let _ (alloc :i64 4)))
                 """,
             )
             summary = run(Path(tmp))
@@ -153,7 +153,7 @@ class DirectiveTest(unittest.TestCase):
 
                 (test one-block
                   (expect (code 0) (leaks 0))
-                  (let p (alloc :i64 4)))
+                  (let _ (alloc :i64 4)))
                 """,
             )
             summary = run(Path(tmp))
@@ -175,7 +175,7 @@ class DirectiveTest(unittest.TestCase):
 
                 (test panics
                   (expect (code 2) (err-contains "R0001: division by zero"))
-                  (let q :i64 (/ 1 (zero))))
+                  (let _ :i64 (/ 1 (zero))))
                 """,
             )
             summary = run(Path(tmp))
@@ -196,7 +196,7 @@ class DirectiveTest(unittest.TestCase):
 
                 (test panics
                   (expect (code 2) (err-contains "R0009: not the panic"))
-                  (let q :i64 (/ 1 (zero))))
+                  (let _ :i64 (/ 1 (zero))))
                 """,
             )
             summary = run(Path(tmp))

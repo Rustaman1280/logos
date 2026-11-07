@@ -291,7 +291,7 @@ class ModuleCheckTest(unittest.TestCase):
             '(mod m)(fn f :str () (ret "s"))',
             "(mod m)(fn f :bool () (ret true))",
             "(mod m)(fn f :bool () (ret false))",
-            "(mod m)(fn f :i64 () (let a 1) (let b 1.5) (ret a))",
+            "(mod m)(fn f :i64 () (let a 1) (let _ 1.5) (ret a))",
         ):
             with self.subTest(src=src):
                 check_src(src)
@@ -359,7 +359,7 @@ class SignatureTest(unittest.TestCase):
 
     def test_a_named_type_annotation_is_bare(self):
         check_src(
-            "(mod m)(type p (struct))(fn f :i64 ((x p)) (let y p x) (ret 0))"
+            "(mod m)(type p (struct))(fn f :i64 ((x p)) (let _ p x) (ret 0))"
         )
 
     def test_a_composite_type_is_written_behind_the_type_marker(self):
@@ -797,7 +797,7 @@ class TestNodeTest(unittest.TestCase):
         self.assertEqual(error.path, "m/test/t/1")
 
     def test_expect_nodes_are_directives_not_expressions(self):
-        checked = check_src('(mod m)(test t (expect (out "x") (code 0)) (let x :i64 1))')
+        checked = check_src('(mod m)(test t (expect (out "x") (code 0)) (let _ :i64 1))')
         self.assertNotIn("m/test/t/0", checked.expr_types)
         self.assertEqual(checked.expr_types["m/test/t/1"], Prim("void"))
 
@@ -847,6 +847,34 @@ class UnknownFormTest(unittest.TestCase):
         )
         self.assertEqual(error.path, "m/f/2/0")
         self.assertIn("'p'", error.message)
+
+
+class UnusedBindingTest(unittest.TestCase):
+    """E0107 names the binding's own node, and ``_`` is the way out."""
+
+    def test_an_unread_binding_is_reported_at_its_declaration(self):
+        error = expect_error("(mod m)(fn f :void () (let x :i64 1))", "E0107")
+        self.assertEqual(error.path, "m/f/2")
+        self.assertEqual(error.message, "unused binding 'x'")
+
+    def test_an_underscore_binding_opts_out(self):
+        check_src("(mod m)(fn f :void () (let _ :i64 1))")
+
+    def test_a_letmut_that_is_only_written_is_still_unused(self):
+        error = expect_error(
+            "(mod m)(fn f :void () (letmut x :i64 1) (set x 2))", "E0107"
+        )
+        self.assertEqual(error.path, "m/f/2")
+        self.assertEqual(error.message, "unused binding 'x'")
+
+    def test_a_parameter_is_part_of_the_signature_and_is_not_reported(self):
+        check_src("(mod m)(fn f :void ((x :i64)) (ret))")
+
+    def test_a_closure_read_marks_the_binding_used(self):
+        check_src(
+            "(mod m)(fn f :void () (let x :i64 1)"
+            " (let g (fn :void () (println x))) (g))"
+        )
 
 
 class CorpusTest(unittest.TestCase):

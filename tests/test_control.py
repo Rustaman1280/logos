@@ -183,7 +183,7 @@ class ControlFlowCheckTest(unittest.TestCase):
     def test_a_binding_from_an_if_branch_is_not_visible_after_the_join(self):
         error = fail_on(
             "(mod m)(fn f :i64 ((c :bool))"
-            " (if c (let x :i64 1) (let x :i64 2)) (ret x))"
+            " (if c (let _ :i64 1) (let _ :i64 2)) (ret x))"
         )
         self.assertEqual(error.code, "E0005")
         self.assertEqual(error.path, "m/f/3")
@@ -192,7 +192,7 @@ class ControlFlowCheckTest(unittest.TestCase):
     def test_a_binding_from_a_loop_body_is_not_visible_after_the_loop(self):
         error = fail_on(
             "(mod m)(fn f :i64 () (letmut i :i64 0)"
-            " (while (< i 1) (let x :i64 1) (set i 1)) (ret x))"
+            " (while (< i 1) (let _ :i64 1) (set i 1)) (ret x))"
         )
         self.assertEqual(error.code, "E0005")
         self.assertEqual(error.path, "m/f/4")
@@ -201,7 +201,7 @@ class ControlFlowCheckTest(unittest.TestCase):
     def test_a_binding_from_a_match_arm_is_not_visible_after_the_match(self):
         error = fail_on(
             "(mod m)(fn f :i64 ((n :i64))"
-            ' (match n (0 (let x :i64 1) (println "a")) (_ (println "b")))'
+            ' (match n (0 (let _ :i64 1) (println "a")) (_ (println "b")))'
             " (ret x))"
         )
         self.assertEqual(error.code, "E0005")
@@ -213,7 +213,7 @@ class ControlFlowCheckTest(unittest.TestCase):
         # the outer binding is untouched when the block ends.
         checked(
             "(mod m)(fn f :i64 () (letmut x :i64 1)"
-            " (match 0 (0 (letmut x :i64 2) (set x 3)) (_ (set x 4)))"
+            " (match 0 (0 (letmut x :i64 2) (set x 3) (println x)) (_ (set x 4)))"
             " (ret x))"
         )
         checked(

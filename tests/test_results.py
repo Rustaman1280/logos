@@ -196,11 +196,11 @@ class ResultTypeTest(unittest.TestCase):
         self.assertEqual(error.message, "'err' expects e, found :i64")
 
     def test_some_infers_its_element_type(self):
-        cm = checked("(mod m)(fn f :void () (let o (some 5)) (println 1))")
+        cm = checked("(mod m)(fn f :void () (let _ (some 5)) (println 1))")
         self.assertEqual(cm.expr_types["m/f/2/1"], Opt(Prim("i64")))
 
     def test_some_takes_the_element_of_its_annotation(self):
-        cm = checked("(mod m)(fn f :void () (let o :(opt :u8) (some 5)) (println 1))")
+        cm = checked("(mod m)(fn f :void () (let _ :(opt :u8) (some 5)) (println 1))")
         self.assertEqual(cm.declared["m/f/2"], Opt(Prim("u8")))
 
     def test_some_checks_its_value_against_the_element(self):
@@ -262,14 +262,14 @@ class ResultTypeTest(unittest.TestCase):
         checked("(mod m)(type eof-error (enum (eof)))"
                 "(fn f :void ()"
                 " (let r :(res (fn () :i64) eof-error) (ok (fn :i64 () (ret 1))))"
-                " (match r ((ok g) (println (g))) ((err e) (println 0))))")
+                " (match r ((ok g) (println (g))) ((err _) (println 0))))")
 
 
 class TryTest(unittest.TestCase):
     def test_try_yields_the_ok_type(self):
         cm = checked("(mod m)" + ERR +
                      "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
-                     "(fn f :(res :str eof-error) () (let v (try (g))) (ret (ok \"x\")))")
+                     "(fn f :(res :str eof-error) () (let _ (try (g))) (ret (ok \"x\")))")
         self.assertEqual(cm.expr_types["m/f/3/1"], Prim("i64"))
 
     def test_try_propagates_an_exactly_matching_error_type(self):
@@ -335,7 +335,7 @@ class UnhandledResultTest(unittest.TestCase):
         checked("(mod m)" + ERR +
                 "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                 "(fn f :void () (let r (g))"
-                " (match r ((ok v) (println v)) ((err e) (println 0))))")
+                " (match r ((ok v) (println v)) ((err _) (println 0))))")
 
     def test_a_tried_binding_is_handled(self):
         checked("(mod m)" + ERR +
@@ -351,7 +351,7 @@ class UnhandledResultTest(unittest.TestCase):
         checked("(mod m)" + ERR +
                 "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                 "(fn take :void ((r :(res :i64 eof-error))) (match r ((ok v) (println v))"
-                " ((err e) (println 0))))"
+                " ((err _) (println 0))))"
                 "(fn f :void () (let r (g)) (take r))")
 
     def test_a_result_parameter_must_be_handled(self):
@@ -364,7 +364,7 @@ class UnhandledResultTest(unittest.TestCase):
         error = fail_on("(mod m)" + ERR +
                         "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (letmut r (g))"
-                        " (match r ((ok v) (println v)) ((err e) (println 0)))"
+                        " (match r ((ok v) (println v)) ((err _) (println 0)))"
                         " (set r (g)))")
         self.assertEqual(error.code, "E0602")
 
@@ -372,7 +372,7 @@ class UnhandledResultTest(unittest.TestCase):
         checked("(mod m)" + ERR +
                 "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                 "(fn f :i64 () (let r (g))"
-                " (let h (fn :i64 () (ret (match r ((ok v) v) ((err e) 0)))))"
+                " (let h (fn :i64 () (ret (match r ((ok v) v) ((err _) 0)))))"
                 " (ret (h)))")
 
     def test_a_result_copied_inside_a_closure_is_that_closure_s_obligation(self):
@@ -384,7 +384,7 @@ class UnhandledResultTest(unittest.TestCase):
         self.assertIn("'x'", error.message)
 
     def test_an_optional_carries_no_obligation(self):
-        checked("(mod m)(fn f :void () (let o (some 1)) (println 1))")
+        checked("(mod m)(fn f :void () (let _ (some 1)) (println 1))")
 
     def test_a_result_inside_a_block_ends_with_it(self):
         error = fail_on("(mod m)" + ERR +
@@ -455,7 +455,7 @@ class UnhandledResultTest(unittest.TestCase):
         error = fail_on("(mod m)" + ERR +
                         "(fn g :(res :i64 eof-error) () (ret (ok 1)))"
                         "(fn f :void () (letmut r (g))"
-                        " (match r ((ok v) (println v)) ((err e) (println 0)))"
+                        " (match r ((ok v) (println v)) ((err _) (println 0)))"
                         " (set r (g)))")
         # The old obligation is discharged; the new value is the one reported,
         # at the end of the block.
@@ -544,7 +544,7 @@ class VariantConstructorTest(unittest.TestCase):
 
     def test_a_payload_less_variant_is_a_bare_value(self):
         cm = checked("(mod m)(type e (enum (bad :i64) (eof)))"
-                     "(fn f e () (let x eof) (ret eof))")
+                     "(fn f e () (let _ eof) (ret eof))")
         self.assertEqual(cm.declared["m/f/2"], EnumRef("e"))
 
     def test_the_payload_is_checked_against_its_declared_type(self):
@@ -713,7 +713,7 @@ class OwnerPlaceTest(unittest.TestCase):
             "(mod m)(fn f :void ()"
             " (letmut v (vec :i64) (make (vec :i64)))"
             " (vec-push v 1)"
-            " (letmut a (make (arr :i64 2) 1 2)))"
+            " (letmut _ (make (arr :i64 2) 1 2)))"
         )
 
     def test_an_owner_inside_an_owner_is_refused(self):
@@ -769,7 +769,7 @@ class OwnerPlaceTest(unittest.TestCase):
             "(mod m)(fn f :void ()"
             " (letmut p (alloc :i64 1))"
             " (set-deref p 9)"
-            " (let x :i64 (deref p))"
+            " (let _ :i64 (deref p))"
             " (free p))"
         )
 
@@ -810,8 +810,8 @@ class OwnerPlaceTest(unittest.TestCase):
         # green and let a second match compile into a double owner (R0002).
         error = fail_on(
             "(mod m)(fn f :void ((o :(opt (own :i64))))"
-            " (match o ((some p) (println 0)) ((none) (println 1)))"
-            " (match o ((some p) (println 0)) ((none) (println 1))))"
+            " (match o ((some _) (println 0)) ((none) (println 1)))"
+            " (match o ((some _) (println 0)) ((none) (println 1))))"
         )
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'o'")

@@ -23,7 +23,7 @@
   (ret (ok (+ x y))))
 
 (fn unwrap-or :i64 ((r : (res :i64 parse-error)) (fallback :i64))
-  (match r ((ok v) (ret v)) ((err e) (ret fallback))))
+  (match r ((ok v) (ret v)) ((err _) (ret fallback))))
 
 (fn find :
   (opt :i64) ((v :i64))
@@ -37,7 +37,7 @@
   (expect (out "7\n")
     (code 0)
     (leaks 0))
-  (match (parse-digit 3) ((ok v) (println v)) ((err e) (println 0))))
+  (match (parse-digit 3) ((ok v) (println v)) ((err _) (println 0))))
 
 (test match-err-payload
   (expect (out "42\n")
@@ -55,7 +55,7 @@
   (expect (out "14\n")
     (code 0)
     (leaks 0))
-  (match (sum-two 3 4) ((ok v) (println v)) ((err e) (println 0))))
+  (match (sum-two 3 4) ((ok v) (println v)) ((err _) (println 0))))
 
 (test try-propagates
   (expect (out "42\n")
@@ -114,7 +114,7 @@
   (expect (out "0\n")
     (code 0)
     (leaks 0))
-  (let v (match (parse-digit 42) ((ok x) x) ((err e) 0)))
+  (let v (match (parse-digit 42) ((ok x) x) ((err _) 0)))
   (println v))
 
 (test wildcard-covers-an-enum
@@ -177,13 +177,13 @@
   (expect (out "14\n")
     (code 0)
     (leaks 0))
-  (println (match (add-two 3 4) ((ok v) v) ((err e) 0))))
+  (println (match (add-two 3 4) ((ok v) v) ((err _) 0))))
 
 (test try-inside-a-loop
   (expect (out "21\n")
     (code 0)
     (leaks 0))
-  (println (match (sum-upto) ((ok v) v) ((err e) 0))))
+  (println (match (sum-upto) ((ok v) v) ((err _) 0))))
 
 (test owner-in-an-optional
   (expect (out "5\n")
@@ -192,8 +192,7 @@
   (letmut p (alloc :i64 1))
   (set-deref p 5)
   (let o (some p))
-  (match o ((some q) (println (deref q)) (free q))
-    (none (println 0))))
+  (match o ((some q) (println (deref q)) (free q)) (none (println 0))))
 
 (test owner-in-a-binding
   (expect (out "9\n")

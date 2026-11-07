@@ -69,6 +69,7 @@ CODES = {
     "E0104": "not mutable",
     "E0105": "missing return",
     "E0106": "integer literal out of range",
+    "E0107": "unused binding",
     "E0200": "unknown field",
     "E0201": "field type mismatch",
     "E0300": "use after move",
@@ -100,6 +101,11 @@ UNKNOWN_FUNCTION = "E0103"
 NOT_MUTABLE = "E0104"
 MISSING_RETURN = "E0105"
 LITERAL_RANGE = "E0106"
+#: A ``let``/``letmut`` whose name is never read. A binding named ``_`` opts
+#: out; a parameter is part of a signature and is never reported. A write
+#: through the binding does not count as a read, so ``letmut`` set and never
+#: read is reported too.
+UNUSED_BINDING = "E0107"
 UNKNOWN_FIELD = "E0200"
 FIELD_TYPE_MISMATCH = "E0201"
 USE_AFTER_MOVE = "E0300"

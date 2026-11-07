@@ -112,7 +112,7 @@ class ThreadTypeTest(unittest.TestCase):
     def test_spawn_returns_a_thread(self):
         cm = checked(
             "(mod m)(fn w :void () (ret))"
-            "(fn f :void () (let t (spawn w)))"
+            "(fn f :void () (let _ (spawn w)))"
         )
         self.assertEqual(type_of(cm, "spawn"), Prim("thread"))
 
@@ -129,7 +129,7 @@ class ThreadTypeTest(unittest.TestCase):
         self.assertEqual(error.message, "join needs a :thread, found :i64")
 
     def test_a_mutex_is_shared_and_unmarked_mutex_is_e0700(self):
-        cm = checked("(mod m)(fn f :void () (let m (mutex)))")
+        cm = checked("(mod m)(fn f :void () (let _ (mutex)))")
         self.assertEqual(
             cm.expr_types[path_of(cm, "mutex")], Shared(Prim("mutex"))
         )
@@ -155,7 +155,7 @@ class ThreadTypeTest(unittest.TestCase):
         # The marker is what makes the crossing visible; there is no unwrap
         # yet, so holding one is all a program can do with it.
         checked(
-            "(mod m)(fn hold :void ((t (shared :thread))) (let kept t))"
+            "(mod m)(fn hold :void ((t (shared :thread))) (let _ t))"
         )
 
     def test_a_channel_of_an_empty_type_is_refused(self):
@@ -182,7 +182,7 @@ class ThreadTypeTest(unittest.TestCase):
     def test_a_channel_of_a_non_empty_struct_is_still_allowed(self):
         checked(
             "(mod m)(type cell (struct (v :i64)))"
-            "(fn f :void () (letmut c (chan cell 1)))"
+            "(fn f :void () (letmut _ (chan cell 1)))"
         )
 
     def test_lock_and_unlock_need_a_shared_mutex(self):
@@ -195,7 +195,7 @@ class ThreadTypeTest(unittest.TestCase):
         self.assertEqual(error.code, "E0100")
 
     def test_a_channel_carries_its_element_type(self):
-        cm = checked("(mod m)(fn f :void () (let c (chan :i64 4)))")
+        cm = checked("(mod m)(fn f :void () (let _ (chan :i64 4)))")
         self.assertEqual(
             cm.expr_types[path_of(cm, "chan")], Shared(Chan(Prim("i64")))
         )
@@ -246,7 +246,7 @@ class ThreadTypeTest(unittest.TestCase):
         self.assertEqual(error.code, "E0700")
 
     def test_a_channel_of_marked_pointers_checks(self):
-        cm = checked("(mod m)(fn f :void () (let c (chan (shared (ptr :i64)) 1)))")
+        cm = checked("(mod m)(fn f :void () (let _ (chan (shared (ptr :i64)) 1)))")
         self.assertEqual(
             cm.expr_types[path_of(cm, "chan")],
             Shared(Chan(Shared(Ptr(Prim("i64"))))),
@@ -453,7 +453,7 @@ class ThreadLoweringTest(unittest.TestCase):
     def test_spawn_names_the_spawn_node_in_the_argument_record(self):
         text = emitted(
             "(mod m)(fn w :void ((n :i64)) (println n))"
-            "(fn f :void () (let t (spawn w 7)))"
+            "(fn f :void () (let _ (spawn w 7)))"
         )
         self.assertIn("@rt_thread_new", text)
         # The path of the spawn is the alloc's path, so an unjoined thread's
@@ -478,13 +478,13 @@ class ThreadLoweringTest(unittest.TestCase):
         )
 
     def test_a_mutex_constructor_calls_rt_mutex_new(self):
-        module = lowered("(mod m)(fn f :void () (let m (mutex)))")
+        module = lowered("(mod m)(fn f :void () (let _ (mutex)))")
         self.assertIn("rt_mutex_new", callees(module.functions[0]))
 
     def test_channel_operations_pass_the_element_size(self):
         text = emitted(
             "(mod m)(fn f :void () (let c (chan :i64 4)) (send c 7)"
-            " (let n (recv c)))"
+            " (let _ (recv c)))"
         )
         self.assertIn("declare i8* @rt_chan_new(i64, i64, i8*)", text)
         self.assertIn("@rt_chan_send", text)
@@ -508,7 +508,7 @@ class ThreadLoweringTest(unittest.TestCase):
         # first field and whatever the stack held for the second.
         text = emitted(
             "(mod m)(type pair (struct (a :i64) (b :i64)))"
-            "(fn f :void () (let c (chan pair 4)))"
+            "(fn f :void () (let _ (chan pair 4)))"
         )
         self.assertIn("call i8* @rt_chan_new(i64 16, i64 4,", text)
 
