@@ -4,4 +4,5 @@
   (ret (f x)))
 
 (fn f :i64 ((n :i64))
-  (ret (apply (fn :i64 ((x :i64)) (ret (+ x n))) 1)))
+  (ret (apply (fn :i64 ((x :i64))
+                (ret (+ x n))) 1)))

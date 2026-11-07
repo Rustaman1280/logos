@@ -3,5 +3,4 @@
 (type parse-error (enum (bad :u64) (overflow)))
 
 (fn classify :i64 ((e parse-error))
-  (match e
-    ((bad n) (ret n))))
+  (match e ((bad n) (ret n))))

@@ -4,6 +4,4 @@
 
 (fn f :void ()
   (let p (alloc (res :i64 eof-error) 1))
-  (match (deref p)
-    ((ok v) (println v))
-    ((err e) (println 0))))
+  (match (deref p) ((ok v) (println v)) ((err e) (println 0))))

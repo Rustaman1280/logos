@@ -132,7 +132,9 @@
     (code 0)
     (leaks 0))
   (let p (alloc :i64 1))
-  (letmut s (shared (ptr :i64)) (ptr p))
+  (letmut s
+    (shared (ptr :i64))
+    (ptr p))
   (set-deref s 7)
   (letmut c (chan cell 1))
   (letmut t (spawn send-cell c s))

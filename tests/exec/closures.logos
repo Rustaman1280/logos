@@ -141,14 +141,17 @@
            (ret (f (+ y x)))))
   (ret (g x)))
 
-(fn make-doubler :(fn (:i64) :i64) ()
+(fn make-doubler :
+  (fn (:i64) :i64) ()
   (ret (fn :i64 ((x :i64))
          (ret (* x 2)))))
 
 (type a-b (struct (x :i64)))
+
 (type a_x2db (struct (x :i64)))
 
-(fn pick :T ((x :T)) (ret x))
+(fn pick :T ((x :T))
+  (ret x))
 
 (test closure-inside-a-generic
   (expect (out "12\n")
@@ -173,7 +176,8 @@
   (println (get p x))
   (println (get q x)))
 
-(fn relay :(fn (:i64) :i64) ((f :(fn (:i64) :i64)))
+(fn relay :
+  (fn (:i64) :i64) ((f : (fn (:i64) :i64)))
   (ret f))
 
 (fn through-a-parameter :i64 ()
