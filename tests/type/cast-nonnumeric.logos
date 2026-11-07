@@ -1,0 +1,4 @@
+(mod cast-nonnumeric)
+
+(fn f :i64 ((b :bool))
+  (ret (cast :i64 b)))

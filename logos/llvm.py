@@ -105,6 +105,22 @@ _BINARY = (
     "fdiv",
 )
 
+#: Conversions, all printed ``dest = op from_ty value to to_ty``. The integer
+#: width changes are ``trunc``/``sext``/``zext``; a cast between an integer and
+#: a float is ``sitofp``/``uitofp`` one way and ``fptosi``/``fptoui`` the other;
+#: and two float widths are ``fpext``/``fptrunc``.
+_CONVERT = (
+    "trunc",
+    "sext",
+    "zext",
+    "sitofp",
+    "uitofp",
+    "fptosi",
+    "fptoui",
+    "fpext",
+    "fptrunc",
+)
+
 #: A name LLVM reads unquoted: ``[-a-zA-Z$._][-a-zA-Z$._0-9]*``.
 _UNQUOTED = re.compile(r"[-a-zA-Z$._][-a-zA-Z$._0-9]*\Z")
 
@@ -396,9 +412,6 @@ class _Text:
             spelled = type_text(ty)
             pairs = ", ".join(f"[ {value}, %{label} ]" for value, label in incoming)
             return f"{dest} = phi {spelled} {pairs}"
-        if op == "trunc":
-            _, dest, from_ty, to_ty, value = instr
-            return f"{dest} = trunc {type_text(from_ty)} {value} to {type_text(to_ty)}"
         if op == "icmp":
             _, dest, pred, ty, left, right = instr
             spelled = type_text(ty)
@@ -425,7 +438,7 @@ class _Text:
             return (
                 f"{dest} = getelementptr {spelled}, {spelled}* {base}, {steps}"
             )
-        if op in ("sext", "zext"):
+        if op in _CONVERT:
             _, dest, from_ty, to_ty, value = instr
             return (
                 f"{dest} = {op} {type_text(from_ty)} {value} "

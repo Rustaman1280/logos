@@ -199,6 +199,29 @@ time, and a value that already has a type never changes under ``compatible``.
 The adopted type is also the literal's range: an integer literal that does not
 fit its resolved type is E0106, never a silent truncation.
 
+Numbers, bits and casts
+-----------------------
+Arithmetic (``+``, ``-``, ``*``, ``/``) and every comparison work on both the
+integer and the float widths. An operation mixes no widths and no kinds: a float
+beside an integer is E0100, because the language has no implicit conversion and
+the checker will not invent one. ``%`` is integers only — a float remainder
+would have to choose between C's ``fmod`` and IEEE's remainder — and the backend
+says the same thing, so a form that checks is a form that lowers.
+
+``(shl a n)``, ``(shr a n)`` and ``(shr-u a n)`` shift an integer's bits: left,
+arithmetic right (the sign bit fills) and logical right (zeros fill). The
+shifted value fixes the type and the count is checked against it like any other
+operand; a count at or past the width is legal and is masked to the width, the
+way the hardware does, so ``(shl x 64)`` on an ``:i64`` is ``(shl x 0)``.
+Shifting a float or a ``:bool`` is E0100.
+
+``(cast T e)`` is the one explicit conversion. It is numeric only and must
+change the type: a cast that names the operand's own type is E0100, and so is
+one that names ``:bool``, ``:str``, a struct, an enum or a container, at either
+end. Integer widths truncate or extend, an integer becomes a float with IEEE
+rounding, and a float outside the target's range panics ``R0003`` at run time
+rather than producing the undefined answer an ``fptosi`` would.
+
 Returning
 ---------
 A function whose declared return type is not ``:void`` must end every path in
@@ -1664,6 +1687,8 @@ class _Checker:
             return self._compare(node, env)
         if kind in _SHIFTS:
             return self._shift(node, env)
+        if kind == "cast":
+            return self._cast(node, env)
         if kind in _LOGICAL:
             return self._logical(node, env)
         if kind == "not":
@@ -1927,6 +1952,47 @@ class _Checker:
                 f"cannot shift {ty} by {count}",
             )
         return ty
+
+    def _cast(self, node: Node, env: _Env) -> Ty:
+        """``(cast T e)``: the one explicit conversion the language has.
+
+        Numeric only, and only between types that differ: a cast that names the
+        operand's own type is E0100, because the program would be describing a
+        change that does not happen. Nothing else converts — ``:bool``, ``:str``,
+        a struct, an enum and every container keep their values, since one of
+        them has no numeric meaning to convert to or from.
+
+        The operand is typed with no expected type, so a literal keeps its
+        default (``:i64`` for an integer, ``:f64`` for a float) instead of
+        adopting ``T`` and making the cast a no-op. What each pair means at run
+        time is the backend's: a width change truncates or sign-extends, an
+        integer becomes a float with IEEE rounding, and a float that is not in
+        the target's range panics ``R0003`` rather than producing a value LLVM
+        would leave undefined.
+        """
+        items = node.items
+        index, where = _cast_shape(node)
+        target = parse_type(items[index], path=node.path)
+        if not (isinstance(target, Prim) and target.name in NUMBERS):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                f"a cast needs a numeric type, found {target}",
+            )
+        source = self._value(items[index + 1], env, None, node.path)
+        if not (isinstance(source, Prim) and source.name in NUMBERS):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[index + 1], node),
+                f"cannot cast {source} to {target}: a cast converts numbers",
+            )
+        if compatible(target, source):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                f"cast from {source} to {target} cannot change the type",
+            )
+        return target
 
     def _compare(self, node: Node, env: _Env) -> Ty:
         args = node.items[1:]
@@ -4498,6 +4564,22 @@ def _name(item: Node | Token, path: str, what: str) -> str:
 def _marker(item: Node | Token) -> bool:
     """Whether ``item`` is the ``:`` in front of a composite type."""
     return isinstance(item, Token) and item.kind == ATOM and item.value == ":"
+
+
+def _cast_shape(node: Node) -> tuple[int, str]:
+    """Where ``(cast T e)`` keeps its type, and the path to report at.
+
+    ``(cast :i64 x)`` puts the type at index one and the value at two. A
+    composite type is written behind the marker the language prints before it,
+    ``(cast :(vec :i64) x)``, which moves both by one. The form takes exactly
+    those two items, so a missing or extra one is E0102 here rather than an
+    index error later.
+    """
+    items = node.items
+    index = 2 if len(items) > 1 and _marker(items[1]) else 1
+    if len(items) != index + 2:
+        raise diag(WRONG_ARITY, node.path, "'cast' takes a type and a value")
+    return index, node.path
 
 
 def _is_type_slot(item: Node | Token) -> bool:

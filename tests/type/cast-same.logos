@@ -1,0 +1,4 @@
+(mod cast-same)
+
+(fn f :i64 ((x :i64))
+  (ret (cast :i64 x)))

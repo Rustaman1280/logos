@@ -1,0 +1,60 @@
+(mod cast)
+
+(test truncate-i64-to-i32
+  (expect (out "1\n-1\n")
+    (code 0))
+  (let big :i64 4294967297)
+  (println (cast :i64 (cast :i32 big)))
+  (println (cast :i64 (cast :i32 -1))))
+
+(test widen-i32-to-i64
+  (expect (out "-7\n")
+    (code 0))
+  (let n :i32 -7)
+  (println (cast :i64 n)))
+
+(test widen-unsigned-zero-extends
+  (expect (out "200\n255\n")
+    (code 0))
+  (println (cast :i64 (cast :u8 200)))
+  (println (cast :i64 (cast :u8 -1))))
+
+(test int-to-float
+  (expect (out "4294967297\n-7\n")
+    (code 0))
+  (println (cast :f64 4294967297))
+  (println (cast :f64 (cast :i32 -7))))
+
+(test float-to-int-in-range
+  (expect (out "2\n-2\n0\n42\n")
+    (code 0))
+  (println (cast :i64 2.75))
+  (println (cast :i64 -2.75))
+  (println (cast :i64 0.0))
+  (println (cast :i64 42.5)))
+
+(test float-to-int-large-in-range
+  (expect (out "-9223372036854775808\n9223372036854774784\n")
+    (code 0))
+  (println (cast :i64 -9223372036854775808.0))
+  (println (cast :i64 9223372036854774784.0)))
+
+(test float-to-int-out-of-range-panics
+  (expect (code 2)
+    (err-contains "cast/test/float-to-int-out-of-range-panics/2/2: R0003: float out of range for :i64"))
+  (let x :f64 1.0e300)
+  (let y :i64 (cast :i64 x))
+  (println y))
+
+(test float-to-unsigned-out-of-range-panics
+  (expect (code 2)
+    (err-contains "R0003: float out of range for :u64"))
+  (let x :f64 -1.0)
+  (println (cast :u64 x)))
+
+(test f32-rounds-to-single
+  (expect (out "0.10000000149011612\n0\n")
+    (code 0))
+  (let x :f32 0.1)
+  (println (cast :f64 x))
+  (println (cast :i64 (cast :i32 x))))

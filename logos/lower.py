@@ -156,6 +156,26 @@ the whole expression to poison at ``-O2``. For signed widths the one overflowing
 pair, ``INT_MIN / -1``, takes a branch of its own and yields the wrapped result
 without dividing. Unsigned widths use ``udiv``/``urem``.
 
+Floats, shifts and casts
+------------------------
+A float operation is one IEEE instruction at ``:f32`` or ``:f64`` and nothing
+else: ``fadd``/``fsub``/``fmul``/``fdiv``, and ``fcmp`` with the ordered
+predicates (``une`` for ``!=``, so a NaN is unequal to everything, itself
+included). No check precedes them and no fast-math flag follows them, so a float
+division by zero produces ``inf`` or ``nan`` where the integer one panics, and
+the two optimisation levels compute the same bits.
+
+A shift masks its count to the operand's width with one ``and`` and then emits
+``shl``, ``ashr`` (``shr``, the sign bit filling) or ``lshr`` (``shr-u``). The
+mask is what makes a count of the width or more defined: LLVM calls that shift
+poison, so leaving it in would let ``-O0`` and ``-O2`` disagree.
+
+``(cast T e)`` lowers to the one instruction the two widths call for —
+``trunc``/``sext``/``zext`` between integers, ``sitofp``/``uitofp``,
+``fpext``/``fptrunc``, or ``fptosi``/``fptoui`` after a range test. The test
+comes first because an out-of-range ``fptosi`` is undefined: a float outside the
+target's range, or a NaN, panics ``R0003`` with the cast's own node path.
+
 Strings
 -------
 A string literal becomes one private global holding exactly its bytes, shared
@@ -301,6 +321,7 @@ from logos.check import (
 from logos.diag import (
     ARRAY_BOUNDS,
     DIVISION_BY_ZERO,
+    FLOAT_RANGE,
     INDEX_TYPE,
     LITERAL_RANGE,
     MATCH_NO_ARM,
@@ -383,6 +404,22 @@ _COMPARE = {"=": "eq", "!=": "ne", "<": "slt", "<=": "sle", ">": "sgt", ">=": "s
 #: shift by the width or more poison, and the hardware's silence would be a
 #: wrong answer with no diagnostic.
 _SHIFT = {"shl": "shl", "shr": "ashr", "shr-u": "lshr"}
+
+#: Every integer width's range, as the floats a range check compares against.
+#: The low end is inclusive and the high end is exclusive: ``hi + 1`` is a power
+#: of two, the one bound a float holds exactly, while ``hi`` itself (``2**63-1``)
+#: rounds up to ``2**63`` in a double and would let that value through to an
+#: ``fptosi``, whose result is undefined outside the range.
+_INT_RANGE_F = {
+    "i8": (-128.0, 128.0),
+    "i16": (-32768.0, 32768.0),
+    "i32": (-2147483648.0, 2147483648.0),
+    "i64": (-(2.0**63), 2.0**63),
+    "u8": (0.0, 256.0),
+    "u16": (0.0, 65536.0),
+    "u32": (0.0, 4294967296.0),
+    "u64": (0.0, 2.0**64),
+}
 
 #: The two operations that can trap.
 _DIVIDE = ("/", "%")
@@ -2568,6 +2605,8 @@ class _Fn:
             return self.compare(item)
         if kind in _SHIFT:
             return self.shift(item)
+        if kind == "cast":
+            return self.cast_value(item)
         if kind in _LOGICAL:
             return self.logical(item)
         if kind == "not":
@@ -2900,6 +2939,80 @@ class _Fn:
         self.emit(("and", masked, ty, count, str(width - 1)))
         dest = self.temp()
         self.emit((_SHIFT[node.kind], dest, ty, value, masked))
+        return dest
+
+    def cast_value(self, node: Node) -> str:
+        """``(cast T e)``: one instruction, or a range check then one.
+
+        Which instruction is decided by the two widths the checker recorded:
+
+        * integer to integer — ``trunc`` to a narrower width (the high bits go),
+          ``sext``/``zext`` to a wider one (the *source* decides whether the sign
+          is carried), and nothing at all between two spellings of one width,
+          since the bits are already the answer;
+        * integer to float — ``sitofp`` or ``uitofp``, rounded to nearest;
+        * float to float — ``fpext`` to ``:f64``, ``fptrunc`` to ``:f32``;
+        * float to integer — a range test first, then ``fptosi``/``fptoui``.
+
+        The test is not politeness: ``fptosi`` outside its range is undefined,
+        so a value that does not fit panics ``R0003`` with the cast's own node
+        path. A NaN fails both ends of the test (every ordered comparison is
+        false against it) and takes the same path, which is the only answer that
+        does not invent an integer.
+        """
+        target = self.type_of(node)
+        operand = node.items[-1]
+        source = self.type_of_item(operand, node.path)
+        value = self.value(operand, node.path)
+        if not isinstance(target, Prim):
+            raise diag(UNKNOWN_NODE, node.path, f"cannot cast {source} to {target}")
+        if not isinstance(source, Prim):
+            raise diag(UNKNOWN_NODE, node.path, f"cannot cast {source} to {target}")
+        source_float = source.name in _FLOATS
+        target_float = target.name in _FLOATS
+        if source_float and target_float:
+            op = "fptrunc" if target.name == "f32" else "fpext"
+            dest = self.temp()
+            self.emit((op, dest, source, target, value))
+            return dest
+        if source_float:
+            return self.float_to_int(node, source, target, value)
+        if target_float:
+            op = "sitofp" if not source.name.startswith("u") else "uitofp"
+            dest = self.temp()
+            self.emit((op, dest, source, target, value))
+            return dest
+        if _SIZES[target.name] == _SIZES[source.name]:
+            # One width, two sign conventions: the bits already mean the value
+            # the target names, so no instruction is needed.
+            return value
+        if _SIZES[target.name] < _SIZES[source.name]:
+            op = "trunc"
+        else:
+            op = "zext" if source.name.startswith("u") else "sext"
+        dest = self.temp()
+        self.emit((op, dest, source, target, value))
+        return dest
+
+    def float_to_int(self, node: Node, source: Prim, target: Prim, value: str) -> str:
+        """``(cast :iN f)``: branch to ``R0003`` unless ``f`` is in range."""
+        low, high = _INT_RANGE_F[target.name]
+        self.labels += 1
+        tag = f"cast{self.labels}"
+        bad, ok = f"{tag}.bad", f"{tag}.ok"
+        above = self.temp()
+        below = self.temp()
+        self.emit(("fcmp", above, "oge", source, value, _float_operand(low, source)))
+        self.emit(("fcmp", below, "olt", source, value, _float_operand(high, source)))
+        fits = self.temp()
+        self.emit(("and", fits, Prim("bool"), above, below))
+        self.block.term = ("cbr", fits, ok, bad)
+        self.new_block(bad)
+        self.panic(node.path, FLOAT_RANGE, f"float out of range for {target}")
+        self.new_block(ok)
+        op = "fptoui" if target.name.startswith("u") else "fptosi"
+        dest = self.temp()
+        self.emit((op, dest, source, target, value))
         return dest
 
     def logical(self, node: Node) -> str:
@@ -3795,3 +3908,14 @@ def _single(value: float) -> float:
 def _hex_float(value: float) -> str:
     """``value`` as LLVM's hexadecimal double literal, ``0x3FF19999A0000000``."""
     return "0x{:016X}".format(struct.unpack("<Q", struct.pack("<d", value))[0])
+
+
+def _float_operand(value: float, ty: Prim) -> str:
+    """Spell a compiler-made float constant exactly at ``ty``'s width.
+
+    The range bounds a cast compares against are powers of two, so each is
+    exactly a ``:f32`` and exactly a ``:f64``; the hexadecimal form names that
+    number without going through a decimal that a ``float`` operand might not
+    hold precisely.
+    """
+    return _hex_float(_single(value) if ty.name == "f32" else value)

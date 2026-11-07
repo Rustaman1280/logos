@@ -31,8 +31,10 @@ quote it.
   slice — for an allocation count or a string length whose byte size would
   overflow, and for an allocation the allocator could not satisfy: all are
   runtime checks that cannot be proven at compile time, and all panic with the
-  node path of the operation. It is reserved for checks of that kind (channel
-  state and the rest).
+  node path of the operation. It is also the code a ``(cast :iN f)`` emits when
+  the float is outside the target's range (``float out of range for :iN``), or
+  is a NaN: ``fptosi`` has no defined result there. It is reserved for checks of
+  that kind (channel state and the rest).
 * ``R0004`` free of a pointer that was never allocated — raised by the same
   tracker when ``rt_free`` is handed an address this process never allocated.
   The location is ``<runtime>``: no ``alloc`` node made the block, so there is
@@ -164,6 +166,13 @@ MATCH_NO_ARM = "R0003"
 #: The runtime check an array index outside ``0..n`` reaches. The same code as
 #: an unmatched ``match``: both are bounds that only the running program knows.
 ARRAY_BOUNDS = "R0003"
+
+#: The runtime check a ``(cast :iN f)`` makes before ``fptosi``/``fptoui``.
+#: A float outside the target's range has no integer value, and the LLVM
+#: conversion is undefined rather than saturating, so the program panics with
+#: ``float out of range for T`` instead of producing one. A NaN takes the same
+#: path: neither end of the range test holds for it.
+FLOAT_RANGE = "R0003"
 
 #: The runtime code for ``free`` of an address no ``alloc`` produced. Like
 #: ``R0002`` it is a runtime name only; the compiler never emits it, and the
