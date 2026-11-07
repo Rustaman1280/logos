@@ -1,9 +1,12 @@
 (mod libc-interposition)
 
-(fn write :i64 ()
+(fn write :i64 ((fd :i64) (buf (ptr :u8)) (len :i64))
   (ret 0))
 
 (test a-user-write-does-not-take-over-printing
   (expect (out "still here\n"))
-  (let _ (write))
+  (let b (alloc :u8 1))
+  (set-deref b 0)
+  (let _ (write 1 (ptr b) 1))
+  (free b)
   (println "still here"))

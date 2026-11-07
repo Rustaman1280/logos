@@ -168,6 +168,30 @@ class AllocCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0002")
         self.assertIn("allocation of record is not supported", error.message)
 
+    def test_alloc_of_an_enum_is_refused(self):
+        # An enum's tag is an invariant that its payloads do not describe:
+        # the block's tag bits would be garbage, and a branch no variant
+        # covers has no defined answer.
+        error = fail_on(
+            "(mod m)(type flag (enum (on) (off)))"
+            "(fn f :void () (let p (alloc flag 1)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "allocation of flag is not supported: it has invariants"
+        )
+
+    def test_alloc_of_a_struct_carrying_an_enum_is_refused(self):
+        # The invariant is reached through the field, the same way a :str in
+        # a struct is: an aggregate of invariants is not invariant-free.
+        error = fail_on(
+            "(mod m)(type flag (enum (on) (off)))"
+            "(type holder (struct (state flag) (n :i64)))"
+            "(fn f :void () (let p (alloc holder 1)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertIn("allocation of holder is not supported", error.message)
+
     def test_alloc_takes_a_type_and_a_count(self):
         error = fail_on("(mod m)(fn f :void () (let p (alloc :i64)))")
         self.assertEqual(error.code, "E0102")

@@ -126,6 +126,8 @@
 
 (type inner (enum (a :i64) (b)))
 
+(type pair (struct (a :i64) (b :i64)))
+
 (type nested (enum (wrap inner) (plain)))
 
 (test enum-payload-of-an-enum
@@ -149,14 +151,10 @@
     (b (println 0)))
   (vec-free v))
 
-(test alloc-of-an-enum
-  (expect (out "7\n")
-    (code 0)
+(test alloc-of-a-struct-of-scalars
+  (expect (code 0)
     (leaks 0))
-  (letmut p (alloc inner 3))
-  (set-deref p (a 7))
-  (match (deref p) ((a n) (println n))
-    (b (println 0)))
+  (let p (alloc pair 3))
   (free p))
 
 (fn add-two :

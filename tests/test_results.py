@@ -933,7 +933,7 @@ class ResultsExecTest(unittest.TestCase):
         "wildcard-covers-an-enum": "7\n",
         "enum-payload-of-an-enum": "5\n",
         "enum-in-a-vector": "2\n1\n",
-        "alloc-of-an-enum": "7\n",
+        "alloc-of-a-struct-of-scalars": "",
         "try-inside-one-expression": "14\n",
         "try-inside-a-loop": "21\n",
         "owner-in-an-optional": "5\n",

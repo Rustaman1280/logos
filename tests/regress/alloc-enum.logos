@@ -1,0 +1,8 @@
+(mod alloc-enum)
+
+(type flag (enum (on) (off)))
+
+(fn f :i64 ()
+  (let p (alloc flag 2))
+  (free p)
+  (ret 0))

@@ -1,0 +1,9 @@
+(mod alloc-enum-in-struct)
+
+(type flag (enum (on) (off)))
+(type holder (struct (state flag) (n :i64)))
+
+(fn f :i64 ()
+  (let p (alloc holder 1))
+  (free p)
+  (ret 0))

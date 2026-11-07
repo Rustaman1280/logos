@@ -46,11 +46,11 @@ Memory and ownership
 ``(alloc T n)`` has type ``(own T)``: a block of n elements the program must
 release with ``(free p)``. Only a type whose every bit pattern is already a
 value may be allocated, because the block is not initialised: a scalar, a
-``:bool``, a struct or enum of those, or an array of those. A ``(vec T)``, a
-``(res ...)``, an ``(opt ...)``, a ``(fn ...)``, a ``:str`` and any type that
-holds an owner are **E0002**, ``allocation of T is not supported: it has
-invariants``: reading one of those uninitialised is a branch on a garbage tag
-or a call through a garbage pointer. ``(ptr p)`` gives the same address as a raw
+``:bool``, a struct of those, or an array of those. A ``(vec T)``, a
+``(res ...)``, an enum, a ``(fn ...)``, a ``:str`` and any type that holds an
+owner are **E0002**, ``allocation of T is not supported: it has invariants``:
+reading one of those uninitialised is a branch on a garbage tag or a call
+through a garbage pointer. ``(ptr p)`` gives the same address as a raw
 ``(ptr T)``, which may be walked with ``(ptr-add p i)`` and read or written
 with ``(deref p)``/``(set-deref p v)``; only the owner may free, so a raw
 pointer is E0301 there.
@@ -2313,20 +2313,26 @@ class _Checker:
             raise diag(
                 WRONG_ARITY, node.path, "while takes a condition and an optional body"
             )
-        condition = self._value(args[0], env, Prim("bool"), node.path)
-        if not compatible(condition, Prim("bool")):
-            raise diag(
-                TYPE_MISMATCH,
-                _at(args[0], node),
-                f"condition must be :bool, found {condition}",
-            )
+        # The condition runs before every iteration, so it is part of the
+        # loop: a move or release in it happens on each pass and is E0303 for
+        # a binding declared outside, exactly like one in the body. The depth
+        # is raised before the condition is typed and held until the body
+        # ends, which also covers a match or an if used as the condition.
+        env.loop += 1
+        try:
+            condition = self._value(args[0], env, Prim("bool"), node.path)
+            if not compatible(condition, Prim("bool")):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(args[0], node),
+                    f"condition must be :bool, found {condition}",
+                )
 
-        def body() -> Ty:
-            # The body is inside a loop, so ``break`` and ``continue`` are
-            # legal here and return to zero as soon as the body ends: the depth
-            # is a property of the enclosing form, not of the function.
-            env.loop += 1
-            try:
+            def body() -> Ty:
+                # The body is inside the loop, so ``break`` and ``continue``
+                # are legal here and return to zero as soon as the body ends:
+                # the depth is a property of the enclosing form, not of the
+                # function.
                 with env.block():
                     for statement in args[1:]:
                         if not isinstance(statement, Node):
@@ -2334,16 +2340,16 @@ class _Checker:
                                 UNKNOWN_NODE, node.path, "a statement must be a form"
                             )
                         self._statement(statement, env)
-            finally:
-                env.loop -= 1
-            return Prim("void")
+                return Prim("void")
 
-        # One "branch": the body runs zero or more times, and a value it freed
-        # may have been released on the iteration that ran, so after the loop a
-        # binding moved in the body counts as moved (the second iteration's
-        # free is then the runtime's R0002 to catch, since the loop is checked
-        # once).
-        self._branches(env, [body])
+            # One "branch": the body runs zero or more times, and a value it
+            # freed may have been released on the iteration that ran, so after
+            # the loop a binding moved in the body counts as moved (the second
+            # iteration's free is then the runtime's R0002 to catch, since the
+            # loop is checked once).
+            self._branches(env, [body])
+        finally:
+            env.loop -= 1
         return Prim("void")
 
     def _loop_jump(self, node: Node, env: _Env) -> Ty:
@@ -3101,14 +3107,14 @@ class _Checker:
         elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
         if _is_void(elem):
             raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
-        if not _invariant_free(elem, self._structs, self._enums):
+        if not _invariant_free(elem, self._structs):
             # ``alloc`` hands out an uninitialised block. That is a value only
             # for a type whose every bit pattern is one: a scalar, a bool, an
-            # aggregate of those. A vector descriptor, a result or optional tag,
-            # a function value or a :str would be read as a live value while
-            # still holding whatever the allocator left there — a branch on a
-            # garbage tag, a call through a garbage pointer, a length that
-            # walks off the buffer.
+            # aggregate of those. An enum's tag, a vector descriptor, a result
+            # or optional tag, a function value or a :str would be read as a
+            # live value while still holding whatever the allocator left
+            # there — a branch on a garbage tag, a call through a garbage
+            # pointer, a length that walks off the buffer.
             raise diag(
                 UNKNOWN_NODE,
                 node.path,
@@ -4976,38 +4982,35 @@ def _channel_element(elem: Ty, path: str) -> Ty:
 def _invariant_free(
     ty: Ty,
     structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
-    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
     seen: frozenset[str] = frozenset(),
 ) -> bool:
     """Whether every bit pattern of ``ty`` is already a value of ``ty``.
 
     Only such a type may be allocated uninitialised. A scalar takes any bits;
-    a struct or enum takes any bits when every field or payload does; an array
-    when its element does. Everything else has an invariant a reader would
-    rely on — a vector's descriptor, a result's tag, a function value's code
+    a struct takes any bits when every field does; an array when its element
+    does. Everything else has an invariant a reader would rely on — an enum's
+    tag, a vector's descriptor, a result's tag, a function value's code
     pointer, a ``:str``'s length, an owner that must be released — so an
     uninitialised block of it is not a value, and ``alloc`` refuses it.
     """
     if isinstance(ty, Prim):
         return ty.name in NUMBERS or ty.name == "bool"
     if isinstance(ty, Arr):
-        return _invariant_free(ty.elem, structs, enums, seen)
+        return _invariant_free(ty.elem, structs, seen)
     if isinstance(ty, StructRef):
         if structs is None or ty.name in seen:
             return False
         inner = seen | {ty.name}
         return all(
-            _invariant_free(field, structs, enums, inner)
+            _invariant_free(field, structs, inner)
             for _name, field in structs.get(ty.name, ())
         )
     if isinstance(ty, EnumRef):
-        if enums is None or ty.name in seen:
-            return False
-        inner = seen | {ty.name}
-        return all(
-            payload is None or _invariant_free(payload, structs, enums, inner)
-            for _variant, payload in enums.get(ty.name, ())
-        )
+        # An enum has an invariant whatever its payloads are: the tag picks
+        # the variant, and a garbage tag is a branch no variant covers. An
+        # uninitialised block of it cannot be a value, so it is refused even
+        # when every payload's bits would be.
+        return False
     return False
 
 

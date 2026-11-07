@@ -962,6 +962,19 @@ class FormattingLoweringTest(unittest.TestCase):
         # ``!=`` is the exact negation of ``=``: une is true on a NaN.
         self.assertIn("fcmp une double", text)
 
+    def test_a_comparison_of_two_float_literals_is_a_float_compare(self):
+        # A literal has no width of its own: the ``.`` or the exponent is
+        # what says ``:f64``, so an all-literal comparison must not fall back
+        # to the integer default and reach clang as ``icmp ... 1.5``.
+        text = emitted(
+            "(mod m)(fn f :void () (println (< 1.5 2.0))"
+            ' (println (= 1.5 1.5)) (println (< -1.5 -2.0)))'
+        )
+        self.assertIn("fcmp olt double 1.5, 2.0", text)
+        self.assertIn("fcmp oeq double 1.5, 1.5", text)
+        self.assertIn("fcmp olt double -1.5, -2.0", text)
+        self.assertNotIn("icmp", text)
+
     def test_modulo_on_a_float_is_refused(self):
         error = fail_on("(mod m)(fn f :void ((a :f64)) (println (% a 2.0)))")
         self.assertEqual(error.code, "E0100")

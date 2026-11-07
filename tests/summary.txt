@@ -88,7 +88,7 @@ PASS exec/results/match-produces-a-value -
 PASS exec/results/wildcard-covers-an-enum -
 PASS exec/results/enum-payload-of-an-enum -
 PASS exec/results/enum-in-a-vector -
-PASS exec/results/alloc-of-an-enum -
+PASS exec/results/alloc-of-a-struct-of-scalars -
 PASS exec/results/try-inside-one-expression -
 PASS exec/results/try-inside-a-loop -
 PASS exec/results/owner-in-an-optional -
@@ -168,12 +168,16 @@ PASS thread/chan/shared-pointer-element -
 PASS thread/sum/eight-threads -
 PASS generics/limit -
 PASS generics/unbound -
+PASS regress/alloc-enum-in-struct -
+PASS regress/alloc-enum -
 PASS regress/alloc-fn -
 PASS regress/closure-escape -
 PASS regress/div-zero/division-by-zero-panics -
+PASS regress/float-literal-compare/all-literal-comparisons-are-float -
 PASS regress/generic-vector -
 PASS regress/int-overflow/int-min-divided-by-minus-one-wraps -
 PASS regress/libc-interposition/a-user-write-does-not-take-over-printing -
+PASS regress/loop-condition -
 PASS regress/loop-release -
 PASS regress/owner-place-read -
 PASS regress/recursive-enum -

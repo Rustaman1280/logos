@@ -1,0 +1,12 @@
+(mod loop-condition)
+
+(type flag (enum (on) (off)))
+
+(fn f :i64 ()
+  (let p (alloc :i64 2))
+  (letmut go :bool true)
+  (while (match (if go (on) (off))
+           ((on) (free p) true)
+           ((off) false))
+    (set go false))
+  (ret 0))

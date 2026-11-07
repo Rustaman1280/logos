@@ -2814,22 +2814,29 @@ class _Fn:
 
         A numeric literal has no width of its own — the checker gives it the
         type of the operand beside it — so ``(< 200 a)`` with ``a :u8`` is a
-        ``:u8`` comparison. Only when every operand is a literal is the
-        checker's default, ``:i64``, the answer. A string literal is ``:str``,
-        which is how ``(= "a" "b")`` reaches the byte comparison.
+        ``:u8`` comparison, and the non-literal side wins whenever there is
+        one. When every operand is a literal the answer is the literal's own
+        default: ``:f64`` if any of them is written with a ``.`` or an
+        exponent, ``:i64`` otherwise. A string literal is ``:str``, which is
+        how ``(= "a" "b")`` reaches the byte comparison.
         """
+        float_literal = False
         for item in items:
             if isinstance(item, Node):
                 return self.type_of(item)
             if isinstance(item, Token) and item.kind == STRING:
                 return _STR
+            if isinstance(item, Token) and item.kind == NUMBER:
+                if "." in item.value or "e" in item.value or "E" in item.value:
+                    float_literal = True
+                continue
             if isinstance(item, Token) and item.kind == ATOM:
                 binding = self.vars.get(item.value)
                 if binding is not None:
                     return binding[0]
                 if item.value in ("true", "false"):
                     return Prim("bool")
-        return Prim("i64")
+        return Prim("f64") if float_literal else Prim("i64")
 
     def arith(self, node: Node) -> str:
         """``(op a b ...)``: one instruction per operand pair.
