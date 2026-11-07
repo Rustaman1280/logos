@@ -1,0 +1,6 @@
+(mod float-mix)
+
+(fn f :f64 ()
+  (let x :f64 1.5)
+  (let y :i64 2)
+  (ret (+ x y)))

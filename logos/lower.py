@@ -277,6 +277,8 @@ environment, so both cross the boundary the same way.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
+import struct
 from typing import Iterator
 
 from logos import llvm
@@ -348,6 +350,27 @@ from logos.types import (
 #: Logos arithmetic to LLVM opcode. ``/`` and ``%`` are not here: they are
 #: checked before they are emitted, and their opcode depends on signedness.
 _ARITH = {"+": "add", "-": "sub", "*": "mul"}
+
+#: The float spellings of the same four operations. IEEE arithmetic has no
+#: wrapping and no trap, so every one of them is a single instruction: ``+``,
+#: ``-`` and ``*`` map straight across, and ``/`` is a bare ``fdiv`` — dividing
+#: by zero yields ``inf``/``nan`` under IEEE 754, which is a value, not a panic.
+#: ``%`` is not here at all: the checker refuses it on a float, because there is
+#: no one answer to what it should mean (fmod or IEEE remainder).
+_FLOAT_ARITH = {"+": "fadd", "-": "fsub", "*": "fmul", "/": "fdiv"}
+
+#: Logos comparison to ``fcmp`` predicate. The ordered predicates are false
+#: when either operand is NaN, which is the IEEE 754 meaning of ``<`` and ``<=``;
+#: ``!=`` is ``une``, the exact negation of ``=``, so a NaN is unequal to
+#: everything including itself. Nothing here is fast-math: no flag is added.
+_FLOAT_COMPARE = {
+    "=": "oeq",
+    "!=": "une",
+    "<": "olt",
+    "<=": "ole",
+    ">": "ogt",
+    ">=": "oge",
+}
 
 #: Logos comparison to ``icmp`` predicate. The ordered ones are the signed
 #: spellings; an unsigned operand turns ``slt`` into ``ult`` and so on, because
@@ -724,7 +747,13 @@ class _Lower:
         self.enum_widths: dict[str, int] = {}
         #: The type record shared by everything that is not a copy: the
         #: module's own functions and its tests.
-        self.body = Types(cm.expr_types, cm.call_targets, cm.closures, cm.declared)
+        self.body = Types(
+            cm.expr_types,
+            cm.call_targets,
+            cm.closures,
+            cm.declared,
+            cm.literal_types,
+        )
         #: Every source function this module can call, mapped to its symbol.
         #: Built before any body is lowered, so source order is irrelevant and
         #: a call to a name that is not here is E0103 in the lowerer. A generic
@@ -2631,7 +2660,11 @@ class _Fn:
     def literal(self, token: Token, where: str) -> str:
         if token.kind == NUMBER:
             if "." in token.value or "e" in token.value or "E" in token.value:
-                return _float_text(token.value, where)
+                # The checker recorded the width this literal was checked at;
+                # an ``:f32`` needs single-precision spelling (see below).
+                return _float_text(
+                    token.value, where, self.record.literal_types.get(token)
+                )
             # The checker has proved the value fits the resolved width; the
             # spelling is normalised so ``+5`` and ``007`` are LLVM's ``5`` and
             # ``7``.
@@ -2746,25 +2779,34 @@ class _Fn:
         return Prim("i64")
 
     def arith(self, node: Node) -> str:
+        """``(op a b ...)``: one instruction per operand pair.
+
+        An integer form is LLVM's wrapping arithmetic at the width the checker
+        resolved; ``/`` and ``%`` go through :meth:`divide` because both can
+        trap. A float form is the IEEE instruction at ``:f32`` or ``:f64``: no
+        check, no branch, and no fast-math flag, so dividing by zero gives
+        ``inf`` or ``nan`` rather than a panic, exactly as IEEE 754 says.
+        """
         ty = self.type_of(node)
-        if isinstance(ty, Prim) and ty.name in _FLOATS:
-            # Formatting a float is in scope; arithmetic on one is not. An
-            # ``add`` over a double would be invalid IR, and silence would be
-            # worse than the refusal.
+        is_float = isinstance(ty, Prim) and ty.name in _FLOATS
+        if is_float and node.kind == "%":
+            # Unreachable through the checker, which refuses it: kept so the IR
+            # never carries a ``%`` the backend has no instruction for.
             raise diag(
-                UNKNOWN_NODE,
+                TYPE_MISMATCH,
                 node.path,
-                f"'{node.kind}' on {ty} is not lowered by this backend yet",
+                f"'%' needs integers, found {ty}",
             )
         args = node.items[1:]
         acc = self.value(args[0], node.path)
         for arg in args[1:]:
             right = self.value(arg, node.path)
-            if node.kind in _DIVIDE:
+            if node.kind in _DIVIDE and not is_float:
                 acc = self.divide(node.kind, ty, acc, right, node.path)
             else:
                 dest = self.temp()
-                self.emit((_ARITH[node.kind], dest, ty, acc, right))
+                op = _FLOAT_ARITH[node.kind] if is_float else _ARITH[node.kind]
+                self.emit((op, dest, ty, acc, right))
                 acc = dest
         return acc
 
@@ -2797,13 +2839,25 @@ class _Fn:
                 node.path,
                 f"'{node.kind}' on :str is not lowered by this backend yet",
             )
+        predicate = _COMPARE[node.kind]
+        if isinstance(ty, Prim) and ty.name in _FLOATS:
+            # IEEE comparison: ordered predicates are false on a NaN, and
+            # ``!=`` is ``une`` so a NaN compares unequal to everything. No
+            # fast-math flag is set, so the compiler cannot optimise the NaN
+            # case away.
+            left = self.value(items[1], node.path)
+            right = self.value(items[2], node.path)
+            dest = self.temp()
+            self.emit(
+                ("fcmp", dest, _FLOAT_COMPARE[node.kind], ty, left, right)
+            )
+            return dest
         if not (isinstance(ty, Prim) and ty.name in INTEGERS + ("bool",)):
             raise diag(
                 UNKNOWN_NODE,
                 node.path,
                 f"'{node.kind}' on {ty} is not lowered by this backend yet",
             )
-        predicate = _COMPARE[node.kind]
         if ty.name.startswith("u") and predicate.startswith("s"):
             predicate = "u" + predicate[1:]
         left = self.value(items[1], node.path)
@@ -3656,20 +3710,33 @@ def _path_of(item: Node | Token, where: str) -> str:
     return item.path if isinstance(item, Node) and item.path else where
 
 
-def _float_text(text: str, where: str) -> str:
-    """Spell a float literal the way LLVM reads a ``double`` operand.
+def _float_text(text: str, where: str, widened: Ty | None = None) -> str:
+    """Spell a float literal the way LLVM reads an operand of its width.
 
     LLVM's decimal form needs a digit, a dot and then whatever exponent the
     value has, so ``2.0`` stays ``2.0`` and ``1e300`` becomes ``1.0e+300``.
     Python's ``repr`` is the shortest text that reads back as the same double,
     which is also what the runtime prints, so a literal and the value it
     formats agree.
+
+    One decimal cannot serve both widths. LLVM accepts a decimal constant for a
+    ``float`` only when the value is exactly single precision, so ``0.1`` at
+    ``:f32`` is refused as "floating point constant invalid for type". The
+    checker records the width each literal was checked at, and a value the
+    ``float`` cannot hold exactly is spelled in hexadecimal: the bits of the
+    double that *is* the single-precision value, a form LLVM reads at either
+    width because it names an exact number. The rounding happens here once, at
+    compile time, instead of being left for LLVM to reject.
     """
     value = float(text)
     if value != value or value in (float("inf"), float("-inf")):
         raise diag(
             LITERAL_RANGE, where, f"float literal '{text}' is not a finite :f64"
         )
+    if isinstance(widened, Prim) and widened.name == "f32":
+        single = _single(value)
+        if single != value:
+            return _hex_float(single)
     spelled = repr(value)
     if "e" in spelled or "E" in spelled:
         mantissa, _, exponent = spelled.partition("e")
@@ -3679,3 +3746,16 @@ def _float_text(text: str, where: str) -> str:
     if "." not in spelled:
         return spelled + ".0"
     return spelled
+
+
+def _single(value: float) -> float:
+    """``value`` rounded to ``:f32``, as the double that holds those bits."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return math.inf if value > 0 else -math.inf
+
+
+def _hex_float(value: float) -> str:
+    """``value`` as LLVM's hexadecimal double literal, ``0x3FF19999A0000000``."""
+    return "0x{:016X}".format(struct.unpack("<Q", struct.pack("<d", value))[0])

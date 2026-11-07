@@ -941,14 +941,30 @@ class FormattingLoweringTest(unittest.TestCase):
         self.assertIn("double 1.0e+300", text)
         self.assertNotIn("1e+300", text.replace("1.0e+300", ""))
 
-    def test_float_arithmetic_is_still_refused(self):
-        # Formatting is in scope; float arithmetic is not, and emitting
-        # ``add double`` would be invalid IR rather than a diagnostic.
-        error = fail_on_lower("(mod m)(fn f :void () (println (+ 1.5 2.5)))")
-        self.assertEqual(error.code, "E0002")
-        self.assertEqual(
-            error.message, "'+' on :f64 is not lowered by this backend yet"
+    def test_float_arithmetic_is_a_single_ieee_instruction(self):
+        # ``+`` on a float is one ``fadd``: no check, no branch, and no
+        # fast-math flag, so a zero divisor yields inf rather than a panic.
+        text = emitted(
+            "(mod m)(fn f :void ((a :f64) (b :f64))"
+            " (println (+ a b)) (println (* a b)) (println (/ a b)))"
         )
+        self.assertIn(" = fadd double ", text)
+        self.assertIn(" = fmul double ", text)
+        self.assertIn(" = fdiv double ", text)
+        self.assertNotIn("fast", text)
+
+    def test_float_comparison_is_an_ordered_fcmp(self):
+        text = emitted(
+            "(mod m)(fn f :void ((a :f64) (b :f64))"
+            " (println (if (< a b) 1 0)) (println (if (!= a b) 1 0)))"
+        )
+        self.assertIn("fcmp olt double", text)
+        # ``!=`` is the exact negation of ``=``: une is true on a NaN.
+        self.assertIn("fcmp une double", text)
+
+    def test_modulo_on_a_float_is_refused(self):
+        error = fail_on("(mod m)(fn f :void ((a :f64)) (println (% a 2.0)))")
+        self.assertEqual(error.code, "E0100")
 
 
 class StringsExecTest(unittest.TestCase):

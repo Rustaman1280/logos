@@ -384,6 +384,15 @@ class Types:
     call_targets: dict[str, str] = field(default_factory=dict)
     closures: dict[str, "Closure"] = field(default_factory=dict)
     declared: dict[str, Ty] = field(default_factory=dict)
+    #: The width each numeric literal was checked at, keyed by the token
+    #: itself. A literal has no width in the syntax, and the backend has to
+    #: spell it before it knows what the enclosing form expects — but LLVM
+    #: accepts a decimal float constant only when it is exactly the target
+    #: width's value, so ``0.1`` at ``:f32`` needs the single-precision bits.
+    #: Each copy of a generic body carries its own map, exactly as it carries
+    #: its own ``expr_types``: one source token can be ``:f32`` in one
+    #: instantiation and ``:f64`` in another.
+    literal_types: dict["Token", Ty] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +465,10 @@ class CheckedModule:
     instances: dict[str, Instance] = field(default_factory=dict)
     generic: frozenset[str] = frozenset()
     enums: dict[str, tuple[tuple[str, Ty | None], ...]] = field(default_factory=dict)
+    #: The width each numeric literal was checked at, keyed by the token.
+    #: ``Types`` carries the same map for each monomorphised copy; see there
+    #: for why the backend needs it.
+    literal_types: dict["Token", Ty] = field(default_factory=dict)
 
 
 def mangle_instance(name: str, args: tuple[Ty, ...], where: str = "") -> str:
@@ -1335,6 +1348,7 @@ class _Checker:
         self.call_targets: dict[str, str] = {}
         self.closures: dict[str, Closure] = {}
         self.declared: dict[str, Ty] = {}
+        self.literal_types: dict[Token, Ty] = {}
         self._types: dict[str, Ty] = {}
         self._structs: dict[str, tuple[tuple[str, Ty], ...]] = {}
         self._enums: dict[str, tuple[tuple[str, Ty | None], ...]] = {}
@@ -1347,7 +1361,11 @@ class _Checker:
         #: instantiation's. Swapped around each copy's body, because the same
         #: node path is a different type in each.
         self._record = Types(
-            self.expr_types, self.call_targets, self.closures, self.declared
+            self.expr_types,
+            self.call_targets,
+            self.closures,
+            self.declared,
+            self.literal_types,
         )
         #: The source functions a call may instantiate. Only this module's own
         #: definitions, because a copy's body is emitted from here; a generic
@@ -1392,6 +1410,7 @@ class _Checker:
             dict(self._instances),
             frozenset(self._params),
             dict(visible.enums),
+            literal_types=self.literal_types,
         )
 
     # -- namespaces ------------------------------------------------------
@@ -1742,7 +1761,11 @@ class _Checker:
         self, token: Token, env: _Env, expected: Ty | None, where: str
     ) -> Ty:
         if token.kind == NUMBER:
-            return _number(token, expected, where)
+            ty = _number(token, expected, where)
+            # The backend needs the width to spell a float constant exactly;
+            # see ``Types.literal_types``.
+            self._record.literal_types[token] = ty
+            return ty
         if token.kind == STRING:
             return Prim("str")
         if token.kind == ATOM:
@@ -1836,6 +1859,12 @@ class _Checker:
                     f"'{node.kind}' needs numbers, found {ty}",
                 )
             rest = args[1:]
+        if node.kind == "%" and isinstance(ty, Prim) and ty.name in FLOATS:
+            # There is no modulo on a float: the language would have to choose
+            # between C's fmod and IEEE's remainder, and neither is a wrapping
+            # operation the way integer ``%`` is. Refused here rather than in
+            # the backend, so a form the compiler accepts is one it can emit.
+            raise diag(TYPE_MISMATCH, node.path, f"'%' needs integers, found {ty}")
         for arg in rest:
             operand = self._value(arg, env, ty, node.path)
             if compatible(ty, operand):

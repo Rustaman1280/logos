@@ -85,8 +85,22 @@ _PRIM = {
     "mutex": "i8*",
 }
 
-#: Opcodes that print as ``dest = op ty a, b``.
-_BINARY = ("add", "sub", "mul", "sdiv", "srem", "udiv", "urem", "and")
+#: Opcodes that print as ``dest = op ty a, b``. The float arithmetic the
+#: backend emits is in the same shape; ``fcmp`` shares ``icmp``'s, below.
+_BINARY = (
+    "add",
+    "sub",
+    "mul",
+    "sdiv",
+    "srem",
+    "udiv",
+    "urem",
+    "and",
+    "fadd",
+    "fsub",
+    "fmul",
+    "fdiv",
+)
 
 #: A name LLVM reads unquoted: ``[-a-zA-Z$._][-a-zA-Z$._0-9]*``.
 _UNQUOTED = re.compile(r"[-a-zA-Z$._][-a-zA-Z$._0-9]*\Z")
@@ -386,6 +400,10 @@ class _Text:
             _, dest, pred, ty, left, right = instr
             spelled = type_text(ty)
             return f"{dest} = icmp {pred} {spelled} {left}, {right}"
+        if op == "fcmp":
+            _, dest, pred, ty, left, right = instr
+            spelled = type_text(ty)
+            return f"{dest} = fcmp {pred} {spelled} {left}, {right}"
         if op == "insertvalue":
             _, dest, agg_ty, agg, elem_ty, value, index = instr
             return (
