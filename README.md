@@ -15,41 +15,72 @@ runtime in `runtime/`.
 
 ## Status
 
-Incremental build. Tasks 1-4 provide the scaffold, the command line skeleton,
-lexing, parsing, node paths, canonical printing, diagnostics, name resolution
-and the type checker. Task 5 adds the first backend: IR, the LLVM text emitter
-and the driver, so `build` produces a real ELF. Task 6 adds control flow —
-`if`, `while`, `match`, `break`/`continue` — comparisons and boolean logic, and
-lowers `:str` as the 16-byte `{ i8*, i64 }` value the spec defines, so
-`print`/`println` take any string value and not only a literal. Task 7 adds
-structs with C layout (`make`, `get`, `set-field`) and fixed arrays
-(`make (arr T n)`, `arr-get`, `arr-set`) whose indices are bounds-checked at run
-time. Task 8 adds manual memory: `(alloc T n)` gives an `(own T)`, `free`
-releases it, `(ptr p)` takes a raw view, `deref`/`set-deref`/`ptr-add` read and
-walk it; an owning pointer moves, so a moved binding cannot be used again, and
-a debug build reports every block still live when `main` returns. Task 9 adds
-strings (`str-len`, `str-concat`, `str-eq`, `str-slice`, and `=` on `:str` as
-byte equality) and growable vectors (`(vec T)` with `make`, `vec-push`,
-`vec-len`, `vec-get`, `vec-set`, `vec-free`), and gives `print`/`println` a
-formatter for every scalar it prints: `:i64`, `:u64`, `:f64`, `:bool` and
-`:str`. A narrower integer still needs a cast, because nothing in the language
-converts implicitly. Task 11 adds results and optionals: `(res T E)` with
-`(ok v)`/`(err e)`, `(opt T)` with `(some v)`/`(none)`, `(try e)` to propagate
-an error the caller declares, error types as declared enums with payloads
-(`(type parse-error (enum (bad-digit :u64) (overflow)))`), and exhaustive
-`match` over an enum, a result or an optional. A missing variant is E0600, a
-`try` whose error types differ is E0601, and a result nobody handles is E0602.
-Task 10 adds monomorphised generics and closures that capture by value. Task 12
-adds threads and the synchronization that goes with them: `(spawn f args...)`,
-`(join t)`, `(mutex)`/`lock`/`unlock`, `(chan T n)`/`send`/`recv`, and
-`(atomic T v)`/`atomic-add`/`atomic-load`/`atomic-store`, over pthreads. Shared
-mutable state is marked `(shared ...)`, and handing a thread an unmarked pointer
-or handle — or making one a channel element — is E0700. A pthread failure is R0005.
-Everything else reports a diagnostic at the construct. Task 14 closes the
-surface: `(read-all)` returns every byte of standard input as a `:str`, so a
-program can be a filter as well as a printer, and the repository ships the
-proof: three real programs under `examples/`, a differential oracle under
-`tests/diff/` whose C twins are built with gcc, and `tools/accept.sh`.
+Logos v1 is complete for one target: x86_64 Linux. The language, the compiler
+and the test harness are built, reviewed, and green.
+
+Verified by execution on this machine:
+
+- `python3 -m logos test` runs 184 cases across eight categories at `-O0` and
+  `-O2` and compares the two optimisation levels with each other, not only with
+  the expected output. 0 failures, 10 deliberate leaks, 0 baseline regressions.
+- `bash tools/accept.sh` runs seven sections and all pass: the harness, a
+  differential oracle against gcc, three example programs whose output matches
+  `wc`, `jq` and a C reference byte for byte, formatter idempotency over 41
+  files, and a compile-speed floor.
+- 851 unit tests pass. `tools/verify_install.sh` installs the package into a
+  throwaway prefix and builds a program from outside the repository.
+
+The language has: integers, floats, booleans and strings; structs with C
+layout; fixed arrays and growable vectors; enums with payloads; results and
+optionals with `try`; generics by monomorphisation; closures confined to their
+frame; manual memory with move checking and a leak tracker; threads, mutexes,
+channels and atomics over pthreads; `extern` declarations for the C ABI; and
+node-addressed tooling (`show`, `patch`, `fmt`) that treats one subtree as one
+editable unit.
+
+### What it refuses, on purpose
+
+These are not gaps. Each one exists because the alternative was a program that
+reads freed memory, uses an uninitialised value, or behaves differently at
+`-O2` than at `-O0`:
+
+- a vector, an owner, or any type containing one is never copied; binding it
+  moves it, and a second use is E0300 or E0402;
+- a value cannot be read out of a place (a vector element, an array element, a
+  struct field, a dereference) when its type owns memory;
+- an owner may not be stored in a struct, an array, an enum payload or another
+  owner, so aggregate copies can never duplicate one;
+- a binding declared outside a loop may not be moved or freed inside it,
+  condition included;
+- a capturing closure may not cross a call boundary; its environment lives in
+  the creating frame;
+- `alloc` refuses any type with an invariant (a vector, a result, an optional,
+  a function value, a string, an enum tag), so nothing uninitialised is ever
+  read as a typed value;
+- a result that is never handled is an error, and `try` requires the exact
+  error type;
+- shared state must be marked `(shared T)` before it can reach another thread,
+  and the marker is checked through aggregates;
+- a form the checker accepts but the backend cannot emit is a bug; the backend
+  never fails silently at run time.
+
+### Known limits
+
+- One target: x86_64 Linux. The target triple is a flag, but arm64 and Darwin
+  have not been built or tested.
+- Release builds do not quarantine freed blocks, so `R0002` in a release build
+  is defence in depth. A stale double free cannot be constructed from Logos
+  source, because the ownership rules above refuse it.
+- Imports resolve at check time but only own-module functions are lowered, so a
+  cross-module call is refused until linking exists. Test-local helper
+  functions are refused for the same reason.
+- A `:str` owns nothing: concatenation allocates a buffer that lives until the
+  process exits, and it does not appear in the leak report.
+- A mutex held by a thread that exited stays locked; an unjoined thread's
+  allocations may or may not appear in the leak report.
+- `examples/wc.logos` matches GNU `wc` through a pipe, which pads to seven
+  columns; a regular-file redirect uses a different width.
+
 
 ## Requirements
 
