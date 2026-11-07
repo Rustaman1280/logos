@@ -142,6 +142,24 @@ class CliShowPatchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue(), "(+ a 1)\n")
 
+    def test_show_prints_the_token_at_a_leaf_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["show", str(path), "m/f/2/0/1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "1\n")
+
+    def test_patch_replaces_a_token_and_reformats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            with patch("sys.stdin", io.StringIO("41\n")):
+                code = main(["patch", str(path), "m/f/2/0/1"])
+            self.assertEqual(code, 0)
+            expected = self.NESTED.replace("(+ a 1)", "(+ a 41)")
+            self.assertEqual(path.read_text(encoding="utf-8"), expected)
+
     def test_show_on_a_bad_path_exits_one_and_names_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._file(tmp)

@@ -103,11 +103,12 @@ def _is_form(item: Node | Token) -> bool:
 
 def _render_item(item: Node | Token, column: int) -> str:
     if isinstance(item, Token):
-        return _render_token(item)
+        return render_token(item)
     return _render_form(item, column)
 
 
-def _render_token(token: Token) -> str:
+def render_token(token: Token) -> str:
+    """Return the canonical spelling of one token, quotes for a string."""
     if token.kind != STRING:
         return token.value
     body = "".join(_ESCAPES_OUT.get(ch, ch) for ch in token.value)

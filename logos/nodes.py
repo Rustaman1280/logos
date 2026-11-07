@@ -86,17 +86,43 @@ class Node:
                 yield from item.walk()
 
 
-def find(root: Node, path: str) -> Node | None:
-    """The node at ``path``, or ``None``.
+def find(root: Node, path: str) -> "Node | Token | None":
+    """The node or token at ``path``, or ``None``.
 
-    The empty path is the file itself. Every other path is compared against
-    the ones :func:`assign_paths` set, so the two cannot drift.
+    The empty path is the file itself. Tokens hold a position but not a path,
+    so the walk mirrors :func:`assign_paths` position for position, using the
+    same numbering rules.
     """
     if path == "":
         return root
-    for node in root.walk():
-        if node.path == path:
-            return node
+    module = _module(root)
+    prefix = (module.name or "") if module is not None else ""
+    slot = 0
+    for item in root.items:
+        if not isinstance(item, Node):
+            continue
+        if item is module:
+            child = prefix
+        else:
+            child = _join(prefix, _segment(item) or str(slot))
+            slot += 1
+        if path == child:
+            return item
+        if path.startswith(child + "/"):
+            found = _find_below(item, path)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_below(node: Node, path: str) -> "Node | Token | None":
+    """Find ``path`` among ``node``'s numbered children, recursively."""
+    for index, item in enumerate(_children(node)):
+        child = _join(node.path, str(index))
+        if path == child:
+            return item
+        if path.startswith(child + "/") and isinstance(item, Node):
+            return _find_below(item, path)
     return None
 
 
@@ -135,15 +161,18 @@ def _segment(node: Node) -> str | None:
     return name
 
 
+def _children(node: Node) -> tuple[Union[Node, Token], ...]:
+    """The children ``_assign`` numbers: everything after the head and name."""
+    if node.kind == "":
+        return node.items
+    if node.name is not None:
+        return node.items[2:]
+    return node.items[1:]
+
+
 def _assign(node: Node) -> None:
     """Number the children of ``node`` and recurse."""
-    if node.kind == "":
-        children = node.items
-    elif node.name is not None:
-        children = node.items[2:]
-    else:
-        children = node.items[1:]
-    for index, item in enumerate(children):
+    for index, item in enumerate(_children(node)):
         if not isinstance(item, Node):
             continue
         item.path = _join(node.path, str(index))

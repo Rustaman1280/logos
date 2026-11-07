@@ -16,7 +16,8 @@ from pathlib import Path
 
 from logos import __version__, driver, tester
 from logos.diag import LogosError
-from logos.fmt import render
+from logos.fmt import render, render_token
+from logos.lexer import LPAREN, RPAREN, Token, tokenize
 from logos.nodes import Node, assign_paths, find
 from logos.parser import parse
 
@@ -349,7 +350,7 @@ def _load(source: str) -> "tuple[Node | None, int]":
 
 
 def _show(source: str, path: str) -> int:
-    """Print the canonical form of the one node at ``path``."""
+    """Print the canonical form of the one node (or token) at ``path``."""
     root, status = _load(source)
     if root is None:
         return status
@@ -360,17 +361,30 @@ def _show(source: str, path: str) -> int:
             file=sys.stderr,
         )
         return 1
-    sys.stdout.write(render(target))
+    if isinstance(target, Token):
+        sys.stdout.write(render_token(target) + "\n")
+    else:
+        sys.stdout.write(render(target))
     return 0
 
 
-def _patch(source: str, path: str) -> int:
-    """Replace the node at ``path`` with the one form read from stdin.
+def _parent_of(root: Node, item: "Node | Token") -> Node | None:
+    """The node whose ``items`` hold ``item``, by identity."""
+    for node in root.walk():
+        if any(child is item for child in node.items):
+            return node
+    return None
 
-    The file is parsed and the path is checked before stdin is read, so a bad
-    path is reported without waiting on input. The replacement keeps its new
-    shape and then every path in the file is assigned again from scratch, so a
-    later ``show`` or ``patch`` addresses the result by its new positions.
+
+def _patch(source: str, path: str) -> int:
+    """Replace the node (or token) at ``path`` with stdin's one item.
+
+    A node takes one form, parsed as usual; a token takes one token, because a
+    bare atom is not a form. The file is parsed and the path is checked before
+    stdin is read, so a bad path is reported without waiting on input. The
+    replacement keeps its new shape and then every path in the file is
+    assigned again from scratch, so a later ``show`` or ``patch`` addresses the
+    result by its new positions.
     """
     root, status = _load(source)
     if root is None:
@@ -382,23 +396,47 @@ def _patch(source: str, path: str) -> int:
             file=sys.stderr,
         )
         return 1
-    try:
-        replacement = parse(sys.stdin.read(), "<stdin>")
-    except LogosError as error:
-        print(error.render(), file=sys.stderr)
-        return 1
-    forms = [item for item in replacement.items if isinstance(item, Node)]
-    if len(replacement.items) != 1 or len(forms) != 1:
-        print(
-            "logos: patch: stdin must hold exactly one form",
-            file=sys.stderr,
+    if isinstance(target, Token):
+        try:
+            tokens = tokenize(sys.stdin.read(), "<stdin>")
+        except LogosError as error:
+            print(error.render(), file=sys.stderr)
+            return 1
+        if len(tokens) != 1 or tokens[0].kind in (LPAREN, RPAREN):
+            print(
+                "logos: patch: stdin must hold exactly one form or one token",
+                file=sys.stderr,
+            )
+            return 1
+        parent = _parent_of(root, target)
+        if parent is None:
+            print(
+                f"logos: patch: no node at path '{path}' in {source}",
+                file=sys.stderr,
+            )
+            return 1
+        new_token = tokens[0]
+        parent.items = tuple(
+            new_token if item is target else item for item in parent.items
         )
-        return 1
-    new = forms[0]
-    target.kind = new.kind
-    target.items = new.items
-    target.line = new.line
-    target.col = new.col
+    else:
+        try:
+            replacement = parse(sys.stdin.read(), "<stdin>")
+        except LogosError as error:
+            print(error.render(), file=sys.stderr)
+            return 1
+        forms = [item for item in replacement.items if isinstance(item, Node)]
+        if len(replacement.items) != 1 or len(forms) != 1:
+            print(
+                "logos: patch: stdin must hold exactly one form",
+                file=sys.stderr,
+            )
+            return 1
+        new = forms[0]
+        target.kind = new.kind
+        target.items = new.items
+        target.line = new.line
+        target.col = new.col
     assign_paths(root)
     try:
         Path(source).write_text(render(root), encoding="utf-8")
