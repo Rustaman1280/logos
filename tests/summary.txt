@@ -1,3 +1,4 @@
+LEAKS 10
 PASS parse/fixture/add-wraps -
 PASS parse/unknown-node -
 PASS type/arity -

@@ -36,11 +36,16 @@ alone.
 
 Baseline
 --------
-:func:`write_baseline` writes ``<suite root>/summary.txt``: one line per case,
-``<status> <category>/<case> <detail>``, with statuses ``PASS`` and ``FAIL``.
-:func:`compare_baseline` reports a case that passed before and fails now, a
-case in the baseline that the run no longer contains, and a new case with no
-baseline result. The suite root keeps its own baseline, so the repository's is
+:func:`write_baseline` writes ``<suite root>/summary.txt``: one ``LEAKS N``
+line with the suite's total leak count, then one line per case,
+``<status> <encoded category>/<case> <detail>``, with statuses ``PASS`` and
+``FAIL``. Case ids are percent-encoded so a path containing a space cannot
+split a line. A full run replaces the baseline; a filtered run merges into it,
+keeping every line it did not run. :func:`compare_baseline` reports a case that
+passed before and fails now, a case in the baseline that a full run no longer
+contains (even when its whole category directory went away), a new case with
+no baseline result, and a full run whose total leak count exceeds the
+recorded one. The suite root keeps its own baseline, so the repository's is
 ``tests/summary.txt``.
 """
 
@@ -50,6 +55,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from logos import driver
 from logos.check import check_module
@@ -61,6 +67,9 @@ from logos.parser import parse
 #: The categories, in the order the suite runs them. The order is fixed so a
 #: run is byte-for-byte reproducible; the files inside a category are sorted.
 CATEGORIES = ("parse", "type", "exec", "mem", "thread", "generics", "regress", "diff")
+
+#: The prefix of the baseline line that records the whole suite's leak total.
+LEAKS = "LEAKS "
 
 #: The levels every case runs at unless the caller asks for a subset. The
 #: specification requires the whole corpus at both, so both is the default.
@@ -81,7 +90,15 @@ INTEGER = re.compile(r"^[+-]?[0-9]+$")
 
 
 class SuiteError(Exception):
-    """The suite itself could not be read: for example, the path is missing."""
+    """The suite itself could not be read: for example, the path is missing.
+
+    A broken input the caller asked to run is a failing run, not a usage
+    error, so this exits 1 and names the path it could not read.
+    """
+
+
+class UsageError(ValueError):
+    """The command line asked for something the suite cannot do (exit 2)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +125,15 @@ class Summary:
     leaks: int = 0
     cases: list[CaseResult] = field(default_factory=list)
     categories: tuple[str, ...] = ()
+    #: True when the run covered a whole suite (no ``--only``, a directory
+    #: root that is not itself one category). A full run is what the baseline
+    #: records, so it is also what may report a deleted category missing and
+    #: gate on the leak total.
+    full: bool = False
+    #: ``.logos`` files under the root that no known category claimed. A typo
+    #: in a category directory name must not hide a whole file, so each is
+    #: reported and any makes the run fail.
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -145,39 +171,52 @@ def run_suite(
     prove a hang fails without waiting ten seconds.
     """
     if only is not None and only not in CATEGORIES:
-        raise ValueError(f"unknown test category '{only}'")
+        raise UsageError(f"unknown test category '{only}'")
     levels = list(opts) if opts else list(OPTS)
     summary = Summary()
-    files = _discover(Path(root), only)
+    root_path = Path(root)
+    files, skipped = _discover(root_path, only)
     summary.categories = tuple(sorted({_category(path) for path in files}))
+    summary.skipped = skipped
+    summary.full = (
+        only is None
+        and root_path.is_dir()
+        and root_path.name not in CATEGORIES
+    )
     for path in files:
         _run_file(path, levels, summary, timeout)
     return summary
 
 
-def _discover(root: Path, only: str | None) -> list[Path]:
-    """Every ``.logos`` file in scope, in a deterministic order.
+def _discover(root: Path, only: str | None) -> tuple[list[Path], list[str]]:
+    """Every ``.logos`` file in scope, plus the ones no category claims.
 
     A ``tests``-style root is walked category by category so its files run in
-    the documented order. Any other directory is walked whole and sorted; the
-    category of each file still comes from its path, so a nested layout keeps
-    working.
+    the documented order. A file under such a root that sits outside every
+    known category is returned as skipped: it is not silently dropped, because
+    a misspelt directory name would otherwise hide a whole fixture. Any other
+    directory is walked whole and sorted; the category of each file still comes
+    from its path, so a nested layout keeps working.
     """
     if not root.exists():
         raise SuiteError(f"{root}: no such file or directory")
     if root.is_file():
         files = [root]
+        skipped: list[Path] = []
     elif any((root / category).is_dir() for category in CATEGORIES):
         files = []
         for category in CATEGORIES:
             directory = root / category
             if directory.is_dir():
                 files.extend(sorted(directory.rglob("*.logos")))
+        claimed = set(files)
+        skipped = [path for path in sorted(root.rglob("*.logos")) if path not in claimed]
     else:
         files = sorted(root.rglob("*.logos"))
+        skipped = []
     if only is not None:
         files = [path for path in files if _category(path) == only]
-    return files
+    return files, [str(path) for path in skipped]
 
 
 def _category(path: Path) -> str:
@@ -206,10 +245,19 @@ def _run_file(path: Path, opts: list[str], summary: Summary, timeout: float) -> 
     base = _category_dir(path)
     relative = path.relative_to(base).with_suffix("").as_posix()
     try:
-        root = parse(path.read_text(encoding="utf-8"), str(path))
-    except OSError as error:
-        _record(summary, f"{category}/{relative}", f"cannot read: {error.strerror}")
+        source = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        _record(
+            summary,
+            f"{category}/{relative}",
+            f"cannot read {path}: not UTF-8 ({error.reason} at byte {error.start})",
+        )
         return
+    except OSError as error:
+        _record(summary, f"{category}/{relative}", f"cannot read {path}: {error.strerror}")
+        return
+    try:
+        root = parse(source, str(path))
     except LogosError as error:
         _run_unparsable(path, category, relative, error, summary)
         return
@@ -295,8 +343,10 @@ def _expected_in_text(path: Path) -> tuple[str | None, str | None]:
     """Read the expected code from a file the parser could not turn into a tree."""
     try:
         source = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        return None, f"cannot read {path}: not UTF-8 ({error.reason} at byte {error.start})"
     except OSError as error:
-        return None, f"cannot read: {error.strerror}"
+        return None, f"cannot read {path}: {error.strerror}"
     codes = set(EXPECT_ERROR.findall(source))
     if len(codes) > 1:
         return None, "two expect-error directives: " + " and ".join(sorted(codes))
@@ -341,6 +391,10 @@ def _expected_from_sidecar(path: Path) -> tuple[str | None, str | None]:
         return None, None
     try:
         text = sidecar.read_text(encoding="utf-8").strip()
+    except UnicodeDecodeError as error:
+        return None, (
+            f"cannot read {sidecar.name}: not UTF-8 ({error.reason} at byte {error.start})"
+        )
     except OSError as error:
         return None, f"cannot read {sidecar.name}: {error.strerror}"
     if "\n" in text:
@@ -518,7 +572,10 @@ def _clauses(node: Node) -> Expectation:
             raise DirectiveError(f"({clause.kind} ...) takes one value")
         argument = arguments[0]
         if clause.kind in ("out", "err-contains"):
-            values[clause.kind] = _string(clause, argument)
+            text = _string(clause, argument)
+            if clause.kind == "err-contains" and text == "":
+                raise DirectiveError("(err-contains ...) needs a non-empty string")
+            values[clause.kind] = text
         elif clause.kind in ("code", "leaks"):
             values[clause.kind] = _integer(clause, argument)
         else:
@@ -601,25 +658,110 @@ def baseline_path(root: str | Path) -> Path | None:
 
 
 def write_baseline(summary: Summary, path: Path) -> None:
-    """Write ``<status> <category>/<case> <detail>`` for every case."""
-    lines = [f"{case.status} {case.id} {case.detail}" for case in summary.cases]
+    """Write the baseline, merging a filtered run into what is already there.
+
+    A full run replaces the baseline: it is the record of the whole suite, so
+    it is also what drops a case that no longer exists and what records the
+    suite's leak total. A filtered run only knows the cases it ran, so it
+    rewrites those lines and keeps every other line and the recorded total
+    untouched; updating one category must never delete another's history.
+    """
+    previous = None if summary.full else _read_baseline(path)
+    lines: list[str] = []
+    if summary.full:
+        total = summary.leaks
+        lines = [_format_case(case.id, case.status, case.detail) for case in summary.cases]
+    else:
+        records = previous[0] if previous is not None else []
+        total = previous[1] if previous is not None else None
+        current = {case.id: case for case in summary.cases}
+        known = {case_id for _, case_id, _ in records}
+        for status, case_id, detail in records:
+            case = current.get(case_id)
+            if case is None:
+                lines.append(f"{status} {_encode_id(case_id)} {detail}")
+            else:
+                lines.append(_format_case(case.id, case.status, case.detail))
+        for case in summary.cases:
+            if case.id not in known:
+                lines.append(_format_case(case.id, case.status, case.detail))
+    if total is not None:
+        lines.insert(0, f"{LEAKS}{total}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def read_baseline(path: Path) -> dict[str, str] | None:
-    """Read a baseline into ``{case id: status}``, or ``None`` if absent."""
+    """Read a baseline into ``{case id: status}``, or ``None`` if absent.
+
+    The leak-total line is not a case and is omitted here;
+    :func:`compare_baseline` reads it separately.
+    """
+    baseline = _read_baseline(path)
+    if baseline is None:
+        return None
+    records, _ = baseline
+    return {case_id: status for status, case_id, _ in records}
+
+
+def _read_baseline(
+    path: Path,
+) -> tuple[list[tuple[str, str, str]], int | None] | None:
+    """Parse the baseline's case records and its total leak count.
+
+    A line the harness cannot read is a broken input, not a usage error: it
+    raises :class:`SuiteError` naming the file and line, which the caller
+    reports as exit 1. When that happens no case results are trusted, but the
+    cases have already run and been printed.
+    """
     if not path.is_file():
         return None
-    entries: dict[str, str] = {}
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise SuiteError(
+            f"{path}: baseline is not UTF-8 ({error.reason} at byte {error.start})"
+        ) from None
+    except OSError as error:
+        raise SuiteError(f"{path}: cannot read baseline: {error.strerror}") from None
+    records: list[tuple[str, str, str]] = []
+    total: int | None = None
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
+            continue
+        if line.startswith(LEAKS):
+            value = line[len(LEAKS) :].strip()
+            if not value.isdigit():
+                raise SuiteError(
+                    f"{path}:{number}: leak total needs a number, found '{value}'"
+                )
+            total = int(value)
             continue
         fields = line.split(" ", 2)
         if len(fields) < 2:
             raise SuiteError(f"{path}:{number}: baseline line needs a status and a case")
-        entries[fields[1]] = fields[0]
-    return entries
+        status, encoded = fields[0], fields[1]
+        if status not in ("PASS", "FAIL"):
+            raise SuiteError(
+                f"{path}:{number}: baseline status must be PASS or FAIL, found '{status}'"
+            )
+        records.append((status, _decode_id(encoded), fields[2] if len(fields) > 2 else "-"))
+    return records, total
+
+
+def _format_case(case_id: str, status: str, detail: str) -> str:
+    """One baseline line; the id is percent-encoded so a space cannot split it."""
+    return f"{status} {_encode_id(case_id)} {_one_line(detail)}"
+
+
+def _encode_id(case_id: str) -> str:
+    """A case id made space-free for the baseline, keeping the category slash."""
+    return quote(case_id, safe="/._-")
+
+
+def _decode_id(text: str) -> str:
+    """The inverse of :func:`_encode_id`."""
+    return unquote(text)
 
 
 def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
@@ -630,10 +772,20 @@ def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
     baseline result at all. The last is not a complaint about the case; it is
     the instruction that a new test must have a recorded result before the
     suite is green.
+
+    The baseline is the record of the whole suite, so a full run also reports
+    a case missing even when its whole category directory was deleted. A
+    filtered run is only responsible for the categories it ran.
+
+    A full run whose total leak count exceeds the baseline's is a regression
+    too: a leak that no individual ``(leaks N)`` clause names must not keep the
+    suite green. The problem names both totals.
     """
-    previous = read_baseline(path)
-    if previous is None:
+    baseline = _read_baseline(path)
+    if baseline is None:
         return []
+    records, total = baseline
+    previous = {case_id: status for status, case_id, _ in records}
     current = {case.id: case for case in summary.cases}
     scope = set(summary.categories)
     problems: list[tuple[str, str]] = []
@@ -647,6 +799,13 @@ def compare_baseline(summary: Summary, path: Path) -> list[tuple[str, str]]:
             )
     for case_id, status in previous.items():
         category = case_id.split("/", 1)[0]
-        if status == "PASS" and case_id not in current and (not scope or category in scope):
-            problems.append((case_id, "regression: passed in baseline, missing from this run"))
+        if status != "PASS" or case_id in current:
+            continue
+        if not (summary.full or not scope or category in scope):
+            continue
+        problems.append((case_id, "regression: passed in baseline, missing from this run"))
+    if summary.full and total is not None and summary.leaks > total:
+        problems.append(
+            ("suite/leaks", f"regression: leak total {summary.leaks} exceeds baseline {total}")
+        )
     return sorted(problems)

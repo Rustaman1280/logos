@@ -15,6 +15,7 @@ nothing about the corpus it exists to check.
 from __future__ import annotations
 
 import io
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -49,6 +50,23 @@ BROKEN_HELLO = """\
 (test prints
   (expect (out "expected\\n") (code 0))
   (println "observed"))
+"""
+
+FINE = """\
+(mod fine)
+
+(test frees
+  (expect (code 0) (leaks 0))
+  (let p (alloc :i64 4))
+  (free p))
+"""
+
+LEAKY = """\
+(mod leaky)
+
+(test leaks
+  (expect (code 0) (leaks 1))
+  (let p (alloc :i64 4)))
 """
 
 
@@ -238,6 +256,60 @@ class DirectiveTest(unittest.TestCase):
             summary = run(Path(tmp))
             self.assertEqual(summary.failed, 1)
             self.assertIn("expect needs at least one clause", summary.failures[0][1])
+
+    def test_an_empty_err_contains_asserts_nothing_and_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(
+                Path(tmp),
+                "exec",
+                "empty-err",
+                """\
+                (mod empty)
+
+                (test empty
+                  (expect (err-contains ""))
+                  (println "hi"))
+                """,
+            )
+            summary = run(Path(tmp))
+            self.assertEqual(summary.failed, 1)
+            self.assertIn("needs a non-empty string", summary.failures[0][1])
+
+    def test_a_non_utf8_fixture_is_a_case_failure_naming_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            bad = root / "exec" / "broken.logos"
+            bad.write_bytes(b"\xff\xfe not utf-8")
+            summary = run(root)
+            self.assertEqual(summary.passed, 1)
+            self.assertEqual(summary.failed, 1)
+            case, detail = summary.failures[0]
+            self.assertEqual(case, "exec/broken")
+            self.assertIn(str(bad), detail)
+            self.assertIn("not UTF-8", detail)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["test", tmp, "--opt", "-O0"])
+            self.assertEqual(code, 1)
+            self.assertIn(str(bad), out.getvalue())
+
+    def test_a_file_outside_the_categories_is_reported_and_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            stray = root / "exce" / "typo.logos"
+            stray.parent.mkdir()
+            stray.write_text(HELLO, encoding="utf-8")
+            summary = run(root)
+            self.assertEqual(summary.skipped, [str(stray)])
+            self.assertEqual(summary.total, 1)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["test", tmp, "--opt", "-O0"])
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue().count(f"SKIP {stray}"), 1)
+            self.assertIn("outside the known categories", err.getvalue())
 
     def test_a_file_without_tests_declares_no_case(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -481,7 +553,7 @@ class BaselineTest(unittest.TestCase):
             path = Path(tmp, "summary.txt")
             tester.write_baseline(summary, path)
             lines = path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines, ["PASS exec/hello/prints -"])
+            self.assertEqual(lines, ["LEAKS 0", "PASS exec/hello/prints -"])
             self.assertEqual(tester.read_baseline(path), {"exec/hello/prints": "PASS"})
 
     def test_a_case_that_passed_before_and_fails_now_is_a_regression(self):
@@ -564,6 +636,96 @@ class BaselineTest(unittest.TestCase):
             self.assertEqual(tester.compare_baseline(filtered, baseline), [])
 
 
+    def test_a_filtered_update_keeps_the_other_categories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = write(root, "exec", "hello", HELLO)
+            write(root, "mem", "fine", FINE)
+            baseline = root / "summary.txt"
+            tester.write_baseline(run(root), baseline)
+            listed = tester.read_baseline(baseline) or {}
+            self.assertEqual(len(listed), 2)
+            path.write_text(BROKEN_HELLO, encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(
+                    ["test", tmp, "--only", "exec", "--opt", "-O0", "--update-baseline"]
+                )
+            self.assertEqual(code, 1)
+            entries = tester.read_baseline(baseline) or {}
+            self.assertEqual(entries["exec/hello/prints"], "FAIL")
+            self.assertEqual(entries["mem/fine/frees"], "PASS")
+            self.assertIn("LEAKS 0", baseline.read_text(encoding="utf-8"))
+
+    def test_a_deleted_category_is_a_regression_in_a_full_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            write(root, "mem", "fine", FINE)
+            baseline = root / "summary.txt"
+            tester.write_baseline(run(root), baseline)
+            shutil.rmtree(root / "mem")
+            summary = run(root)
+            self.assertTrue(summary.full)
+            self.assertEqual(summary.categories, ("exec",))
+            self.assertIn(
+                ("mem/fine/frees", "regression: passed in baseline, missing from this run"),
+                tester.compare_baseline(summary, baseline),
+            )
+
+    def test_a_leak_total_above_the_baseline_is_a_regression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "leaky", LEAKY)
+            baseline = root / "summary.txt"
+            summary = run(root)
+            self.assertEqual(summary.leaks, 1)
+            tester.write_baseline(summary, baseline)
+            baseline.write_text(
+                baseline.read_text(encoding="utf-8").replace("LEAKS 1", "LEAKS 0"),
+                encoding="utf-8",
+            )
+            problems = tester.compare_baseline(run(root), baseline)
+            self.assertIn(
+                ("suite/leaks", "regression: leak total 1 exceeds baseline 0"), problems
+            )
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["test", tmp, "--opt", "-O0"])
+            self.assertEqual(code, 1)
+            self.assertIn("BASELINE suite/leaks", out.getvalue())
+            self.assertIn("baseline 0", out.getvalue())
+
+    def test_a_case_id_with_a_space_is_percent_encoded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "two words", HELLO)
+            baseline = root / "summary.txt"
+            tester.write_baseline(run(root), baseline)
+            self.assertIn(
+                "PASS exec/two%20words/prints -",
+                baseline.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertEqual(
+                tester.read_baseline(baseline), {"exec/two words/prints": "PASS"}
+            )
+            self.assertEqual(tester.compare_baseline(run(root), baseline), [])
+
+    def test_a_corrupt_baseline_names_the_file_and_exits_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            baseline = root / "summary.txt"
+            baseline.write_text("PASS\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["test", tmp, "--opt", "-O0"])
+            self.assertEqual(code, 1)
+            self.assertIn(str(baseline), err.getvalue())
+            self.assertIn("baseline line needs a status and a case", err.getvalue())
+            self.assertIn("PASS exec/hello/prints", out.getvalue())
+
+
 class CliTest(unittest.TestCase):
     def test_a_failing_case_exits_one_and_prints_its_detail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,6 +761,20 @@ class CliTest(unittest.TestCase):
             )
         self.assertEqual(code, 2)
         self.assertIn("needs a directory", err.getvalue())
+
+    def test_update_baseline_refuses_a_category_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "exec", "hello", HELLO)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(
+                    ["test", str(root / "exec"), "--opt", "-O0", "--update-baseline"]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("category directory", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            self.assertFalse((root / "exec" / "summary.txt").exists())
 
 
 if __name__ == "__main__":

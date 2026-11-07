@@ -144,43 +144,82 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def _baseline_argument_problem(path: str) -> str | None:
+    """Why ``--update-baseline`` cannot use ``path``, or ``None`` if it can.
+
+    A baseline belongs to a suite root. A single file has no suite, and a
+    category directory is not the suite root: writing ``<category>/summary.txt``
+    there would create a file that no run ever reads.
+    """
+    root = Path(path)
+    if root.is_file():
+        return "--update-baseline needs a directory, not a single file"
+    if root.is_dir() and root.name in tester.CATEGORIES:
+        return (
+            f"--update-baseline needs the suite root, not the category "
+            f"directory '{path}'"
+        )
+    return None
+
+
 def _test(
     path: str, only: str | None, opts: list[str] | None, update_baseline: bool
 ) -> int:
     """Run the corpus, print one line per case, and enforce the baseline.
 
     The exit status is 1 when any case fails, when the baseline records a
-    regression, or when there was nothing to run. A usage error (an unknown
-    category, or a baseline asked for a single file) is 2, as elsewhere in the
-    command line.
+    regression or a leak total above the baseline's, when a file sat outside
+    every known category, or when there was nothing to run. A usage error (an
+    unknown category, or a baseline asked for a file or a category directory)
+    is 2, as elsewhere in the command line.
     """
+    if update_baseline:
+        problem = _baseline_argument_problem(path)
+        if problem is not None:
+            print(f"logos: test: {problem}", file=sys.stderr)
+            return 2
+
     try:
         summary = tester.run_suite(path, only, opts)
-    except ValueError as error:
+    except tester.UsageError as error:
         print(f"logos: test: {error}", file=sys.stderr)
         return 2
     except tester.SuiteError as error:
         print(f"logos: test: {error}", file=sys.stderr)
         return 1
 
+    for case in summary.cases:
+        print(f"{case.status} {case.id} {case.detail}")
+    for skipped in summary.skipped:
+        print(f"SKIP {skipped}")
+    print(f"{summary.passed} passed, {summary.failed} failed, {summary.leaks} leaked")
+
     if summary.total == 0:
         print(f"test: no cases found in {path}")
         return 1
 
-    for case in summary.cases:
-        print(f"{case.status} {case.id} {case.detail}")
-    print(f"{summary.passed} passed, {summary.failed} failed, {summary.leaks} leaked")
+    if summary.skipped:
+        print(
+            f"logos: test: {len(summary.skipped)} file(s) outside the known "
+            f"categories were skipped",
+            file=sys.stderr,
+        )
+        return 1
 
     baseline = tester.baseline_path(path)
-    if update_baseline:
-        if baseline is None:
-            print("logos: test: --update-baseline needs a directory", file=sys.stderr)
-            return 2
-        tester.write_baseline(summary, baseline)
-        print(f"baseline {_display(baseline)}: {summary.total} cases")
-        return 1 if summary.failed else 0
+    try:
+        if update_baseline:
+            if baseline is None:
+                print("logos: test: --update-baseline needs a directory", file=sys.stderr)
+                return 2
+            tester.write_baseline(summary, baseline)
+            print(f"baseline {_display(baseline)}: {summary.total} cases")
+            return 1 if summary.failed else 0
+        regressions = tester.compare_baseline(summary, baseline) if baseline else []
+    except tester.SuiteError as error:
+        print(f"logos: test: {error}", file=sys.stderr)
+        return 1
 
-    regressions = tester.compare_baseline(summary, baseline) if baseline else []
     if baseline is not None and baseline.is_file():
         for case, detail in regressions:
             print(f"BASELINE {case} {detail}")

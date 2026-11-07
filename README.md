@@ -67,9 +67,14 @@ python3 -m logos test --only exec --opt -O0   # one category, one optimisation l
 
 `logosc test` reads the `(expect ...)` directive in each `(test ...)` node and
 the module-level `(expect-error E0xxx)` of a negative case, runs every case at
-`-O0` and `-O2`, and writes one line per case to `tests/summary.txt` with
-`--update-baseline`. A case that passed in the baseline and fails now is a
-regression and exits 1.
+`-O0` and `-O2`, and writes to `tests/summary.txt` with `--update-baseline`.
+The baseline records one line per case plus the suite's leak total; a case
+that passed in the baseline and fails now is a regression and exits 1, as is a
+full run that leaks more than the baseline recorded. `--update-baseline` with
+`--only` merges: it rewrites the cases it ran and keeps the rest. A `.logos`
+file outside the known categories (`parse`, `type`, `exec`, `mem`, `thread`,
+`generics`, `regress`, `diff`) is reported and fails the run rather than being
+skipped.
 
 The IR is always kept beside the binary under `build/`: it is the artefact to
 read when a compiled program misbehaves.
