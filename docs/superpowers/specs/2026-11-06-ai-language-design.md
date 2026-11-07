@@ -160,6 +160,11 @@ propagates only when the caller's error type is exactly the same type;
 otherwise the caller maps it explicitly in a `match`. There is no error
 widening and no union type in v1.
 
+An enum may not contain itself, directly or through another enum: that
+type has no finite size, so it is refused before any layout is computed.
+An enum payload may not be an owning pointer or a vector, because payloads
+are copied, not moved.
+
 An enum is a closed set of named variants, each with no payload or one:
 
 ```
