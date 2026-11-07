@@ -1,0 +1,52 @@
+name: gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          # The formatting gate diffs against main, which needs the merge base.
+          fetch-depth: 0
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld gcc jq python3
+      - name: prepare main for the changed-file format gate
+        run: |
+          git rev-parse --verify --quiet main > /dev/null || git branch main origin/main
+      - name: unit tests
+        run: |
+          make test
+      - name: corpus
+        run: |
+          python3 -m logos test
+      - name: acceptance
+        run: |
+          bash tools/accept.sh
+      - name: manual drift
+        run: |
+          python3 -m logos guide --check
+      - name: formatting
+        shell: bash
+        run: |
+          if [[ -n "$(git diff --name-only main...HEAD -- '*.logos')" ]]; then
+            python3 -m logos fmt $(git diff --name-only main...HEAD -- '*.logos')
+          fi
+          python3 -m logos fmt tests docs/manual
+          git diff --exit-code -- '*.logos'
