@@ -629,6 +629,8 @@ class OwnerPlaceTest(unittest.TestCase):
         self.assertEqual(error.path, "m/box/0/0")
 
     def test_an_array_of_owners_is_refused(self):
+        # R8: refused where the array type is spelled, before the construction
+        # is ever seen. ``_make``'s guard states the same rule one level in.
         error = fail_on(
             "(mod m)(fn f :void ()"
             " (letmut p (alloc :i64 1))"
@@ -636,7 +638,82 @@ class OwnerPlaceTest(unittest.TestCase):
             " (let a (make (arr (own :i64) 2) p q)))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "owning array elements are not supported yet")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+        self.assertEqual(error.path, "m/f/4/1/0")
+
+    # -- R8: a container of owners is unspellable --------------------------
+
+    def test_a_vector_of_owners_is_refused(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec (own :i64)) (make (vec (own :i64)))))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+        self.assertEqual(error.path, "m/f/2/1")
+
+    def test_a_vector_of_owners_cannot_be_created_or_pushed_to(self):
+        # The gap R8 closes: the vector was spellable and pushable, but no
+        # element could be read (E0402) or released, so the owner leaked. The
+        # refusal is now at the annotation, before ``vec-push`` is reached.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (letmut v (vec (own :i64)) (make (vec (own :i64))))"
+            " (vec-push v p))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+        self.assertEqual(error.path, "m/f/3/1")
+
+    def test_a_vector_of_a_wrapper_around_an_owner_is_refused(self):
+        # Any depth: the element type holds an owner through an optional, and
+        # still no element could be released where it lies.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec (opt (own :i64))) (make (vec (opt (own :i64))))))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+
+    def test_an_array_of_owners_as_a_parameter_is_refused(self):
+        # The other spelling the round-3 report left open: the type could be
+        # named as a parameter even though nothing could construct one.
+        error = fail_on(
+            "(mod m)(fn f :void ((a (arr (own :i64) 2))) (ret))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+        self.assertEqual(error.path, "m/f/1/0/0")
+
+    def test_an_empty_array_of_owners_is_refused_too(self):
+        # R8 is about the element type, not the count: zero elements is still
+        # a container whose element cannot be read or released.
+        error = fail_on(
+            "(mod m)(fn f :void ((a (arr (own :i64) 0))) (ret))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(
+            error.message, "a container of owners is not supported yet"
+        )
+
+    def test_a_vector_and_an_array_of_plain_elements_still_check(self):
+        checked(
+            "(mod m)(fn f :void ()"
+            " (letmut v (vec :i64) (make (vec :i64)))"
+            " (vec-push v 1)"
+            " (letmut a (make (arr :i64 2) 1 2)))"
+        )
 
     def test_an_owner_inside_an_owner_is_refused(self):
         error = fail_on("(mod m)(fn f :void ((p (own (own :i64)))) (ret))")
@@ -655,27 +732,14 @@ class OwnerPlaceTest(unittest.TestCase):
 
     # -- reads: no expression may hand out a second owner ------------------
 
-    def test_vec_get_of_an_owner_is_refused(self):
-        error = fail_on(
-            "(mod m)(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (letmut v (vec (own :i64)) (make (vec (own :i64))))"
-            " (vec-push v p)"
-            " (free (vec-get v 0)))"
-        )
-        self.assertEqual(error.code, "E0402")
-        self.assertEqual(error.message, "an owner cannot be read out of a place yet")
-        self.assertEqual(error.path, "m/f/5/0")
-
-    def test_arr_get_of_an_owner_is_refused(self):
-        # Nothing can build an array of owners (E0002 above), but a parameter
-        # can still name the type; the element read is refused for the same
-        # reason a field read is.
-        error = fail_on(
-            "(mod m)(fn f :void ((a (arr (own :i64) 2))) (let p (arr-get a 0)))"
-        )
-        self.assertEqual(error.code, "E0402")
-        self.assertEqual(error.message, "an owner cannot be read out of a place yet")
+    # -- reads: no expression may hand out a second owner ------------------
+    #
+    # R8 removes the two reads this section used to test. No source can spell
+    # ``(vec (own T))`` or ``(arr (own T) n)`` any more, so ``_vec_get`` and
+    # ``_arr_get`` cannot be reached with an owning element; their guards stay
+    # as defence in depth, exactly like ``_get``'s (see the round-3 concern).
+    # The reads that are still reachable are ``deref`` of an owning pointer and
+    # a store into one.
 
     def test_deref_of_an_owning_pointer_is_refused(self):
         # ``(alloc (own T) n)`` is the one way to make an owner whose pointee

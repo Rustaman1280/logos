@@ -150,6 +150,12 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   out of a place — `(get b p)` over an owning field, `(arr-get a i)`,
   `(vec-get v i)`, and `(deref p)` of an owning pointer are E0402 — because
   a place read copies the pointer and creates a second owner.
+- A container whose element type holds an owner at any depth is E0002, `a
+  container of owners is not supported yet`, where the container is spelled:
+  `(vec (own T))`, `(vec (opt (own T)))`, `(arr (own T) n)` — including
+  `n = 0` — and their nested spellings. An element can be neither read nor
+  released, so such a container leaks by construction and no program could
+  free what it holds.
 - A `(vec T)` may not be a struct field or a fixed-array element yet,
   because no place expression exists to release its buffer.
 - A `:str` owns nothing. Concatenation produces a process-lifetime buffer,

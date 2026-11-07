@@ -60,7 +60,11 @@ transferring it and so is allowed on any owning binding.
 An owner lives only in a direct binding or a function parameter. It may not be
 stored in a struct field, a fixed-array element or an enum payload, and an
 owner may not hold another (E0002 where the type is spelled): a place has no
-way to move it out, so the owner would either be copied or leak. For the same
+way to move it out, so the owner would either be copied or leak. Neither may a
+container hold one: a `(vec T)` or `(arr T n)` whose element type holds an
+owner at any depth is E0002, `a container of owners is not supported yet`,
+where the container is spelled, because an element can be neither read nor
+released and the program would leak by construction. For the same
 reason no expression may *read* one out of a place — ``(get b p)`` where the
 field is an owner, ``(arr-get a i)``, ``(vec-get v i)`` and ``(deref p)`` of an
 owning pointer are **E0402**, ``an owner cannot be read out of a place yet``:
@@ -3732,6 +3736,17 @@ def resolve_type(
         return Shared(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Vec):
         elem = resolve_type(ty.elem, types, path, bindings)
+        if holds_owner(elem):
+            # A container is not a place this language can name: an element
+            # can be neither read (E0402) nor released where it lies, so a
+            # vector of owners leaks by construction and no program can be
+            # written with one. Refused where the container is spelled, for
+            # the same reason a vector field is.
+            raise diag(
+                UNKNOWN_NODE,
+                path,
+                "a container of owners is not supported yet",
+            )
         if _stored_result(elem):
             raise diag(
                 UNKNOWN_NODE, path, "a result cannot be a vector element yet"
@@ -3768,6 +3783,15 @@ def resolve_type(
     # ``ty`` is the array case; spelled last so the branches read in the
     # order the type forms are documented.
     elem = resolve_type(ty.elem, types, path, bindings)
+    if holds_owner(elem):
+        # Also the reachable spelling of the same program: an `(arr (own T)
+        # n)` parameter could name the type, and nothing could release an
+        # element of it. Refused where the array is spelled, like a vector.
+        raise diag(
+            UNKNOWN_NODE,
+            path,
+            "a container of owners is not supported yet",
+        )
     if holds_vector(elem):
         # Same reason a vector field is refused: an element of a fixed array
         # is not a place this language can name, so a vector stored there
