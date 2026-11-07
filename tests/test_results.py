@@ -742,12 +742,12 @@ class OwnerPlaceTest(unittest.TestCase):
     # a store into one.
 
     def test_deref_of_an_owning_pointer_is_refused(self):
-        # ``(alloc (own T) n)`` is the one way to make an owner whose pointee
-        # is itself an owner: nothing is initialised, but the read would hand
-        # the inner address out as a second owner.
+        # ``(ptr (own T))`` is spellable even though ``(alloc (own T) n)`` is
+        # refused, so the read guard stays reachable: the pointer is a view of
+        # an owner stored somewhere else, and dereferencing would hand it out
+        # as a second owner.
         error = fail_on(
-            "(mod m)(fn f :void ()"
-            " (letmut p (alloc (own :i64) 1))"
+            "(mod m)(fn f :void ((p (ptr (own :i64))))"
             " (let q (deref p)))"
         )
         self.assertEqual(error.code, "E0402")
@@ -755,9 +755,7 @@ class OwnerPlaceTest(unittest.TestCase):
 
     def test_storing_an_owner_inside_another_is_refused(self):
         error = fail_on(
-            "(mod m)(fn f :void ()"
-            " (letmut p (alloc (own :i64) 1))"
-            " (letmut q (alloc :i64 1))"
+            "(mod m)(fn f :void ((p (ptr (own :i64))) (q (own :i64)))"
             " (set-deref p q))"
         )
         self.assertEqual(error.code, "E0002")
@@ -803,6 +801,19 @@ class OwnerPlaceTest(unittest.TestCase):
         )
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'r'")
+
+    def test_a_second_match_on_an_owning_scrutinee_is_e0300(self):
+        # ``_match`` consumes an owner-holding scrutinee because an arm binds
+        # its payload by copy, so exactly one arm may hold the owner. Fix
+        # round 2 said this was covered; deleting the consume left the suite
+        # green and let a second match compile into a double owner (R0002).
+        error = fail_on(
+            "(mod m)(fn f :void ((o :(opt (own :i64))))"
+            " (match o ((some p) (println 0)) ((none) (println 1)))"
+            " (match o ((some p) (println 0)) ((none) (println 1))))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'o'")
 
     def test_a_capturing_closure_cannot_be_an_enum_payload(self):
         # Fix round 1 claimed `_construct` covered this; only `(ok ...)` and

@@ -2684,6 +2684,20 @@ class _Checker:
                 WRONG_ARITY, node.path, "alloc takes a type and an element count"
             )
         elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
+        if holds_owner(elem, self._structs, self._enums):
+            # ``(own X)`` is refused when X holds an owner, so an allocation
+            # whose element does would make a binding of a type the language
+            # cannot spell — an outer owner holding the inner one reachable
+            # only through a read that is itself refused. The container types
+            # are allowed to spell an owner as an element (``(opt (own T))``),
+            # which is why the check has to be here as well as in
+            # ``resolve_type``: ``(alloc (opt (own T)) n)`` is the spelling
+            # that reaches this method with an owner-holding element.
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                "allocation of owners is not supported yet",
+            )
         if _is_void(elem):
             raise diag(TYPE_MISMATCH, node.path, "cannot allocate :void")
         count = self._value(items[2], env, None, node.path)
@@ -2757,8 +2771,9 @@ class _Checker:
             )
         if holds_owner(elem, self._structs, self._enums):
             # ``(deref p)`` is a place. When the pointee is itself an owner —
-            # only ``(alloc (own T) n)`` can make one — the read would hand out
-            # a second owner of the inner block.
+            # ``(ptr (own T))`` names one, while ``(alloc (own T) n)`` is
+            # refused — the read would hand out a second owner of the inner
+            # block.
             raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
         return elem
 
@@ -2782,8 +2797,8 @@ class _Checker:
             )
         if holds_owner(elem, self._structs, self._enums):
             # Writing an owner behind a pointer stores it inside another owner
-            # (only ``(alloc (own T) n)`` can make such a pointee), where no
-            # place expression can move it back out.
+            # (``(ptr (own T))`` names such a pointee; ``(alloc (own T) n)`` is
+            # refused), where no place expression can move it back out.
             raise diag(
                 UNKNOWN_NODE,
                 node.path,
@@ -3709,8 +3724,9 @@ def resolve_type(
         if holds_owner(elem):
             # An owner holds a block, not another owner: the inner pointer
             # would only be reachable through a deref, and that read is E0402.
-            # ``alloc`` can still make an uninitialised block of owners, which
-            # is why the read site states the rule as well.
+            # ``alloc`` refuses an element that holds an owner for the same
+            # reason, so no owning pointer to one can be made; the read site
+            # states the rule as well (a ``(ptr (own T))`` is spellable).
             raise diag(
                 UNKNOWN_NODE,
                 path,

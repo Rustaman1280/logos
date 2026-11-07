@@ -118,6 +118,24 @@ class AllocCheckTest(unittest.TestCase):
         self.assertEqual(error.code, "E0100")
         self.assertEqual(error.message, "cannot allocate :void")
 
+    def test_alloc_of_a_type_containing_an_owner_is_refused(self):
+        # ``_alloc`` builds ``Own(elem)`` directly, so an element the type
+        # system cannot spell as an owner reached a binding anyway:
+        # ``(alloc (opt (own :i64)) 1)`` checked and made an unspellable
+        # nested-owner type, bypassing the inner-owner refusal. Only a
+        # container could sneak the owner in; ``(own T)`` itself is refused at
+        # the alloc because its element is an owner too.
+        for spelling in ("(own :i64)", "(opt (own :i64))", "(res (own :i64) err)"):
+            with self.subTest(spelling=spelling):
+                error = fail_on(
+                    "(mod m)(type err (enum (eof)))"
+                    f"(fn f :void () (let p (alloc {spelling} 1)))"
+                )
+                self.assertEqual(error.code, "E0002")
+                self.assertEqual(
+                    error.message, "allocation of owners is not supported yet"
+                )
+
     def test_alloc_takes_a_type_and_a_count(self):
         error = fail_on("(mod m)(fn f :void () (let p (alloc :i64)))")
         self.assertEqual(error.code, "E0102")

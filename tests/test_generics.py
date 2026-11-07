@@ -350,6 +350,18 @@ class InstantiationTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertIn("use after move of 'v'", error.message)
 
+    def test_a_generic_parameter_that_unifies_to_an_owner_moves_the_argument(self):
+        # The pre-unification move test at the call site sees a bare ``T`` and
+        # cannot tell it owns anything; the type is fixed only by the argument.
+        # Without the post-unification branch the first call leaves ``p``
+        # armed, the second checks, and lowering emits a second owner.
+        error = fail_on(
+            "(mod m)(fn drop :void ((x :T)) (println 0))"
+            "(fn f :void () (letmut p (alloc :i64 2)) (drop p) (drop p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertIn("use after move of 'p'", error.message)
+
     def test_a_user_definition_cannot_share_a_copy_name(self):
         # The check must consult every visible definition, not just the
         # generic source names: ``id$i64`` beside a copy of ``id`` is two
