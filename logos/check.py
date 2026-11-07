@@ -1297,7 +1297,7 @@ RESERVED_FORMS = frozenset(
     """
     if while match let letmut set ret make get set-field alloc free ptr deref
     set-deref ptr-add print println spawn join lock unlock send recv ok err some
-    none try break continue cast and or not
+    none try break continue cast shl shr shr-u and or not
     """.split()
 )
 #: Form families: every name starting with one of these heads is a form.
@@ -1315,6 +1315,11 @@ BUILTINS = PRINTERS
 _ARITH = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "modulo"}
 _ORDERED = ("<", "<=", ">", ">=")
 _EQUALITY = ("=", "!=")
+#: The bit shifts: left, arithmetic right (the sign bit fills), and logical
+#: right (zeros fill). Integer operands only — a float has no bit pattern the
+#: language exposes — and the result keeps the shifted operand's width.
+_SHL, _SHR, _SHR_U = "shl", "shr", "shr-u"
+_SHIFTS = (_SHL, _SHR, _SHR_U)
 #: Short-circuiting boolean operators. They are not arithmetic: both operands
 #: must be ``:bool`` and so is the result.
 _LOGICAL = ("and", "or")
@@ -1657,6 +1662,8 @@ class _Checker:
             return self._arith(node, env, expected)
         if kind in _ORDERED or kind in _EQUALITY:
             return self._compare(node, env)
+        if kind in _SHIFTS:
+            return self._shift(node, env)
         if kind in _LOGICAL:
             return self._logical(node, env)
         if kind == "not":
@@ -1873,6 +1880,51 @@ class _Checker:
                 TYPE_MISMATCH,
                 _at(arg, node),
                 _operand_message(node.kind, ty, operand),
+            )
+        return ty
+
+    def _shift(self, node: Node, env: _Env) -> Ty:
+        """``(shl a n)``, ``(shr a n)``, ``(shr-u a n)``: bits, not numbers.
+
+        The shifted value fixes the type of the form, and the count is checked
+        against it the same way an arithmetic operand is: a literal adopts the
+        width, and a count of another width is E0100. A count at or beyond the
+        width is not an error — the backend masks it to the width, the way the
+        hardware does — so ``(shl x 64)`` on an ``:i64`` is ``(shl x 0)``.
+
+        Integer operands only. A float has no bit pattern this language
+        exposes, and a ``:bool`` is one bit with nothing to shift into, so both
+        are E0100 at the operand that named them.
+        """
+        args = node.items[1:]
+        if len(args) != 2:
+            raise diag(WRONG_ARITY, node.path, f"'{node.kind}' takes a value and a count")
+        value_item, count_item = args
+        if _literal(value_item) and not _literal(count_item):
+            # A literal has no width of its own: the count beside it decides
+            # the width, exactly as it does for an arithmetic operand.
+            ty = self._value(count_item, env, None, node.path)
+            if not _integer(ty):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(count_item, node),
+                    f"'{node.kind}' needs an integer, found {ty}",
+                )
+            count = self._value(value_item, env, ty, node.path)
+        else:
+            ty = self._value(value_item, env, None, node.path)
+            if not _integer(ty):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(value_item, node),
+                    f"'{node.kind}' needs an integer, found {ty}",
+                )
+            count = self._value(count_item, env, ty, node.path)
+        if not compatible(ty, count):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(count_item, node),
+                f"cannot shift {ty} by {count}",
             )
         return ty
 

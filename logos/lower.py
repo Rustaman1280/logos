@@ -377,6 +377,13 @@ _FLOAT_COMPARE = {
 #: the width, not the operator, decides what the bits mean.
 _COMPARE = {"=": "eq", "!=": "ne", "<": "slt", "<=": "sle", ">": "sgt", ">=": "sge"}
 
+#: Logos shift to LLVM opcode. ``shr`` is arithmetic (the sign bit fills) and
+#: ``shr-u`` is logical (zeros fill); ``shl`` is the same instruction at either
+#: signedness. The count is masked to the width before it is used — LLVM makes a
+#: shift by the width or more poison, and the hardware's silence would be a
+#: wrong answer with no diagnostic.
+_SHIFT = {"shl": "shl", "shr": "ashr", "shr-u": "lshr"}
+
 #: The two operations that can trap.
 _DIVIDE = ("/", "%")
 
@@ -2559,6 +2566,8 @@ class _Fn:
             return self.arith(item)
         if kind in _COMPARE:
             return self.compare(item)
+        if kind in _SHIFT:
+            return self.shift(item)
         if kind in _LOGICAL:
             return self.logical(item)
         if kind == "not":
@@ -2864,6 +2873,33 @@ class _Fn:
         right = self.value(items[2], node.path)
         dest = self.temp()
         self.emit(("icmp", dest, predicate, ty, left, right))
+        return dest
+
+    def shift(self, node: Node) -> str:
+        """``(shl a n)`` and its two right-hand spellings: one masked shift.
+
+        The count is reduced modulo the operand's width first, because LLVM
+        makes a shift by the width or more *poison*: at ``-O0`` it would be the
+        hardware's masked count and at ``-O2`` the optimiser could do anything
+        at all with it. Masking here makes the two agree by construction, and
+        says what the language means — a count of 64 on an ``:i64`` is a count
+        of 0. The mask is a constant the operand's own type holds.
+        """
+        items = node.items
+        ty = self.type_of(node)
+        if not (isinstance(ty, Prim) and ty.name in INTEGERS):
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'{node.kind}' on {ty} is not lowered by this backend yet",
+            )
+        width = 8 * _SIZES[ty.name]
+        value = self.value(items[1], node.path)
+        count = self.value(items[2], node.path)
+        masked = self.temp()
+        self.emit(("and", masked, ty, count, str(width - 1)))
+        dest = self.temp()
+        self.emit((_SHIFT[node.kind], dest, ty, value, masked))
         return dest
 
     def logical(self, node: Node) -> str:

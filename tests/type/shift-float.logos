@@ -1,0 +1,4 @@
+(mod shift-float)
+
+(fn f :f64 ((x :f64))
+  (ret (shl x 2)))
