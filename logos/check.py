@@ -50,14 +50,25 @@ with ``(deref p)``/``(set-deref p v)``; only the owner may free, so a raw
 pointer is E0301 there.
 
 An owning value is not copied, it moves: into a binding, into a call's
-``(own T)`` parameter, into a struct field, out of a ``ret``, or through
-``free``. The binding left behind holds nothing, and reading it is E0300 —
-which is what makes a double free a compile error in the direct case. A move
-is only legal out of a ``letmut`` or a parameter (E0302): a plain ``let``
-promised to hold the same value for its whole scope, while ``free`` destroys
-the value rather than transferring it and so is allowed on any owning binding.
+``(own T)`` parameter, out of a ``ret``, or through ``free``. The binding left
+behind holds nothing, and reading it is E0300 — which is what makes a double
+free a compile error in the direct case. A move is only legal out of a
+``letmut`` or a parameter (E0302): a plain ``let`` promised to hold the same
+value for its whole scope, while ``free`` destroys the value rather than
+transferring it and so is allowed on any owning binding.
+
+An owner lives only in a direct binding or a function parameter. It may not be
+stored in a struct field, a fixed-array element or an enum payload, and an
+owner may not hold another (E0002 where the type is spelled): a place has no
+way to move it out, so the owner would either be copied or leak. For the same
+reason no expression may *read* one out of a place — ``(get b p)`` where the
+field is an owner, ``(arr-get a i)``, ``(vec-get v i)`` and ``(deref p)`` of an
+owning pointer are **E0402**, ``an owner cannot be read out of a place yet``:
+a read copies the pointer, which is the second owner the whole rule exists to
+prevent.
+
 A type that *contains* an owner by value — ``(opt (own T))``, ``(res (own T)
-E)``, a struct or an enum payload, an array — has no copy either, so binding
+E)`` — has no copy either, so binding
 it, passing it, returning it or storing it in any construction moves it, and
 that move needs no ``letmut`` for the same reason a vector's does not: the
 binding is emptied, not reused. A ``match`` consumes a scrutinee that owns
@@ -631,7 +642,10 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
     E0002, and an unresolvable type is E0101, each at the field's own path. A
     field that is or contains a ``(vec T)`` is E0002 at the field: a vector is
     released through its descriptor, and a field is not a place this language
-    can name, so such a field could never free its buffer.
+    can name, so such a field could never free its buffer. A field that is or
+    contains an ``(own T)`` is E0002 for the same reason: an owner lives only
+    in a binding or a parameter, and reading one out of a field would copy the
+    pointer rather than move it.
 
     A type variable has nothing to bind it here — a struct declares no type
     parameters — so one in a field, or in the element type of a fixed array in
@@ -656,6 +670,15 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
             raise diag(DUPLICATE, field.path, f"duplicate field '{name}'")
         names.add(name)
         ty = _read_type(type_item, types, field.path, {})
+        if holds_owner(ty):
+            # An owner lives in a binding or a parameter, nowhere else. A
+            # field is not a place this language can move out of: reading it
+            # would copy the pointer, so two owners would name one block and
+            # the second free would be a use of freed memory. Refused at the
+            # declaration, exactly like a vector field.
+            raise diag(
+                UNKNOWN_NODE, field.path, "owning fields are not supported yet"
+            )
         if holds_vector(ty):
             # A vector's buffer is released through the descriptor, and a
             # field is not a place this language can name: ``vec-free`` takes
@@ -677,6 +700,12 @@ def struct_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty], ...]
 #: The one sentence E0502 carries, wherever a capturing closure would outlive
 #: the frame that owns its environment.
 _CLOSURE_ESCAPE = "a closure that captures cannot leave its function"
+
+#: The one sentence E0402 carries when a place would hand out a second owner.
+#: A place expression does not exist yet, so there is no way to move a value
+#: out of one: reading it copies the pointer, and two owners of one block free
+#: it twice.
+_OWNER_PLACE = "an owner cannot be read out of a place yet"
 
 #: Variant names the compiler gives a meaning of its own: ``(ok v)``, ``(err
 #: e)``, ``(some v)``, ``(none)`` and ``(try e)`` are forms, and ``print`` and
@@ -744,11 +773,11 @@ def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None],
             raise diag(
                 UNKNOWN_NODE, variant.path, "vector payloads are not supported yet"
             )
-        if isinstance(ty, Own):
-            # A payload is copied where the variant is built, and an owner has
-            # no copy: the source and the payload would both own one block, so
-            # freeing either would leave the other dangling. Moving a value
-            # through a payload is a later task.
+        if holds_owner(ty):
+            # A payload is a place the language cannot move out of by an
+            # expression: a match binds it, but an owner inside would have to
+            # be read out of the arm's slot to be released, and that read is
+            # E0402. Moving a value through a payload is a later task.
             raise diag(
                 UNKNOWN_NODE,
                 type_item.path if isinstance(type_item, Node) and type_item.path
@@ -2231,6 +2260,16 @@ class _Checker:
                     self._consume(item, env, node.path)
             return ty
         if isinstance(ty, Arr):
+            if holds_owner(ty.elem, self._structs, self._enums):
+                # An owner lives in a binding or a parameter, not in an
+                # element: ``(arr-get a i)`` cannot move one out, so an array
+                # of owners would leak by construction. Refused where it is
+                # built, at the type that spelled it.
+                raise diag(
+                    UNKNOWN_NODE,
+                    _at(items[1], node),
+                    "owning array elements are not supported yet",
+                )
             if len(values) != ty.n:
                 raise diag(
                     WRONG_ARITY,
@@ -2278,6 +2317,11 @@ class _Checker:
         name = _name(items[2], node.path, "get")
         for field, fty in self._fields(ty, node.path):
             if field == name:
+                if holds_owner(fty, self._structs, self._enums):
+                    # An owning field is E0002 at its declaration, so this is
+                    # the invariant stated at the read site: a place read has
+                    # no way to move an owner out, only to copy the pointer.
+                    raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
                 return fty
         raise diag(UNKNOWN_FIELD, node.path, f"struct '{ty.name}' has no field '{name}'")
 
@@ -2355,6 +2399,10 @@ class _Checker:
                 _at(items[2], node),
                 f"array index must be an integer, found {index}",
             )
+        if holds_owner(ty.elem, self._structs, self._enums):
+            # An element of a fixed array is a place: the read would copy the
+            # owning pointer out of it, and both copies would free the block.
+            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
         return ty.elem
 
     def _arr_set(self, node: Node, env: _Env) -> Ty:
@@ -2571,6 +2619,10 @@ class _Checker:
             raise diag(WRONG_ARITY, node.path, "'vec-get' takes a vector and an index")
         ty = self._vec_operand(items[1], env, node, "vec-get")
         self._index(items[2], env, node, "vector index")
+        if holds_owner(ty.elem, self._structs, self._enums):
+            # A vector element is a place: releasing the owner needs the
+            # element value, and the read would copy it rather than move it.
+            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
         return ty.elem
 
     def _vec_set(self, node: Node, env: _Env) -> Ty:
@@ -2699,6 +2751,11 @@ class _Checker:
                 _at(items[1], node),
                 f"deref needs a pointer, found {ty}",
             )
+        if holds_owner(elem, self._structs, self._enums):
+            # ``(deref p)`` is a place. When the pointee is itself an owner —
+            # only ``(alloc (own T) n)`` can make one — the read would hand out
+            # a second owner of the inner block.
+            raise diag(VEC_MOVE, node.path, _OWNER_PLACE)
         return elem
 
     def _set_deref(self, node: Node, env: _Env) -> Ty:
@@ -2718,6 +2775,15 @@ class _Checker:
                 TYPE_MISMATCH,
                 _at(items[1], node),
                 f"deref needs a pointer, found {ty}",
+            )
+        if holds_owner(elem, self._structs, self._enums):
+            # Writing an owner behind a pointer stores it inside another owner
+            # (only ``(alloc (own T) n)`` can make such a pointee), where no
+            # place expression can move it back out.
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                "an owner cannot be stored inside an owner yet",
             )
         got = self._value(items[2], env, elem, node.path)
         if _escapes(got):
@@ -3635,7 +3701,18 @@ def resolve_type(
     if isinstance(ty, Ptr):
         return Ptr(resolve_type(ty.elem, types, path, bindings))
     if isinstance(ty, Own):
-        return Own(resolve_type(ty.elem, types, path, bindings))
+        elem = resolve_type(ty.elem, types, path, bindings)
+        if holds_owner(elem):
+            # An owner holds a block, not another owner: the inner pointer
+            # would only be reachable through a deref, and that read is E0402.
+            # ``alloc`` can still make an uninitialised block of owners, which
+            # is why the read site states the rule as well.
+            raise diag(
+                UNKNOWN_NODE,
+                path,
+                "an owner cannot hold another owner yet",
+            )
+        return Own(elem)
     if isinstance(ty, Opt):
         elem = resolve_type(ty.elem, types, path, bindings)
         if holds_vector(elem):

@@ -138,18 +138,18 @@ Nothing here is undefined behaviour, so a C oracle can check it:
 - A `(vec T)` is not copyable, and neither is a type that contains one.
   Binding such a value moves it; reading the source afterwards is E0300.
   Two bindings never share a buffer.
-- The same holds for any type that contains an `(own T)` at any depth:
-  `(opt (own T))`, `(res (own T) E)`, a struct with an owning field, an
-  array or an enum whose payload does. Any transfer or construction moves
-  the source: a `let`, a call argument, a `ret`, `make`, `set-field`,
-  `arr-set`, `vec-push`, `vec-set`, `ok`/`err`/`some`, an enum payload,
-  `set-deref`, a `try` and a `match` scrutinee. Reading the source
-  afterwards is E0300 and a second transfer of it is E0402, so two owners
-  never exist.
+- The same holds for the two wrappers that are not places: an
+  `(opt (own T))` or a `(res (own T) E)` in a binding has no copy either.
+  Any transfer or construction moves the source: a `let`, a call argument, a
+  `ret`, `ok`/`err`/`some`, `set-deref`, a `try` and a `match` scrutinee.
+  Reading the source afterwards is E0300 and a second transfer of it is
+  E0402, so two owners never exist.
 - An owner lives only in a direct binding or a function parameter. It may
   not be a struct field, an array element, an enum payload, or an inner
-  owner, and no expression may read one out of a place, because a place
-  read copies the pointer and creates a second owner.
+  owner (E0002 where the type is spelled), and no expression may read one
+  out of a place — `(get b p)` over an owning field, `(arr-get a i)`,
+  `(vec-get v i)`, and `(deref p)` of an owning pointer are E0402 — because
+  a place read copies the pointer and creates a second owner.
 - A `(vec T)` may not be a struct field or a fixed-array element yet,
   because no place expression exists to release its buffer.
 - A `:str` owns nothing. Concatenation produces a process-lifetime buffer,

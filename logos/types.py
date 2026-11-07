@@ -404,10 +404,10 @@ def holds_owner(
 
     An owning pointer is the one value with no copy, so anything holding one
     by value has none either: ``(opt (own T))``, ``(res (own T) E)``, a fixed
-    array of owners, a struct with an owning field, and an enum whose payload
-    does. Copying such a value gives two names for one block, and whichever
-    released it first would leave the other reading freed memory — genuine
-    undefined behaviour, not merely a leak.
+    array or a vector of owners, a struct with an owning field, and an enum
+    whose payload does. Copying such a value gives two names for one block, and
+    whichever released it first would leave the other reading freed memory —
+    genuine undefined behaviour, not merely a leak.
 
     A pointer to an owner is not one: ``(ptr (own T))`` is an address, which
     copies like any other word. The walk stops there, exactly as
@@ -423,7 +423,7 @@ def holds_owner(
     def walk(node: Ty) -> bool:
         if isinstance(node, Own):
             return True
-        if isinstance(node, (Arr, Opt)):
+        if isinstance(node, (Arr, Opt, Vec)):
             return walk(node.elem)
         if isinstance(node, Res):
             return walk(node.ok) or walk(node.err)

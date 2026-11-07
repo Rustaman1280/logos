@@ -579,15 +579,136 @@ class VariantConstructorTest(unittest.TestCase):
         self.assertIn("more than one enum", error.message)
 
 
-class NestedOwnerMoveTest(unittest.TestCase):
-    """R6: a type that contains an ``(own T)`` has no copy, however nested.
+class OwnerPlaceTest(unittest.TestCase):
+    """R7: an owner lives only in a direct binding or a function parameter.
 
-    The value is built once, by moving its owner into the optional, result,
-    struct, array or enum payload; reading the source afterwards is E0300 and a
-    second transfer of it is E0402. Before this, ``(let o (some p)) (free p)``
-    compiled and freed the same block twice — a silent double free in a release
-    build — and a struct holding an owner could be copied.
+    A struct field, a fixed-array element and an enum payload are places, and
+    this language has no place expression that can move a value out of one.
+    Reading copies the pointer, so two owners would share a block and the
+    second free would read freed memory. Every such storage is therefore E0002
+    where the type is spelled, and every place read that could still hand an
+    owner out — ``(get b p)``, ``(arr-get a i)``, ``(vec-get v i)`` and
+    ``(deref p)`` of an owning pointer — is E0402, ``an owner cannot be read
+    out of a place yet``.
+
+    R6 still governs the wrappers that are not places: an ``(opt (own T))`` or
+    ``(res (own T) E)`` in a binding has no copy, so naming it a second time
+    moves it (E0300) and a second transfer is E0402.
     """
+
+    # -- storage: a field, an element, a payload, an inner owner ----------
+
+    def test_a_struct_field_of_an_owner_is_refused(self):
+        error = fail_on("(mod m)(type box (struct (p (own :i64))))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning fields are not supported yet")
+        self.assertEqual(error.path, "m/box/0/0")
+
+    def test_a_struct_field_that_contains_an_owner_is_refused(self):
+        # ``(opt (own T))`` in a field is the same hole one level down: the
+        # only way to reach the owner is through the field, and that read is
+        # E0402, so the owner could never be released.
+        error = fail_on("(mod m)(type box (struct (p (opt (own :i64)))))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning fields are not supported yet")
+
+    def test_freeing_a_field_owner_is_refused(self):
+        # The plain double free from the review: ``(free (get b p))`` twice.
+        # It is refused at the field declaration, which is what makes the read
+        # impossible to write; ``_get`` states the same rule at the read site.
+        error = fail_on(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (letmut b (make box p))"
+            " (free (get b p))"
+            " (free (get b p)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning fields are not supported yet")
+        self.assertEqual(error.path, "m/box/0/0")
+
+    def test_an_array_of_owners_is_refused(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (letmut q (alloc :i64 1))"
+            " (let a (make (arr (own :i64) 2) p q)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning array elements are not supported yet")
+
+    def test_an_owner_inside_an_owner_is_refused(self):
+        error = fail_on("(mod m)(fn f :void ((p (own (own :i64)))) (ret))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "an owner cannot hold another owner yet")
+
+    def test_an_enum_payload_of_an_owner_is_refused(self):
+        error = fail_on("(mod m)(type e (enum (held (own :i64)) (nothing)))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning enum payloads are not supported yet")
+
+    def test_an_enum_payload_that_contains_an_owner_is_refused(self):
+        error = fail_on("(mod m)(type e (enum (held (opt (own :i64))) (nothing)))")
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning enum payloads are not supported yet")
+
+    # -- reads: no expression may hand out a second owner ------------------
+
+    def test_vec_get_of_an_owner_is_refused(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (letmut v (vec (own :i64)) (make (vec (own :i64))))"
+            " (vec-push v p)"
+            " (free (vec-get v 0)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "an owner cannot be read out of a place yet")
+        self.assertEqual(error.path, "m/f/5/0")
+
+    def test_arr_get_of_an_owner_is_refused(self):
+        # Nothing can build an array of owners (E0002 above), but a parameter
+        # can still name the type; the element read is refused for the same
+        # reason a field read is.
+        error = fail_on(
+            "(mod m)(fn f :void ((a (arr (own :i64) 2))) (let p (arr-get a 0)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "an owner cannot be read out of a place yet")
+
+    def test_deref_of_an_owning_pointer_is_refused(self):
+        # ``(alloc (own T) n)`` is the one way to make an owner whose pointee
+        # is itself an owner: nothing is initialised, but the read would hand
+        # the inner address out as a second owner.
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc (own :i64) 1))"
+            " (let q (deref p)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(error.message, "an owner cannot be read out of a place yet")
+
+    def test_storing_an_owner_inside_another_is_refused(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc (own :i64) 1))"
+            " (letmut q (alloc :i64 1))"
+            " (set-deref p q))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "an owner cannot be stored inside an owner yet")
+
+    # -- what still works --------------------------------------------------
+
+    def test_a_direct_owner_binding_allocates_derefs_and_frees(self):
+        checked(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (set-deref p 9)"
+            " (let x :i64 (deref p))"
+            " (free p))"
+        )
 
     def test_an_optional_of_an_owner_moves_the_owner(self):
         error = fail_on(
@@ -609,71 +730,15 @@ class NestedOwnerMoveTest(unittest.TestCase):
         self.assertEqual(error.code, "E0300")
         self.assertEqual(error.message, "use after move of 'p'")
 
-    def test_an_enum_payload_of_an_optional_owner_moves_the_owner(self):
+    def test_a_try_of_an_owning_ok_payload_moves_the_result(self):
         error = fail_on(
-            "(mod m)(type e (enum (held (opt (own :i64))) (nothing)))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let h (held (some p)))"
-            " (free p))"
+            "(mod m)(type err (enum (eof)))"
+            "(fn f :(res :i64 err) ((r :(res (opt (own :i64)) err)))"
+            " (let o (try r))"
+            " (match r ((ok x) (ret (ok 1))) ((err e) (ret (err e)))))"
         )
         self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'p'")
-
-    def test_an_enum_payload_of_a_struct_owner_moves_the_struct(self):
-        error = fail_on(
-            "(mod m)(type box (struct (p (own :i64))))"
-            "(type e (enum (held box) (nothing)))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let b (make box p))"
-            " (let h (held b))"
-            " (free (get b p)))"
-        )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'b'")
-
-    def test_a_struct_holding_an_owner_is_not_copied(self):
-        # The pre-Task-11 hole in its plainest form: `(let c b)` copied the
-        # owner, and the two names each freed it.
-        error = fail_on(
-            "(mod m)(type box (struct (p (own :i64))))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let b (make box p))"
-            " (let c b)"
-            " (free (get c p))"
-            " (free (get b p)))"
-        )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'b'")
-
-    def test_a_second_transfer_of_a_struct_holding_an_owner_is_e0402(self):
-        error = fail_on(
-            "(mod m)(type box (struct (p (own :i64))))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let b (make box p))"
-            " (let c b)"
-            " (let d b)"
-            " (free (get c p)))"
-        )
-        self.assertEqual(error.code, "E0402")
-        self.assertEqual(
-            error.message, "a value containing an owner is not copyable; 'b' moved"
-        )
-
-    def test_an_array_of_owners_moves(self):
-        error = fail_on(
-            "(mod m)(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (letmut q (alloc :i64 1))"
-            " (let a (make (arr (own :i64) 2) p q))"
-            " (let b a)"
-            " (free (arr-get a 0)))"
-        )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'a'")
+        self.assertEqual(error.message, "use after move of 'r'")
 
     def test_a_capturing_closure_cannot_be_an_enum_payload(self):
         # Fix round 1 claimed `_construct` covered this; only `(ok ...)` and
@@ -689,41 +754,6 @@ class NestedOwnerMoveTest(unittest.TestCase):
         self.assertEqual(error.code, "E0502")
         self.assertEqual(
             error.message, "a closure that captures cannot leave its function"
-        )
-
-    def test_an_enum_holding_an_owner_is_not_copied(self):
-        error = fail_on(
-            "(mod m)(type box (struct (p (own :i64))))"
-            "(type e (enum (held box) (nothing)))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let b (make box p))"
-            " (let h (held b))"
-            " (let k h)"
-            " (match h ((held x) (free (get x p))) (nothing (ret))))"
-        )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'h'")
-
-    def test_a_try_of_an_owning_ok_payload_moves_the_result(self):
-        error = fail_on(
-            "(mod m)(type err (enum (eof)))"
-            "(type box (struct (p (own :i64))))"
-            "(fn f :(res :i64 err) ((r :(res box err)))"
-            " (let b (try r))"
-            " (match r ((ok x) (ret (ok 1))) ((err e) (ret (err e)))))"
-        )
-        self.assertEqual(error.code, "E0300")
-        self.assertEqual(error.message, "use after move of 'r'")
-
-    def test_a_single_owner_released_through_its_field_still_checks(self):
-        # The rule is about copies, not about storing: one owner, released.
-        checked(
-            "(mod m)(type box (struct (p (own :i64))))"
-            "(fn f :void ()"
-            " (letmut p (alloc :i64 1))"
-            " (let b (make box p))"
-            " (free (get b p)))"
         )
 
 
@@ -831,7 +861,7 @@ class ResultsExecTest(unittest.TestCase):
         "try-inside-one-expression": "14\n",
         "try-inside-a-loop": "21\n",
         "owner-in-an-optional": "5\n",
-        "owner-in-an-enum-payload": "7\n",
+        "owner-in-a-binding": "9\n",
     }
 
     def test_every_case(self):

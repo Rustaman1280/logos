@@ -26,7 +26,6 @@ from logos.types import Own, Prim, Ptr, StructRef, Ty
 ROOT = Path(__file__).resolve().parents[1]
 MEM = ROOT / "tests" / "mem"
 LEAK = MEM / "leak.logos"
-DOUBLE_FREE = MEM / "double-free.logos"
 
 
 def checked(source: str) -> CheckedModule:
@@ -576,21 +575,21 @@ class MemoryExecTest(unittest.TestCase):
                     f"{where}: R0003: allocation size overflows\n",
                 )
 
-    def test_a_stale_copy_after_a_new_allocation_panics_r0002(self):
-        # The block is freed, a new one is allocated, and only then does the
-        # stale copy reach rt_free. In a debug build the freed address cannot
-        # be recycled, so the dead record is still there and the panic names
-        # the original allocation.
-        case = "stale-copy-after-reuse-panics"
-        style = checked(DOUBLE_FREE.read_text(encoding="utf-8"))
-        first = path_in(style, case, "alloc")
-        for opt in ("-O0", "-O2"):
-            with self.subTest(opt=opt):
-                done = self.run_test(DOUBLE_FREE, case, f"double-free-{case}", 0, opt)
-                self.assertEqual(done.returncode, 2, done.stderr)
-                self.assertEqual(
-                    done.stderr, f"{first}: R0002: double free\n"
-                )
+    def test_a_struct_field_pointer_can_no_longer_double_free(self):
+        # R7: this corpus case used to be a run-time R0002 — the same field
+        # read twice handed out two copies of one owning pointer. An owner now
+        # lives only in a binding or a parameter, so the field is refused where
+        # it is declared and the double free cannot be written. The runtime's
+        # own R0002 path is still covered from C in RuntimeTrackerTest.
+        error = fail_on(
+            "(mod double-free)(type holder (struct (p (own :i64))))"
+            "(test double-free-panics"
+            " (let h holder (make holder (alloc :i64 2)))"
+            " (free (get h p))"
+            " (free (get h p)))"
+        )
+        self.assertEqual(error.code, "E0002")
+        self.assertEqual(error.message, "owning fields are not supported yet")
 
     def test_a_release_build_says_nothing_about_leaks(self):
         source = ROOT / "build" / "mem-release.logos"
@@ -609,22 +608,6 @@ class MemoryExecTest(unittest.TestCase):
                 done = subprocess.run([out], capture_output=True, text=True)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(done.stderr, "")
-
-    def test_a_double_free_panics_with_r0002(self):
-        case = "double-free-panics"
-        style = checked(DOUBLE_FREE.read_text(encoding="utf-8"))
-        # The panic names where the block was allocated, which is the one place
-        # a person can find the pointer that was handed back twice.
-        first = path_in(style, case, "alloc")
-        for opt in ("-O0", "-O2"):
-            with self.subTest(opt=opt):
-                done = self.run_test(DOUBLE_FREE, case, "double-free", 0, opt)
-                self.assertEqual(done.returncode, 2, done.stderr)
-                self.assertEqual(done.stdout, "")
-                self.assertTrue(
-                    done.stderr.startswith(f"{first}: R0002: double free"),
-                    done.stderr,
-                )
 
 
 class RuntimeTrackerTest(unittest.TestCase):
