@@ -252,6 +252,17 @@ and released by `join`, so a thread nobody joins is reported at its `spawn`.
 The leak tracker itself is thread safe: one mutex guards its table, counters
 and report snapshot.
 
+Two limits a reader must know. A mutex held by a thread that exited stays
+locked, so the next `lock` blocks forever. An unjoined thread's allocations
+may or may not appear in the report, because the report is a snapshot taken
+at exit.
+
+`-O0` and `-O2` must agree for race-free programs only. A deliberate data
+race on `(shared T)` has no defined result, so no test may pin its output.
+The `(shared ...)` check descends through aggregates: a struct, array, enum
+or optional that carries a bare pointer is refused as a thread argument, and
+`(shared (ptr T))` is the marked spelling at any depth.
+
 ### Modules
 
 One file, one module, file name equals module name. `(use other)` imports.
