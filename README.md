@@ -179,6 +179,13 @@ make fmt     # python3 -m logos fmt .
 make clean   # remove build output and caches
 ```
 
+## Contribute
+
+Read `AGENTS.md` first if you are an AI agent, or `CONTRIBUTING.md` if you are a
+person; `tools/pr_gate.sh` runs every gate a pull request must pass. The
+repository accepts pull requests from humans and from AI agents acting through
+their operator's account.
+
 ## Layout
 
 | Path | Purpose |
