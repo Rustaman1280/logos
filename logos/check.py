@@ -56,6 +56,12 @@ which is what makes a double free a compile error in the direct case. A move
 is only legal out of a ``letmut`` or a parameter (E0302): a plain ``let``
 promised to hold the same value for its whole scope, while ``free`` destroys
 the value rather than transferring it and so is allowed on any owning binding.
+A type that *contains* an owner by value — ``(opt (own T))``, ``(res (own T)
+E)``, a struct or an enum payload, an array — has no copy either, so binding
+it, passing it, returning it or storing it in any construction moves it, and
+that move needs no ``letmut`` for the same reason a vector's does not: the
+binding is emptied, not reused. A ``match`` consumes a scrutinee that owns
+something because its arm binds the payload, and a second transfer is E0402.
 Moves are tracked per binding and conservatively across branches: each
 ``if`` branch, ``while`` body and ``match`` arm is checked from the ownership
 state as it was before the first branch, so one branch's move cannot make a
@@ -279,6 +285,7 @@ from logos.types import (
     Vec,
     compatible,
     has_typevar,
+    holds_owner,
     holds_vector,
     parse_type,
     substitute,
@@ -939,8 +946,9 @@ class _Env:
 
     ``tvars`` is the substitution the enclosing definition's type variables
     stand for: empty outside a generic, the concrete arguments inside an
-    instantiation. ``structs`` is the layout namespace, so a captured value
-    that holds a ``(vec T)`` is recognised as one.
+    instantiation. ``structs`` and ``enums`` are the layout namespace, so a
+    captured value that holds a ``(vec T)`` or an ``(own T)`` — however deeply
+    nested — is recognised as one.
     """
 
     def __init__(
@@ -952,6 +960,7 @@ class _Env:
         outer: "_Env | None" = None,
         tvars: dict[str, Ty] | None = None,
         structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+        enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
     ) -> None:
         self.fns = dict(fns)
         self.scopes: list[dict[str, _Var]] = [{}]
@@ -963,6 +972,7 @@ class _Env:
         self.outer = outer
         self.tvars = dict(tvars or {})
         self.structs = structs or {}
+        self.enums = enums or {}
         #: The names this closure copied out of ``outer``, in first-use order.
         self.captures: list[tuple[str, Ty]] = []
 
@@ -1041,7 +1051,11 @@ class _Env:
             return None
         if found.moved:
             raise diag(USE_AFTER_MOVE, where, f"use after move of '{name}'")
-        if isinstance(found.ty, Own) or holds_vector(found.ty, self.structs):
+        if (
+            isinstance(found.ty, Own)
+            or holds_vector(found.ty, self.structs)
+            or holds_owner(found.ty, self.structs, self.enums)
+        ):
             # A closure environment holds copies. An owning value has no copy,
             # and an environment no statement can name could never release the
             # one it would otherwise share.
@@ -1347,6 +1361,7 @@ class _Checker:
             ret=sig.ret,
             label=f"function '{name}'",
             structs=self._structs,
+            enums=self._enums,
         )
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
@@ -1364,7 +1379,11 @@ class _Checker:
         if name is None or name.startswith(":"):
             raise diag(UNKNOWN_NODE, node.path, "test needs a name")
         env = _Env(
-            fns, ret=Prim("void"), label=f"test '{name}'", structs=self._structs
+            fns,
+            ret=Prim("void"),
+            label=f"test '{name}'",
+            structs=self._structs,
+            enums=self._enums,
         )
         for item in node.items[2:]:
             if not isinstance(item, Node):
@@ -1392,6 +1411,7 @@ class _Checker:
             label=f"function '{name}'",
             tvars=env.tvars,
             structs=self._structs,
+            enums=self._enums,
         )
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
@@ -1709,10 +1729,10 @@ class _Checker:
                 _at(init, node),
                 f"cannot bind '{name}' to a :void value",
             )
-        if isinstance(ty, Own) or holds_vector(ty, self._structs):
+        if self._move_only(ty):
             # An owning pointer is not copied into a second binding, and
-            # neither is a value that contains a vector: the initialiser's
-            # value moves here, and the old name is empty.
+            # neither is a value that contains one or a vector anywhere: the
+            # initialiser's value moves here, and the old name is empty.
             self._consume(init, env, node.path)
         bound = declared if declared is not None else ty
         if isinstance(declared, FnTy) and isinstance(ty, FnTy):
@@ -1766,7 +1786,7 @@ class _Checker:
                 node.path,
                 f"cannot overwrite '{name}': its result was never handled",
             )
-        if isinstance(var.ty, Own) or holds_vector(var.ty, self._structs):
+        if self._move_only(var.ty):
             if var.moved:
                 # The old value may already have been released, and a write
                 # that happens to be on this path does not undo that: one
@@ -1847,15 +1867,17 @@ class _Checker:
                 f"if branches do not match: {then} and {otherwise}",
             )
         then = _merge_functions(then, otherwise)
-        if holds_vector(then, self._structs):
-            # R7: the result would be a second descriptor for a buffer one of
-            # the arms still owns, so freeing it would free it twice. Form
-            # moves are what would make the arms give the value up; until then
-            # the choice is refused.
+        if self._move_only(then):
+            # R7/R6: the result would be a second descriptor for a buffer — or
+            # a second owner of a block — one of the arms still owns, so
+            # freeing it would free it twice. Form moves are what would make
+            # the arms give the value up; until then the choice is refused.
             raise diag(
                 VEC_MOVE,
                 node.path,
-                "a vector cannot be selected by if or match",
+                "a vector cannot be selected by if or match"
+                if holds_vector(then, self._structs)
+                else "an owning value cannot be selected by if or match",
             )
         return then
 
@@ -1951,6 +1973,11 @@ class _Checker:
         ty = self._value(scrutinee, env, None, node.path)
         if isinstance(ty, Prim) and ty.name in INTEGERS:
             return self._integer_match(node, env, expected, ty, arms)
+        if self._move_only(ty):
+            # An arm binds its payload by copy, so a scrutinee that owns
+            # something gives it up: exactly one arm runs and the binding it
+            # makes holds the only owner afterwards.
+            self._consume(scrutinee, env, node.path)
         variants = self._variants_of(ty, node)
         # Whichever family this is, every arm's pattern is read once here and
         # the plan is reused: the tag the arm tests and the name it binds come
@@ -2036,13 +2063,16 @@ class _Checker:
                 )
             else:
                 result = _merge_functions(result, arm)
-        if result is not None and holds_vector(result, self._structs):
-            # R7, the same rule as ``if``: an arm still owns the buffer the
-            # result descriptor names, so the result would be a second owner.
+        if result is not None and self._move_only(result):
+            # R7/R6, the same rule as ``if``: an arm still owns the buffer or
+            # the block the result names, so the result would be a second
+            # owner.
             raise diag(
                 VEC_MOVE,
                 node.path,
-                "a vector cannot be selected by if or match",
+                "a vector cannot be selected by if or match"
+                if holds_vector(result, self._structs)
+                else "an owning value cannot be selected by if or match",
             )
         return result  # type: ignore[return-value]
 
@@ -2134,8 +2164,8 @@ class _Checker:
                 node.path,
                 f"{env.label} returns {env.ret}, found {value}",
             )
-        if isinstance(env.ret, Own):
-            # Returning an owning pointer hands it to the caller.
+        if self._move_only(env.ret):
+            # Returning an owning value hands it to the caller.
             self._consume(args[0], env, node.path)
         if isinstance(env.ret, Res):
             # The value leaves the function: its error slot is the caller's to
@@ -2197,7 +2227,7 @@ class _Checker:
                         _at(item, node),
                         f"field '{field}' of '{ty.name}' expects {fty}, found {got}",
                     )
-                if isinstance(fty, Own):
+                if self._move_only(fty):
                     self._consume(item, env, node.path)
             return ty
         if isinstance(ty, Arr):
@@ -2220,7 +2250,7 @@ class _Checker:
                         _at(item, node),
                         f"cannot store {got} in {ty}",
                     )
-                if isinstance(ty.elem, Own):
+                if self._move_only(ty.elem):
                     self._consume(item, env, node.path)
             return ty
         if isinstance(ty, EnumRef):
@@ -2297,7 +2327,7 @@ class _Checker:
                     _at(items[3], node),
                     f"field '{field}' of '{var.ty.name}' expects {fty}, found {got}",
                 )
-            if isinstance(fty, Own):
+            if self._move_only(fty):
                 self._consume(items[3], env, node.path)
             return Prim("void")
         raise diag(
@@ -2368,7 +2398,7 @@ class _Checker:
                 _at(items[3], node),
                 f"cannot store {got} in {var.ty}",
             )
-        if isinstance(var.ty.elem, Own):
+        if self._move_only(var.ty.elem):
             self._consume(items[3], env, node.path)
         return Prim("void")
 
@@ -2517,7 +2547,7 @@ class _Checker:
                 _at(node.items[2], node),
                 f"cannot push {got} into {ty}",
             )
-        if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
+        if self._move_only(ty.elem):
             # The element is a place this language cannot name afterwards —
             # ``vec-free`` takes a binding or a parameter, not an element — so
             # the value moved into the buffer can never be released, but it
@@ -2560,7 +2590,7 @@ class _Checker:
             raise diag(
                 TYPE_MISMATCH, _at(node.items[3], node), f"cannot store {got} in {ty}"
             )
-        if isinstance(ty.elem, Own) or holds_vector(ty.elem, self._structs):
+        if self._move_only(ty.elem):
             # Same move as ``vec-push``: storing a descriptor in an element
             # would otherwise leave the source naming the same buffer.
             self._consume(node.items[3], env, node.path)
@@ -2708,7 +2738,7 @@ class _Checker:
                 _at(items[2], node),
                 f"cannot store {got} through {ty}",
             )
-        if isinstance(elem, Own) or holds_vector(elem, self._structs):
+        if self._move_only(elem):
             # A stored descriptor must be the only one: the memory behind a
             # raw pointer is not a place a ``vec-free`` can name either, so
             # the value is moved, not copied.
@@ -2774,6 +2804,21 @@ class _Checker:
                     return max(self._origin_loop(arm, env, ty) for arm in arms)
         return env.loop
 
+    def _move_only(self, ty: Ty) -> bool:
+        """Whether a value of ``ty`` has no copy at all.
+
+        An ``(own T)`` is the owning pointer itself; anything that contains one
+        or a ``(vec T)`` by value — an optional, a result, an array, a struct
+        field, an enum payload, however deeply nested — is the same: copying it
+        would give two names one block. A ``(ptr T)`` is an address and copies,
+        and so does a closure type: neither owns anything by value.
+        """
+        if isinstance(ty, Own):
+            return True
+        return holds_vector(ty, self._structs) or holds_owner(
+            ty, self._structs, self._enums
+        )
+
     def _consume(
         self, item: Node | Token, env: _Env, where: str, *, release: bool = False
     ) -> None:
@@ -2786,22 +2831,24 @@ class _Checker:
         destroys the value rather than handing it on. A parameter may always be
         moved, because its value was given up by the caller already.
 
-        A value that contains a ``(vec T)`` is different: copying it would give
-        two bindings one buffer, and this language has no rule for that, so a
-        second name for such a value is always a move. It is therefore allowed
-        out of a plain ``let`` as well — the alternative is not a stable
-        binding but a second owner — and the source is empty afterwards, which
-        is what makes the ``let``'s promise true rather than broken.
+        A value that contains a ``(vec T)`` or an ``(own T)`` is different:
+        copying it would give two bindings one buffer or one block, and this
+        language has no rule for that, so a second name for such a value is
+        always a move. It is therefore allowed out of a plain ``let`` as well —
+        the alternative is not a stable binding but a second owner — and the
+        source is empty afterwards, which is what makes the ``let``'s promise
+        true rather than broken.
         """
         if not (isinstance(item, Token) and item.kind == ATOM):
             return
         var = env.lookup(item.value, where)
         if var is None or var.moved:
             return
-        vector = holds_vector(var.ty, self._structs)
-        if not (isinstance(var.ty, Own) or vector):
+        if not self._move_only(var.ty):
             return
-        if vector:
+        if not isinstance(var.ty, Own):
+            # Structural ownership travels with the value, so the move needs no
+            # ``letmut``: the binding is not being reused, it is being emptied.
             var.moved = True
             return
         if not release and not var.mutable and not var.param:
@@ -2813,14 +2860,14 @@ class _Checker:
         var.moved = True
 
     def _transfer(self, item: Node | Token, env: _Env, where: str) -> None:
-        """Refuse a second transfer of a value that contains a vector.
+        """Refuse a second transfer of a value that has no copy.
 
         Binding or passing such a value moves it, so the source is empty
         afterwards. Reaching it again means the program asked for a second
-        value where there is one buffer, and the answer is neither a copy (two
-        owners of one allocation) nor a use-after-move (the value is still
-        here, it just left): it is E0402, which names the reason. A plain read
-        of the empty binding is still E0300.
+        value where there is one buffer or one block, and the answer is neither
+        a copy (two owners of one allocation) nor a use-after-move (the value
+        is still here, it just left): it is E0402, which names the reason. A
+        plain read of the empty binding is still E0300.
         """
         if not (isinstance(item, Token) and item.kind == ATOM):
             return
@@ -2832,6 +2879,12 @@ class _Checker:
                 VEC_MOVE,
                 where,
                 f"a value containing a vector is not copyable; '{item.value}' moved",
+            )
+        if holds_owner(var.ty, self._structs, self._enums):
+            raise diag(
+                VEC_MOVE,
+                where,
+                f"a value containing an owner is not copyable; '{item.value}' moved",
             )
 
     # -- results and optionals --------------------------------------------
@@ -2877,6 +2930,9 @@ class _Checker:
                 f"'{node.kind}' expects {wanted}, found {value}",
             )
         self._refuse_carried(value, args[0], node, "a result")
+        # A result is built by copying its slot; when the slot owns something,
+        # the value moves instead and the source is empty.
+        self._consume(args[0], env, node.path)
         return expected
 
     def _some(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
@@ -2893,6 +2949,9 @@ class _Checker:
                 f"'some' expects {elem}, found {value}",
             )
         self._refuse_carried(value, args[0], node, "an optional")
+        # An optional holds its element by value, so an owning element moves
+        # into it rather than being copied.
+        self._consume(args[0], env, node.path)
         return Opt(elem if elem is not None else value)
 
     def _none(self, node: Node, env: _Env, expected: Ty | None) -> Ty:
@@ -2939,6 +2998,11 @@ class _Checker:
         # The error is the caller's to handle now; the ok value is this
         # expression's.
         self._handled(args[0], env)
+        if self._move_only(inner.ok):
+            # ``try`` hands the ok payload out by value. When it owns
+            # something the result gives it up, exactly as a construction
+            # does, so the source cannot be read again.
+            self._consume(args[0], env, node.path)
         return inner.ok
 
     def _handled(self, item: Node | Token, env: _Env) -> None:
@@ -3031,6 +3095,9 @@ class _Checker:
                     f"variant '{name}' holds {payload}, found {value}",
                 )
             self._refuse_carried(value, args[0], node, f"enum '{enum}'")
+            # The payload area holds the value by copy, so anything owning
+            # moves into the variant and the source is empty afterwards.
+            self._consume(args[0], env, node.path)
         return EnumRef(enum)
 
     def _printer(self, node: Node, env: _Env) -> Ty:
@@ -3119,6 +3186,10 @@ class _Checker:
                 # A vector argument is a transfer, not a copy: the same
                 # argument twice is E0402 at the second one.
                 self._transfer(arg, env, node.path)
+            elif self._move_only(param):
+                # An owner travels the same way: a second transfer of the same
+                # binding is E0402 rather than a read of an empty slot.
+                self._transfer(arg, env, node.path)
             ty = self._value(arg, env, param, node.path)
             if _escapes(ty):
                 # R12: a capturing closure's environment is a slot in this
@@ -3134,7 +3205,7 @@ class _Checker:
                     _at(arg, node),
                     f"argument {index} of '{name}' expects {param}, found {ty}",
                 )
-            if isinstance(param, Own) or holds_vector(param, self._structs):
+            if self._move_only(param):
                 # The callee owns what it is handed: the argument moves into
                 # the parameter and the caller's binding is empty afterwards.
                 self._consume(arg, env, node.path)
@@ -3176,6 +3247,10 @@ class _Checker:
                         VEC_MOVE, _at(arg, node), "a vector argument must be a name"
                     )
                 self._transfer(arg, env, node.path)
+            elif self._move_only(param):
+                # An owning argument is a transfer too, whether the type is
+                # written out or fixed by unification.
+                self._transfer(arg, env, node.path)
             hint = None if has_typevar(param) else param
             ty = self._value(arg, env, hint, node.path)
             if _escapes(ty):
@@ -3205,7 +3280,10 @@ class _Checker:
                     )
                 self._transfer(arg, env, node.path)
                 self._consume(arg, env, node.path)
-            elif isinstance(concrete, Own):
+            elif self._move_only(concrete):
+                # R6: a bare type variable fixed by this argument to a type
+                # that owns something moves here for the same reason.
+                self._transfer(arg, env, node.path)
                 self._consume(arg, env, node.path)
             if isinstance(concrete, Res):
                 self._handled(arg, env)
@@ -3307,6 +3385,7 @@ class _Checker:
             label=f"function '{instance.name}'",
             tvars=subst,
             structs=self._structs,
+            enums=self._enums,
         )
         for index, param in enumerate(_param_nodes(_params_item(node), node.path)):
             param_name, _ = _param_parts(param)
@@ -3344,6 +3423,7 @@ class _Checker:
             outer=env,
             tvars=env.tvars,
             structs=self._structs,
+            enums=self._enums,
         )
         for (param_name, param_ty), param_node in zip(
             params, _param_nodes(_closure_params(node), node.path)

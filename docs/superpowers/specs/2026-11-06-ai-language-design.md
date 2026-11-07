@@ -139,8 +139,13 @@ Nothing here is undefined behaviour, so a C oracle can check it:
   Binding such a value moves it; reading the source afterwards is E0300.
   Two bindings never share a buffer.
 - The same holds for any type that contains an `(own T)` at any depth:
-  `(opt (own T))`, `(res (own T) E)`, a struct with an owning field. Any
-  transfer or construction moves the source, so two owners never exist.
+  `(opt (own T))`, `(res (own T) E)`, a struct with an owning field, an
+  array or an enum whose payload does. Any transfer or construction moves
+  the source: a `let`, a call argument, a `ret`, `make`, `set-field`,
+  `arr-set`, `vec-push`, `vec-set`, `ok`/`err`/`some`, an enum payload,
+  `set-deref`, a `try` and a `match` scrutinee. Reading the source
+  afterwards is E0300 and a second transfer of it is E0402, so two owners
+  never exist.
 - A `(vec T)` may not be a struct field or a fixed-array element yet,
   because no place expression exists to release its buffer.
 - A `:str` owns nothing. Concatenation produces a process-lifetime buffer,

@@ -33,6 +33,10 @@
 
 (type holder (struct (failure parse-error)))
 
+(type owned-box (struct (p (own :i64))))
+
+(type owned-thing (enum (held owned-box) (nothing)))
+
 (test match-ok
   (expect (out "7\n")
     (code 0)
@@ -184,3 +188,24 @@
     (code 0)
     (leaks 0))
   (println (match (sum-upto) ((ok v) v) ((err e) 0))))
+
+(test owner-in-an-optional
+  (expect (out "5\n")
+    (code 0)
+    (leaks 0))
+  (letmut p (alloc :i64 1))
+  (set-deref p 5)
+  (let o (some p))
+  (match o ((some q) (println (deref q)) (free q))
+    (none (println 0))))
+
+(test owner-in-an-enum-payload
+  (expect (out "7\n")
+    (code 0)
+    (leaks 0))
+  (letmut p (alloc :i64 1))
+  (set-deref p 7)
+  (let b (make owned-box p))
+  (let h (held b))
+  (match h ((held x) (println (deref (get x p))) (free (get x p)))
+    (nothing (println 0))))

@@ -395,6 +395,58 @@ def holds_vector(
     return walk(ty)
 
 
+def holds_owner(
+    ty: Ty,
+    structs: dict[str, tuple[tuple[str, Ty], ...]] | None = None,
+    enums: dict[str, tuple[tuple[str, Ty | None], ...]] | None = None,
+) -> bool:
+    """Whether ``ty`` is or contains an ``(own T)`` by value.
+
+    An owning pointer is the one value with no copy, so anything holding one
+    by value has none either: ``(opt (own T))``, ``(res (own T) E)``, a fixed
+    array of owners, a struct with an owning field, and an enum whose payload
+    does. Copying such a value gives two names for one block, and whichever
+    released it first would leave the other reading freed memory — genuine
+    undefined behaviour, not merely a leak.
+
+    A pointer to an owner is not one: ``(ptr (own T))`` is an address, which
+    copies like any other word. The walk stops there, exactly as
+    :func:`holds_vector` does.
+
+    ``structs`` and ``enums`` supply the field and variant lists when they are
+    known. A struct or enum that contains itself by value is refused before
+    this is asked (E0002), so ``seen`` is defence against a hand-built table,
+    not a case the checker reaches.
+    """
+    seen: set[str] = set()
+
+    def walk(node: Ty) -> bool:
+        if isinstance(node, Own):
+            return True
+        if isinstance(node, (Arr, Opt)):
+            return walk(node.elem)
+        if isinstance(node, Res):
+            return walk(node.ok) or walk(node.err)
+        if isinstance(node, StructRef) and structs is not None:
+            key = "struct:" + node.name
+            if key in seen:
+                return False
+            seen.add(key)
+            return any(walk(field) for _, field in structs.get(node.name, ()))
+        if isinstance(node, EnumRef) and enums is not None:
+            key = "enum:" + node.name
+            if key in seen:
+                return False
+            seen.add(key)
+            return any(
+                payload is not None and walk(payload)
+                for _, payload in enums.get(node.name, ())
+            )
+        return False
+
+    return walk(ty)
+
+
 def _atom(token: Token, where: str) -> Ty:
     if token.kind != ATOM:
         raise diag(UNKNOWN_TYPE, where, f"expected a type, found {token.kind.lower()}")

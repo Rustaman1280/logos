@@ -579,6 +579,154 @@ class VariantConstructorTest(unittest.TestCase):
         self.assertIn("more than one enum", error.message)
 
 
+class NestedOwnerMoveTest(unittest.TestCase):
+    """R6: a type that contains an ``(own T)`` has no copy, however nested.
+
+    The value is built once, by moving its owner into the optional, result,
+    struct, array or enum payload; reading the source afterwards is E0300 and a
+    second transfer of it is E0402. Before this, ``(let o (some p)) (free p)``
+    compiled and freed the same block twice — a silent double free in a release
+    build — and a struct holding an owner could be copied.
+    """
+
+    def test_an_optional_of_an_owner_moves_the_owner(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let o (some p))"
+            " (free p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'p'")
+
+    def test_a_result_of_an_owner_moves_the_owner(self):
+        error = fail_on(
+            "(mod m)(type err (enum (eof)))(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let r :(res (own :i64) err) (ok p))"
+            " (free p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'p'")
+
+    def test_an_enum_payload_of_an_optional_owner_moves_the_owner(self):
+        error = fail_on(
+            "(mod m)(type e (enum (held (opt (own :i64))) (nothing)))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let h (held (some p)))"
+            " (free p))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'p'")
+
+    def test_an_enum_payload_of_a_struct_owner_moves_the_struct(self):
+        error = fail_on(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(type e (enum (held box) (nothing)))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let b (make box p))"
+            " (let h (held b))"
+            " (free (get b p)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'b'")
+
+    def test_a_struct_holding_an_owner_is_not_copied(self):
+        # The pre-Task-11 hole in its plainest form: `(let c b)` copied the
+        # owner, and the two names each freed it.
+        error = fail_on(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let b (make box p))"
+            " (let c b)"
+            " (free (get c p))"
+            " (free (get b p)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'b'")
+
+    def test_a_second_transfer_of_a_struct_holding_an_owner_is_e0402(self):
+        error = fail_on(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let b (make box p))"
+            " (let c b)"
+            " (let d b)"
+            " (free (get c p)))"
+        )
+        self.assertEqual(error.code, "E0402")
+        self.assertEqual(
+            error.message, "a value containing an owner is not copyable; 'b' moved"
+        )
+
+    def test_an_array_of_owners_moves(self):
+        error = fail_on(
+            "(mod m)(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (letmut q (alloc :i64 1))"
+            " (let a (make (arr (own :i64) 2) p q))"
+            " (let b a)"
+            " (free (arr-get a 0)))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'a'")
+
+    def test_a_capturing_closure_cannot_be_an_enum_payload(self):
+        # Fix round 1 claimed `_construct` covered this; only `(ok ...)` and
+        # `(some ...)` had a test, so deleting the call left the suite green.
+        error = fail_on(
+            "(mod m)(type e (enum (held (fn () :i64)) (nothing)))"
+            "(fn f :void ()"
+            " (let n 1)"
+            " (let h (fn :i64 () (ret n)))"
+            " (let x (held h))"
+            " (ret))"
+        )
+        self.assertEqual(error.code, "E0502")
+        self.assertEqual(
+            error.message, "a closure that captures cannot leave its function"
+        )
+
+    def test_an_enum_holding_an_owner_is_not_copied(self):
+        error = fail_on(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(type e (enum (held box) (nothing)))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let b (make box p))"
+            " (let h (held b))"
+            " (let k h)"
+            " (match h ((held x) (free (get x p))) (nothing (ret))))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'h'")
+
+    def test_a_try_of_an_owning_ok_payload_moves_the_result(self):
+        error = fail_on(
+            "(mod m)(type err (enum (eof)))"
+            "(type box (struct (p (own :i64))))"
+            "(fn f :(res :i64 err) ((r :(res box err)))"
+            " (let b (try r))"
+            " (match r ((ok x) (ret (ok 1))) ((err e) (ret (err e)))))"
+        )
+        self.assertEqual(error.code, "E0300")
+        self.assertEqual(error.message, "use after move of 'r'")
+
+    def test_a_single_owner_released_through_its_field_still_checks(self):
+        # The rule is about copies, not about storing: one owner, released.
+        checked(
+            "(mod m)(type box (struct (p (own :i64))))"
+            "(fn f :void ()"
+            " (letmut p (alloc :i64 1))"
+            " (let b (make box p))"
+            " (free (get b p)))"
+        )
+
+
 class ResultLoweringTest(unittest.TestCase):
     def test_a_result_is_a_tag_and_two_slots(self):
         self.assertEqual(
@@ -682,6 +830,8 @@ class ResultsExecTest(unittest.TestCase):
         "alloc-of-an-enum": "7\n",
         "try-inside-one-expression": "14\n",
         "try-inside-a-loop": "21\n",
+        "owner-in-an-optional": "5\n",
+        "owner-in-an-enum-payload": "7\n",
     }
 
     def test_every_case(self):
