@@ -437,17 +437,21 @@ class ControlFlowLoweringTest(unittest.TestCase):
         self.assertIn("%v.1.addr = alloca i8", llvm.emit(m))
 
     def test_a_type_with_no_layout_is_e0002_not_a_value_error(self):
-        # ``(vec T)``, ``(opt T)`` and ``(res T E)`` have layouts now;
-        # ``(shared T)`` belongs to a later task, and a type this backend
-        # cannot spell must still be a diagnostic with a path.
+        # ``(vec T)``, ``(opt T)``, ``(res T E)`` and ``(shared T)`` all have
+        # layouts now. The last one is only a marker for a pointer or a
+        # synchronization handle, so ``(shared :i64)`` is refused where it is
+        # spelled — still with E0002 and a path, never a bare ``ValueError``.
         with self.assertRaises(LogosError) as caught:
             lower.lower_module(
                 checked("(mod m)(fn f :void ((v :(shared :i64))) (ret))")
             )
         error = caught.exception
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
-        self.assertEqual(error.path, "m/f/1/0")
+        self.assertEqual(
+            error.message,
+            "only a pointer, a mutex, a channel or an atomic can be shared",
+        )
+        self.assertEqual(error.path, "m/f/1/0/1")
 
     def test_a_constant_true_loop_has_no_exit_edge(self):
         # Nothing can leave the loop, so the head branches straight to the

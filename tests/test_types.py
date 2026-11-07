@@ -786,15 +786,15 @@ class UnknownFormTest(unittest.TestCase):
         error = expect_error("(mod m)(fn f :i64 () 5 (ret 0))", "E0002")
         self.assertEqual(error.path, "m/f")
 
-    def test_a_form_from_a_later_task_is_an_unknown_function(self):
-        # ``ok``, ``err``, ``some`` and ``none`` are forms now; ``spawn``
-        # arrives with threads (Task 12), so it is still only a name with no
-        # rule and reaches the call path.
+    def test_spawn_of_a_name_that_is_not_a_function_is_e0103(self):
+        # Every language form now has a rule; ``spawn`` names a function, and
+        # a name that is not one is the ordinary unknown-function diagnostic
+        # at the spawn node.
         error = expect_error(
             "(mod m)(fn f :i64 ((p :i32)) (ret (spawn p)))", "E0103"
         )
         self.assertEqual(error.path, "m/f/2/0")
-        self.assertIn("'spawn'", error.message)
+        self.assertIn("'p'", error.message)
 
 
 class CorpusTest(unittest.TestCase):

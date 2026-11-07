@@ -48,6 +48,11 @@ PRIMITIVES = (
     "bool",
     "str",
     "void",
+    # The concurrency handles. Appended after the numeric and printable
+    # vocabulary so ``INTEGERS`` (the first eight) keeps its slice: neither is
+    # a number, and neither has a literal spelling.
+    "thread",
+    "mutex",
 )
 
 INTEGERS = PRIMITIVES[:8]
@@ -55,7 +60,8 @@ FLOATS = ("f32", "f64")
 NUMBERS = INTEGERS + FLOATS
 
 #: The composite type forms, by head name.
-FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared")
+FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared",
+         "chan", "atomic")
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +170,35 @@ class Shared:
 
 
 @dataclass(frozen=True, slots=True)
+class Chan:
+    """A channel of ``T``, ``(chan T)``.
+
+    The value is a handle: an opaque pointer to a runtime ring buffer. The
+    element type is part of the type because ``send`` and ``recv`` type their
+    operand by it; it is not part of the machine value.
+    """
+
+    elem: "Ty"
+
+    def __str__(self) -> str:
+        return f"(chan {self.elem})"
+
+
+@dataclass(frozen=True, slots=True)
+class Atomic:
+    """An atomic cell of ``T``, ``(atomic T)``.
+
+    Like a channel it is a handle: the value is the address of a runtime
+    object, and the element type only types the operations on it.
+    """
+
+    elem: "Ty"
+
+    def __str__(self) -> str:
+        return f"(atomic {self.elem})"
+
+
+@dataclass(frozen=True, slots=True)
 class StructRef:
     """A reference to a named struct, written bare: ``point``."""
 
@@ -194,7 +229,22 @@ class TypeVar:
 
 
 #: Any type value. The alias is recursive, so it lives below the classes.
-Ty = Prim | Ptr | Own | Arr | Vec | Res | Opt | FnTy | Shared | StructRef | EnumRef | TypeVar
+Ty = (
+    Prim
+    | Ptr
+    | Own
+    | Arr
+    | Vec
+    | Res
+    | Opt
+    | FnTy
+    | Shared
+    | Chan
+    | Atomic
+    | StructRef
+    | EnumRef
+    | TypeVar
+)
 
 
 def parse_type(node: "Node | Token", *, path: str = "") -> Ty:
@@ -236,6 +286,10 @@ def parse_type(node: "Node | Token", *, path: str = "") -> Ty:
             parse_type(node.items[1], path=where),
             parse_type(node.items[2], path=where),
         )
+    if kind in ("chan", "atomic"):
+        _count(node, 2, where, f"{kind} takes one element type")
+        elem = parse_type(node.items[1], path=where)
+        return Chan(elem) if kind == "chan" else Atomic(elem)
     if kind in ("fn", "fn*"):
         _count(node, 3, where, f"{kind} takes a parameter list and a return type")
         return FnTy(
@@ -271,6 +325,10 @@ def compatible(a: Ty, b: Ty) -> bool:
         return isinstance(b, Opt) and compatible(a.elem, b.elem)
     if isinstance(a, Shared):
         return isinstance(b, Shared) and compatible(a.elem, b.elem)
+    if isinstance(a, Chan):
+        return isinstance(b, Chan) and compatible(a.elem, b.elem)
+    if isinstance(a, Atomic):
+        return isinstance(b, Atomic) and compatible(a.elem, b.elem)
     if isinstance(a, Vec):
         return isinstance(b, Vec) and compatible(a.elem, b.elem)
     if isinstance(a, Arr):
@@ -307,7 +365,7 @@ def substitute(ty: Ty, bindings: dict[str, Ty]) -> Ty:
         return bindings.get(ty.name, ty)
     if isinstance(ty, Prim):
         return ty
-    if isinstance(ty, (Ptr, Own, Opt, Shared, Vec)):
+    if isinstance(ty, (Ptr, Own, Opt, Shared, Vec, Chan, Atomic)):
         return type(ty)(substitute(ty.elem, bindings))
     if isinstance(ty, Arr):
         return Arr(substitute(ty.elem, bindings), ty.n)
@@ -338,7 +396,7 @@ def typevars(ty: Ty) -> list[str]:
         if isinstance(node, TypeVar):
             if node.name not in found:
                 found.append(node.name)
-        elif isinstance(node, (Ptr, Own, Opt, Shared, Vec)):
+        elif isinstance(node, (Ptr, Own, Opt, Shared, Vec, Chan, Atomic)):
             walk(node.elem)
         elif isinstance(node, Arr):
             walk(node.elem)

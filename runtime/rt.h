@@ -44,9 +44,12 @@ _Noreturn void rt_panic(const char *path, const char *code, const char *msg);
  * block that has been freed; keeping it is what lets a second free name the
  * `alloc` that created the block instead of reporting nothing at all.
  *
- * It is a debug facility. It is not thread safe, and it is not compiled out in
- * this build: Tasks 9 and 12 reuse the same allocator, and Task 12 is where the
- * question of one tracker per process under threads is settled.
+ * It is thread safe. One mutex guards every piece of its state — the table,
+ * the counters and the report's snapshot — because the alternative, a tracker
+ * per thread, would have to merge them at exit anyway, and the map is a debug
+ * facility whose contention is nothing beside the malloc it records. Every
+ * entry point takes the lock, so a thread allocating while another frees sees
+ * one consistent table.
  *
  * What R0002 guarantees, exactly. A double free is caught when the same
  * address is released twice, and a stale owner — a copy of the pointer carried
@@ -168,6 +171,73 @@ int rt_str_eq(const unsigned char *a, size_t an,
 
 /* Format v as decimal text in a new string and store its byte count. */
 unsigned char *rt_str_from_i64(long long v, size_t *out_len);
+
+/* ---------------------------------------------------------------------------
+ * Concurrency
+ *
+ * Threads, mutexes, channels and atomics are pthreads underneath and opaque
+ * handles above: every type in this section crosses to Logos as one `void *`
+ * and is never dereferenced by generated code. They are created here and live
+ * for the life of the process. There is no destroy operation in the language,
+ * so these objects are NOT tracked by the leak tracker: a mutex, a channel or
+ * an atomic that a program cannot release would otherwise be reported as a
+ * leak no program could fix. A thread is the exception, because `join` is its
+ * release: its handle is allocated with rt_alloc, so one that is never joined
+ * is reported at the `spawn` that made it.
+ *
+ * Failures call rt_panic with R0005, `thread operation failed`, at the node
+ * that asked: a thread that could not be started, a join of a handle that is
+ * not a live thread (including a second join), a mutex that could not be
+ * created/locked/unlocked, or a condition variable that failed while a channel
+ * blocked. A non-positive channel capacity is R0003, a runtime check.
+ *
+ * The channel functions copy exactly `elem` bytes per element, so an element
+ * type must be one with a copy; the checker refuses a vector or an owner.
+ * `send` blocks while the ring is full and `recv` while it is empty.
+ * ------------------------------------------------------------------------- */
+
+typedef struct rt_thread rt_thread;
+typedef struct rt_mutex rt_mutex;
+typedef struct rt_chan rt_chan;
+typedef struct rt_atomic rt_atomic;
+
+/* Start `entry(arg)` on a new thread and return its handle.
+ * `path` is the `spawn` node path; the handle is allocated under it, so an
+ * unjoined thread is named where it was started. The runtime owns `arg` from
+ * the moment the thread starts: the entry function receives it, and rt_free
+ * releases it when the entry returns. On a pthread_create failure the thread
+ * never starts, so rt_thread_new releases both and panics R0005. */
+rt_thread *rt_thread_new(const char *path, void *(*entry)(void *), void *arg);
+
+/* Wait for `t` to finish and release its handle.
+ * Panics R0005 with `thread is not running` when `t` is NULL or is not a live
+ * thread handle — which includes a second join of one already joined. */
+void rt_join(rt_thread *t, const char *path);
+
+/* A new error-checking mutex. Relocking it from the thread that holds it is an
+ * error (EDEADLK) rather than a hang, and so is unlocking it from another
+ * thread; both panic R0005. The mutex is untracked and lives for the process. */
+rt_mutex *rt_mutex_new(const char *path);
+void rt_mutex_lock(rt_mutex *m, const char *path);
+void rt_mutex_unlock(rt_mutex *m, const char *path);
+
+/* A channel of `elem`-byte elements with room for `capacity` of them.
+ * A capacity that is not positive is R0003 at `path`; a capacity whose byte
+ * size would overflow is R0003 too. The ring and its buffer are untracked. */
+rt_chan *rt_chan_new(size_t elem, long long capacity, const char *path);
+
+/* Copy one element into the ring, blocking while it is full. */
+void rt_chan_send(rt_chan *c, const void *value, const char *path);
+
+/* Copy one element out of the ring, blocking while it is empty. */
+void rt_chan_recv(rt_chan *c, void *out, const char *path);
+
+/* A 64-bit atomic cell. `:u64` uses the same bits; LLVM has no signedness.
+ * Untracked and process-lifetime, like a mutex. */
+rt_atomic *rt_atomic_new(long long value);
+long long rt_atomic_add(rt_atomic *a, long long delta);
+long long rt_atomic_load(rt_atomic *a);
+void rt_atomic_store(rt_atomic *a, long long value);
 
 #ifdef __cplusplus
 }

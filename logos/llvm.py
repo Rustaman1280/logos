@@ -46,6 +46,8 @@ import re
 from logos.ir import IrBlock, IrDecl, IrFn, IrGlobal, IrModule
 from logos.types import (
     Arr,
+    Atomic,
+    Chan,
     EnumRef,
     FnTy,
     Opt,
@@ -53,6 +55,7 @@ from logos.types import (
     Prim,
     Ptr,
     Res,
+    Shared,
     StructRef,
     Ty,
     Vec,
@@ -75,6 +78,11 @@ _PRIM = {
     "f64": "double",
     "str": "{ i8*, i64 }",
     "void": "void",
+    # A thread handle and a mutex handle are opaque pointers to runtime
+    # objects. Neither is ever dereferenced by generated code, so the pointer
+    # is typed ``i8*`` exactly as the C boundary spells ``void *``.
+    "thread": "i8*",
+    "mutex": "i8*",
 }
 
 #: Opcodes that print as ``dest = op ty a, b``.
@@ -166,6 +174,15 @@ def type_text(ty: Ty) -> str:
             return spelled
     if isinstance(ty, (Ptr, Own)):
         return f"{type_text(ty.elem)}*"
+    if isinstance(ty, (Shared, Chan, Atomic)):
+        # A shared wrapper is a marker, not a layout: the value is exactly the
+        # one it wraps. A channel and an atomic are opaque runtime handles, so
+        # both spell as ``void *`` and never expose their element type to
+        # generated code — the element type is what the operations are typed
+        # by, not what the pointer points at.
+        if isinstance(ty, Shared):
+            return type_text(ty.elem)
+        return "i8*"
     if isinstance(ty, Vec):
         return f"{{ {type_text(ty.elem)}*, i64, i64 }}"
     if isinstance(ty, FnTy):

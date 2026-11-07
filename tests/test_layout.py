@@ -442,17 +442,20 @@ class StructLoweringTest(unittest.TestCase):
         )
         self.assertIn("store i64 5, i64* %t", text)
 
-    def test_a_struct_field_with_no_layout_is_e0002_at_the_use(self):
-        # ``(vec T)`` and ``(opt T)`` are lowerable now; ``(shared T)`` is not,
-        # and a field that names it must be refused where the struct is
-        # materialised.
+    def test_a_shared_scalar_field_is_e0002_at_the_declaration(self):
+        # ``(vec T)``, ``(opt T)`` and ``(shared T)`` are lowerable now; only
+        # ``(shared T)`` around a scalar is meaningless, and it is refused
+        # where the field's type is spelled.
         error = fail_on_lower(
             "(mod m)(type box (struct (v (shared :i64))))"
             "(fn f :void ((b box)) (ret))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
-        self.assertEqual(error.path, "m/f/1/0")
+        self.assertEqual(
+            error.message,
+            "only a pointer, a mutex, a channel or an atomic can be shared",
+        )
+        self.assertEqual(error.path, "m/box/0/0/0")
 
     def test_a_void_field_is_e0002_at_the_use(self):
         error = fail_on_lower(

@@ -856,14 +856,18 @@ class VecLoweringTest(unittest.TestCase):
         self.assertIn("%struct.p = type { i64 }", text)
         self.assertIn("{ %struct.p*, i64, i64 }", text)
 
-    def test_a_vector_of_an_unlowered_type_is_e0002(self):
-        # ``(opt T)`` has a layout now; ``(shared T)`` belongs to a later task
-        # and must still be a diagnostic at the node that named it.
+    def test_a_vector_of_a_bad_shared_type_is_e0002(self):
+        # The shared marker wraps a pointer or a synchronization handle; a
+        # scalar behind it is refused where the vector's element is spelled,
+        # with a path, rather than reaching the backend.
         error = fail_on_lower(
             "(mod m)(fn f :void ((v (vec (shared :i64)))) (ret))"
         )
         self.assertEqual(error.code, "E0002")
-        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
+        self.assertEqual(
+            error.message,
+            "only a pointer, a mutex, a channel or an atomic can be shared",
+        )
 
 
 class FormattingLoweringTest(unittest.TestCase):

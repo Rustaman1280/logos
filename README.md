@@ -39,6 +39,12 @@ an error the caller declares, error types as declared enums with payloads
 (`(type parse-error (enum (bad-digit :u64) (overflow)))`), and exhaustive
 `match` over an enum, a result or an optional. A missing variant is E0600, a
 `try` whose error types differ is E0601, and a result nobody handles is E0602.
+Task 10 adds monomorphised generics and closures that capture by value. Task 12
+adds threads and the synchronization that goes with them: `(spawn f args...)`,
+`(join t)`, `(mutex)`/`lock`/`unlock`, `(chan T n)`/`send`/`recv`, and
+`(atomic T v)`/`atomic-add`/`atomic-load`/`atomic-store`, over pthreads. Shared
+mutable state is marked `(shared ...)`, and handing a thread an unmarked pointer
+or handle is E0700. A pthread failure is R0005.
 Everything else reports a diagnostic at the construct.
 
 ## Requirements

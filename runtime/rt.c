@@ -7,9 +7,16 @@
  * with status 2.
  */
 
+/* POSIX 2008 gives pthread_mutexattr_settype and the error-checking mutex
+ * type. Defining it before any header, rather than relying on the compiler's
+ * default, keeps the runtime's declarations the same at -std=c11, which the
+ * probes use, and at the driver's default dialect. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "rt.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +103,29 @@ static size_t rt_cap;    /* power of two, or 0 before the first allocation */
 static size_t rt_used;   /* slots holding a record */
 static size_t rt_live;   /* records whose block is still allocated */
 static unsigned long long rt_seq;
+
+/* The one lock every tracker operation holds. All of the state above is
+ * guarded by it: a thread that allocates while another frees must see one
+ * table, and the counters must move with the records they count. It is a
+ * debug facility, so the contention is irrelevant beside the malloc each
+ * entry already pays for; a per-thread tracker would buy nothing and would
+ * still need a merge under a global lock at exit, in allocation order.
+ *
+ * A failure to lock is a pthread failure like any other: R0005, and the
+ * process ends rather than touching the table unguarded. */
+static pthread_mutex_t rt_tracker_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void rt_tracker_enter(void) {
+    if (pthread_mutex_lock(&rt_tracker_lock) != 0) {
+        rt_panic(NULL, "R0005", "could not lock the leak tracker");
+    }
+}
+
+static void rt_tracker_leave(void) {
+    if (pthread_mutex_unlock(&rt_tracker_lock) != 0) {
+        rt_panic(NULL, "R0005", "could not unlock the leak tracker");
+    }
+}
 
 /* Mix an address into a bucket index. The low bits of a malloc'd address are
  * the ones worth spreading, so the multiply and the shift both use them. */
@@ -198,6 +228,7 @@ void *rt_alloc(size_t n, size_t align, const char *path) {
     if (p == NULL) {
         rt_panic(path, "R0003", "out of memory");
     }
+    rt_tracker_enter();
     /* Keep the table at most three quarters full, so a probe always reaches an
      * unused slot and rt_find/rt_place terminate. */
     if (rt_cap == 0 || (rt_used + 1) * 4 > rt_cap * 3) {
@@ -221,6 +252,7 @@ void *rt_alloc(size_t n, size_t align, const char *path) {
         b->seq = rt_seq++;
         b->live = 1;
     }
+    rt_tracker_leave();
     return p;
 }
 
@@ -230,6 +262,7 @@ void rt_free(void *p) {
     if (p == NULL) {
         return;
     }
+    rt_tracker_enter();
     b = rt_find(p);
     if (b == NULL) {
         /* Nothing was ever allocated here — not a block this process created,
@@ -246,6 +279,7 @@ void rt_free(void *p) {
     }
     b->live = 0;
     rt_live--;
+    rt_tracker_leave();
 #ifdef LOGOS_DEBUG
     /* Quarantine: the block stays allocated for the life of the process. The
      * address can then never be recycled into a fresh live block, which is
@@ -257,8 +291,33 @@ void rt_free(void *p) {
 #endif
 }
 
+/* Whether this address is a live block. The thread handle's join uses it to
+ * refuse a handle that was already joined before it reads the handle's own
+ * fields: the handle is released by the first join, so the test must be the
+ * tracker's, not the freed memory's. */
+static int rt_is_live_block(void *p) {
+    rt_block *b;
+    int live = 0;
+
+    if (p == NULL) {
+        return 0;
+    }
+    rt_tracker_enter();
+    b = rt_find(p);
+    if (b != NULL && b->live) {
+        live = 1;
+    }
+    rt_tracker_leave();
+    return live;
+}
+
 size_t rt_leak_count(void) {
-    return rt_live;
+    size_t count;
+
+    rt_tracker_enter();
+    count = rt_live;
+    rt_tracker_leave();
+    return count;
 }
 
 /* Write a non-negative decimal count, without printf: the runtime formats its
@@ -278,7 +337,12 @@ static void rt_write_size(int fd, size_t v) {
 }
 
 void rt_leak_report(void) {
-    rt_block **live_blocks;
+    struct rt_leak_line {
+        size_t size;
+        const char *path;
+        unsigned long long seq;
+    };
+    struct rt_leak_line *lines;
     size_t count = 0;
     size_t i;
     size_t j;
@@ -287,42 +351,57 @@ void rt_leak_report(void) {
     static const char middle[] = " bytes at ";
     static const char newline[] = "\n";
 
+    /* Snapshot the live records while the table is locked, then print with the
+     * lock released. Printing under the lock would hold up a thread that is
+     * allocating, and holding pointers into the table would be worse: a
+     * concurrent rt_alloc may grow it, which frees the table the pointers came
+     * from. The snapshot copies the two values and the path literal; nothing
+     * in it depends on the table afterwards. */
+    rt_tracker_enter();
     if (rt_live == 0) {
+        rt_tracker_leave();
         return;
     }
-    live_blocks = calloc(rt_live, sizeof *live_blocks);
-    if (live_blocks == NULL) {
+    lines = calloc(rt_live, sizeof *lines);
+    if (lines == NULL) {
         /* The report is diagnostics; failing to build it must not change the
          * program's exit status or pretend the blocks are gone. */
+        rt_tracker_leave();
         return;
     }
     for (i = 0; i < rt_cap; i++) {
         if (rt_slots[i].ptr != NULL && rt_slots[i].live) {
-            live_blocks[count++] = &rt_slots[i];
+            lines[count].size = rt_slots[i].size;
+            lines[count].path = rt_slots[i].path;
+            lines[count].seq = rt_slots[i].seq;
+            count++;
         }
     }
+    rt_tracker_leave();
+
     /* Allocation order, so two runs of the same program report in the same
-     * order even though the addresses differ. */
+     * order even though the addresses differ. Allocation happens under the
+     * lock, so the sequence numbers are a total order across threads. */
     for (i = 1; i < count; i++) {
-        rt_block *held = live_blocks[i];
+        struct rt_leak_line held = lines[i];
         j = i;
-        while (j > 0 && live_blocks[j - 1]->seq > held->seq) {
-            live_blocks[j] = live_blocks[j - 1];
+        while (j > 0 && lines[j - 1].seq > held.seq) {
+            lines[j] = lines[j - 1];
             j--;
         }
-        live_blocks[j] = held;
+        lines[j] = held;
     }
     for (i = 0; i < count; i++) {
         (void)rt_write(STDERR_FILENO, prefix, sizeof prefix - 1);
-        rt_write_size(STDERR_FILENO, live_blocks[i]->size);
+        rt_write_size(STDERR_FILENO, lines[i].size);
         (void)rt_write(STDERR_FILENO, middle, sizeof middle - 1);
-        if (live_blocks[i]->path != NULL) {
-            (void)rt_write(STDERR_FILENO, live_blocks[i]->path,
-                           strlen(live_blocks[i]->path));
+        if (lines[i].path != NULL) {
+            (void)rt_write(STDERR_FILENO, lines[i].path,
+                           strlen(lines[i].path));
         }
         (void)rt_write(STDERR_FILENO, newline, sizeof newline - 1);
     }
-    free(live_blocks);
+    free(lines);
 }
 
 /* ---------------------------------------------------------------------------
@@ -494,4 +573,280 @@ unsigned char *rt_str_from_i64(long long v, size_t *out_len) {
         *out_len = n;
     }
     return s.data;
+}
+
+/* ---------------------------------------------------------------------------
+ * Concurrency
+ *
+ * The handles are opaque to generated code: every function here takes and
+ * returns `void *`-shaped pointers, and the runtime is the only thing that
+ * knows what they point at. The one shared piece of state is the leak tracker,
+ * which takes its own lock in every entry point above.
+ *
+ * A mutex, a channel and an atomic are malloc'ed without rt_alloc and never
+ * released: the language has no destroy form, so tracking them would turn
+ * every program that uses one into a leak report no program could fix. A
+ * thread is different — `join` is its release — so its handle is an rt_alloc
+ * block, and a thread nobody joins is reported at the `spawn` that made it.
+ * ------------------------------------------------------------------------- */
+
+/* The signature pthread_create wants: one opaque argument, one opaque result.
+ * The generated thunk has exactly this shape. */
+typedef void *(*rt_thread_body)(void *);
+
+typedef struct {
+    rt_thread_body entry;
+    void *arg;
+} rt_thread_start;
+
+struct rt_thread {
+    pthread_t thread;
+};
+
+struct rt_mutex {
+    pthread_mutex_t lock;
+};
+
+struct rt_chan {
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    unsigned char *buffer;
+    size_t elem;   /* bytes per element, never zero */
+    size_t cap;    /* elements the ring holds */
+    size_t head;   /* index of the next slot to write */
+    size_t count;  /* elements currently in the ring */
+};
+
+struct rt_atomic {
+    long long value;
+};
+
+/* The thread's real entry point. `start` is the runtime's own record, the only
+ * allocation here that is not the tracker's business; the argument record came
+ * from rt_alloc and is released now that the target has returned. */
+static void *rt_thread_main(void *raw) {
+    rt_thread_start *start = raw;
+    void *result = start->entry(start->arg);
+
+    rt_free(start->arg);
+    free(start);
+    return result;
+}
+
+rt_thread *rt_thread_new(const char *path, void *(*entry)(void *), void *arg) {
+    rt_thread_start *start;
+    rt_thread *t;
+
+    if (entry == NULL) {
+        rt_panic(path, "R0005", "a thread needs an entry point");
+    }
+    start = malloc(sizeof *start);
+    if (start == NULL) {
+        rt_panic(path, "R0003", "out of memory");
+    }
+    /* The handle is tracked under the spawn's path: a thread never joined is
+     * a live block, and the report says where it was started. */
+    t = rt_alloc(sizeof *t, 8, path);
+    start->entry = entry;
+    start->arg = arg;
+    if (pthread_create(&t->thread, NULL, rt_thread_main, start) != 0) {
+        /* The thread never started, so it never ran `rt_thread_main` and does
+         * not own the argument record. Release both before ending the
+         * process, so a debug run does not report leaks caused by the failure
+         * itself. */
+        free(start);
+        rt_free(arg);
+        rt_free(t);
+        rt_panic(path, "R0005", "could not start a thread");
+    }
+    return t;
+}
+
+void rt_join(rt_thread *t, const char *path) {
+    /* The liveness test comes first: a second join is handed a handle the
+     * first one released, and reading `t->thread` from it would be a read of
+     * freed memory before the tracker could say anything. The debug build
+     * quarantines the block, so the test is exact there; a release build can
+     * only be best effort, like every other stale-pointer check. */
+    if (!rt_is_live_block(t)) {
+        rt_panic(path, "R0005", "thread is not running");
+    }
+    if (pthread_join(t->thread, NULL) != 0) {
+        rt_panic(path, "R0005", "could not join a thread");
+    }
+    rt_free(t);
+}
+
+rt_mutex *rt_mutex_new(const char *path) {
+    pthread_mutexattr_t attr;
+    rt_mutex *m = malloc(sizeof *m);
+
+    if (m == NULL) {
+        rt_panic(path, "R0003", "out of memory");
+    }
+    if (pthread_mutexattr_init(&attr) != 0) {
+        free(m);
+        rt_panic(path, "R0005", "could not create a mutex");
+    }
+    /* Error checking, so a lock the calling thread already holds reports
+     * EDEADLK instead of deadlocking, and an unlock by a non-owner reports
+     * EPERM. Both become R0005 at the node that asked, which is the only
+     * observable way a program can misuse a mutex. */
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(m);
+        rt_panic(path, "R0005", "could not create a mutex");
+    }
+    if (pthread_mutex_init(&m->lock, &attr) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(m);
+        rt_panic(path, "R0005", "could not create a mutex");
+    }
+    pthread_mutexattr_destroy(&attr);
+    return m;
+}
+
+void rt_mutex_lock(rt_mutex *m, const char *path) {
+    if (m == NULL) {
+        rt_panic(path, "R0005", "mutex is not running");
+    }
+    if (pthread_mutex_lock(&m->lock) != 0) {
+        rt_panic(path, "R0005", "could not lock a mutex");
+    }
+}
+
+void rt_mutex_unlock(rt_mutex *m, const char *path) {
+    if (m == NULL) {
+        rt_panic(path, "R0005", "mutex is not running");
+    }
+    if (pthread_mutex_unlock(&m->lock) != 0) {
+        rt_panic(path, "R0005", "could not unlock a mutex");
+    }
+}
+
+rt_chan *rt_chan_new(size_t elem, long long capacity, const char *path) {
+    rt_chan *c;
+
+    if (capacity <= 0) {
+        rt_panic(path, "R0003", "channel capacity must be positive");
+    }
+    if (elem == 0) {
+        /* An empty element still occupies a slot; one byte keeps the ring's
+         * arithmetic away from a zero stride. */
+        elem = 1;
+    }
+    if ((unsigned long long)capacity > (unsigned long long)((size_t)-1) / elem) {
+        rt_panic(path, "R0003", "channel capacity overflows");
+    }
+    c = malloc(sizeof *c);
+    if (c == NULL) {
+        rt_panic(path, "R0003", "out of memory");
+    }
+    c->buffer = malloc(elem * (size_t)capacity);
+    if (c->buffer == NULL) {
+        free(c);
+        rt_panic(path, "R0003", "out of memory");
+    }
+    c->elem = elem;
+    c->cap = (size_t)capacity;
+    c->head = 0;
+    c->count = 0;
+    if (pthread_mutex_init(&c->lock, NULL) != 0) {
+        free(c->buffer);
+        free(c);
+        rt_panic(path, "R0005", "could not create a channel");
+    }
+    if (pthread_cond_init(&c->not_empty, NULL) != 0 ||
+        pthread_cond_init(&c->not_full, NULL) != 0) {
+        pthread_mutex_destroy(&c->lock);
+        free(c->buffer);
+        free(c);
+        rt_panic(path, "R0005", "could not create a channel");
+    }
+    return c;
+}
+
+void rt_chan_send(rt_chan *c, const void *value, const char *path) {
+    size_t slot;
+
+    if (c == NULL) {
+        rt_panic(path, "R0005", "channel is not running");
+    }
+    if (pthread_mutex_lock(&c->lock) != 0) {
+        rt_panic(path, "R0005", "could not lock a channel");
+    }
+    while (c->count == c->cap) {
+        if (pthread_cond_wait(&c->not_full, &c->lock) != 0) {
+            rt_panic(path, "R0005", "could not wait on a channel");
+        }
+    }
+    slot = c->head;
+    memcpy(c->buffer + slot * c->elem, value, c->elem);
+    c->head = (c->head + 1) % c->cap;
+    c->count++;
+    if (pthread_cond_signal(&c->not_empty) != 0) {
+        rt_panic(path, "R0005", "could not wake a channel");
+    }
+    if (pthread_mutex_unlock(&c->lock) != 0) {
+        rt_panic(path, "R0005", "could not unlock a channel");
+    }
+}
+
+void rt_chan_recv(rt_chan *c, void *out, const char *path) {
+    size_t slot;
+
+    if (c == NULL) {
+        rt_panic(path, "R0005", "channel is not running");
+    }
+    if (pthread_mutex_lock(&c->lock) != 0) {
+        rt_panic(path, "R0005", "could not lock a channel");
+    }
+    while (c->count == 0) {
+        if (pthread_cond_wait(&c->not_empty, &c->lock) != 0) {
+            rt_panic(path, "R0005", "could not wait on a channel");
+        }
+    }
+    /* The oldest element: the ring is `count` long, so its tail is `count`
+     * slots behind the head. */
+    slot = (c->head + c->cap - c->count) % c->cap;
+    memcpy(out, c->buffer + slot * c->elem, c->elem);
+    c->count--;
+    if (pthread_cond_signal(&c->not_full) != 0) {
+        rt_panic(path, "R0005", "could not wake a channel");
+    }
+    if (pthread_mutex_unlock(&c->lock) != 0) {
+        rt_panic(path, "R0005", "could not unlock a channel");
+    }
+}
+
+rt_atomic *rt_atomic_new(long long value) {
+    rt_atomic *a = malloc(sizeof *a);
+
+    if (a == NULL) {
+        rt_panic(NULL, "R0003", "out of memory");
+    }
+    __atomic_store_n(&a->value, value, __ATOMIC_SEQ_CST);
+    return a;
+}
+
+long long rt_atomic_add(rt_atomic *a, long long delta) {
+    if (a == NULL) {
+        rt_panic(NULL, "R0003", "atomic handle is null");
+    }
+    return __atomic_add_fetch(&a->value, delta, __ATOMIC_SEQ_CST);
+}
+
+long long rt_atomic_load(rt_atomic *a) {
+    if (a == NULL) {
+        rt_panic(NULL, "R0003", "atomic handle is null");
+    }
+    return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST);
+}
+
+void rt_atomic_store(rt_atomic *a, long long value) {
+    if (a == NULL) {
+        rt_panic(NULL, "R0003", "atomic handle is null");
+    }
+    __atomic_store_n(&a->value, value, __ATOMIC_SEQ_CST);
 }

@@ -10,9 +10,12 @@ every printable scalar, checked integer division, structs (``make``, ``get``,
 (``str-len``, ``str-concat``, ``str-eq``, ``str-slice``), vectors
 (``make``, ``vec-push``, ``vec-len``, ``vec-get``, ``vec-set``, ``vec-free``)
 and the tagged values of results and optionals (``ok``, ``err``, ``some``,
-``none``, ``try``). A construct the checker accepts but this pass does not
-lower yet is reported as a diagnostic at its own path — never a ``KeyError``
-or a ``ValueError``, and never silently miscompiled.
+``none``, ``try``), and threads with their synchronization (``spawn``,
+``join``, ``mutex``, ``lock``, ``unlock``, ``chan``, ``send``, ``recv``,
+``atomic``, ``atomic-add``, ``atomic-load``, ``atomic-store``). A construct the
+checker accepts but this pass does not lower yet is reported as a diagnostic at
+its own path — never a ``KeyError`` or a ``ValueError``, and never silently
+miscompiled.
 
 Results, optionals and enums
 ----------------------------
@@ -108,6 +111,26 @@ constant-true loop always returns is not reported as missing a ``ret``.
 ``match`` tests its arms' literals in source order and falls through to a panic
 when no arm matches; ``and``/``or`` short-circuit, so the right operand of
 ``(and false (println "x"))`` never runs.
+
+Concurrency
+-----------
+A thread, a mutex, a channel and an atomic are one opaque ``i8*`` at the C
+boundary; generated code never looks inside one. ``spawn`` builds one heap
+record holding the target's arguments (``rt_alloc`` under the spawn's own node
+path, so an unjoined thread's handle is reportable at the form that started
+it), emits a thunk ``i8* (i8*)`` per call site that unpacks the record and
+calls the target, and hands both to ``rt_thread_new``. The runtime owns the
+record and releases it when the target returns; ``join`` waits and releases the
+handle. ``deref``, ``set-deref`` and ``ptr-add`` through a ``(shared (ptr T))``
+are the same operations as through a ``(ptr T)``: the marker is a promise about
+who else reaches the memory, not a different representation.
+
+``send`` spills its value into a stack slot and passes the slot's address;
+``recv`` gives the runtime a slot and loads what it filled. Both are one
+runtime call, and both may block, which is why they are statements in practice
+but remain expressions of type ``:void`` / ``T`` respectively. Every runtime
+call that can fail carries the node path as a C literal, so R0005 names the
+form that asked.
 
 Names
 -----
@@ -304,6 +327,8 @@ from logos.nodes import Node
 from logos.types import (
     INTEGERS,
     Arr,
+    Atomic,
+    Chan,
     EnumRef,
     FnTy,
     Opt,
@@ -311,6 +336,7 @@ from logos.types import (
     Prim,
     Ptr,
     Res,
+    Shared,
     StructRef,
     Ty,
     Vec,
@@ -423,6 +449,38 @@ _MEMCMP = IrDecl("memcmp", (_VOID_PTR, _VOID_PTR, Prim("i64")), Prim("i32"))
 #: growth uses to carry the old elements into the new buffer.
 _MEMCPY = IrDecl("memcpy", (_VOID_PTR, _VOID_PTR, Prim("i64")), _VOID_PTR)
 
+#: The concurrency runtime. Every handle crosses as ``i8*``; a ``path`` is a
+#: compiler-generated NUL-terminated literal for a failure that can name a
+#: node. ``rt_thread_new`` takes the path (the argument record is allocated
+#: with it, so an unjoined thread's record is named at the spawn), the thunk's
+#: address and the argument record.
+_RT_THREAD_NEW = IrDecl(
+    "rt_thread_new", (_VOID_PTR, _VOID_PTR, _VOID_PTR), _VOID_PTR
+)
+_RT_JOIN = IrDecl("rt_join", (_VOID_PTR, _VOID_PTR), Prim("void"))
+_RT_MUTEX_NEW = IrDecl("rt_mutex_new", (_VOID_PTR,), _VOID_PTR)
+_RT_MUTEX_LOCK = IrDecl("rt_mutex_lock", (_VOID_PTR, _VOID_PTR), Prim("void"))
+_RT_MUTEX_UNLOCK = IrDecl("rt_mutex_unlock", (_VOID_PTR, _VOID_PTR), Prim("void"))
+_RT_CHAN_NEW = IrDecl(
+    "rt_chan_new", (Prim("i64"), Prim("i64"), _VOID_PTR), _VOID_PTR
+)
+_RT_CHAN_SEND = IrDecl(
+    "rt_chan_send", (_VOID_PTR, _VOID_PTR, _VOID_PTR), Prim("void")
+)
+_RT_CHAN_RECV = IrDecl(
+    "rt_chan_recv", (_VOID_PTR, _VOID_PTR, _VOID_PTR), Prim("void")
+)
+#: An atomic is one 64-bit word. ``:u64`` crosses as the same ``i64``: LLVM
+#: has no signedness, and the checker has already refused every other width.
+_RT_ATOMIC_NEW = IrDecl("rt_atomic_new", (Prim("i64"),), _VOID_PTR)
+_RT_ATOMIC_ADD = IrDecl(
+    "rt_atomic_add", (_VOID_PTR, Prim("i64")), Prim("i64")
+)
+_RT_ATOMIC_LOAD = IrDecl("rt_atomic_load", (_VOID_PTR,), Prim("i64"))
+_RT_ATOMIC_STORE = IrDecl(
+    "rt_atomic_store", (_VOID_PTR, Prim("i64")), Prim("void")
+)
+
 
 def lowered_type(
     ty: Ty,
@@ -483,6 +541,17 @@ def _unlowered(
         # type the backend cannot spell. The stack still grows through the
         # element so the walk terminates, but a cycle it finds is not reported:
         # it is one pointer deep, not a type that contains itself by value.
+        if _is_void(ty.elem):
+            return ty.elem, None
+        bad, _ = _unlowered(ty.elem, structs, enums, stack)
+        return bad, None
+    if isinstance(ty, Shared):
+        # A marker, not a layout: the value is the one it wraps.
+        return _unlowered(ty.elem, structs, enums, stack)
+    if isinstance(ty, (Chan, Atomic)):
+        # An opaque handle is one word; the element type is never materialised
+        # in this program's storage, but it still has to be spellable so the
+        # operations that carry it can be typed.
         if _is_void(ty.elem):
             return ty.elem, None
         bad, _ = _unlowered(ty.elem, structs, enums, stack)
@@ -763,7 +832,7 @@ class _Lower:
             )
             llvm.register_enum(ty.name, words)
             self.enum_widths[ty.name] = words
-        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt)):
+        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt, Shared, Chan, Atomic)):
             self._register_enums(ty.elem, stack)
         elif isinstance(ty, Res):
             self._register_enums(ty.ok, stack)
@@ -810,7 +879,7 @@ class _Lower:
             for _, payload in self.cm.enums.get(ty.name, ()):
                 if payload is not None:
                     self._collect(payload, stack + (ty.name,))
-        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt)):
+        elif isinstance(ty, (Arr, Ptr, Own, Vec, Opt, Shared, Chan, Atomic)):
             self._collect(ty.elem, stack)
         elif isinstance(ty, Res):
             self._collect(ty.ok, stack)
@@ -2013,6 +2082,313 @@ class _Fn:
         self.emit(("gep", dest, elem, pointer, (("i64", offset),)))
         return dest
 
+    # -- concurrency ------------------------------------------------------
+
+    def spawn(self, node: Node) -> str:
+        """``(spawn f args...)``: a heap record, a thunk, and ``rt_thread_new``.
+
+        The arguments are evaluated here and copied into one record on the
+        heap, because the new thread outlives this frame's slots. The record is
+        allocated with ``rt_alloc`` and the spawn's own node path, so a program
+        that forgets to join is told where the thread was started. The thunk is
+        the one function whose signature the runtime knows, ``i8* (i8*)``: it
+        casts the record back to its field list, calls the target, and returns
+        null. ``rt_thread_new`` owns the record from the moment the thread
+        starts and releases it when the target returns.
+        """
+        ty = self.type_of(node)
+        if not (isinstance(ty, Prim) and ty.name == "thread"):
+            raise diag(
+                UNKNOWN_NODE,
+                node.path,
+                f"'spawn' did not produce a :thread, found {ty}",
+            )
+        items = node.items
+        if len(items) < 2 or not isinstance(items[1], Token):
+            raise diag(
+                UNKNOWN_NODE, node.path, "spawn needs the name of a module function"
+            )
+        name = items[1].value
+        symbol = self.lowering.symbols.get(name)
+        sig = self.cm.fn_sigs.get(name)
+        if symbol is None or sig is None:
+            raise diag(
+                UNKNOWN_FUNCTION,
+                node.path,
+                f"cannot start '{name}': no lowered definition in module "
+                f"'{self.cm.module.name}'",
+            )
+        args = items[2:]
+        fields = sig.params
+        if len(args) != len(fields):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                f"'{name}' takes {len(fields)} arguments, got {len(args)}",
+            )
+        # Evaluate the arguments in source order, before the record exists:
+        # an argument may itself allocate or create a handle.
+        values = tuple(self.value(arg, node.path) for arg in args)
+        for field in fields:
+            self.lowering.use_type(field, node.path)
+        size = _fields_size(fields, self.cm.structs, self.cm.enums) if fields else 0
+        align = (
+            max(align_of(field, self.cm.structs, self.cm.enums) for field in fields)
+            if fields
+            else 1
+        )
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_ALLOC)
+        raw = self.temp()
+        self.emit(("call", raw, "rt_alloc", (str(size), str(align), path)))
+        if fields:
+            base = self.temp()
+            self.emit(("bitcastrec", base, fields, _VOID_PTR, raw))
+            for index, (field, value) in enumerate(zip(fields, values)):
+                address = self.temp()
+                self.emit(("geprec", address, fields, base, index))
+                self.emit(("store", field, value, address))
+        code = self.spawn_thunk(fields, symbol, node.path)
+        self.lowering.declare(_RT_THREAD_NEW)
+        handle = self.temp()
+        self.emit(("call", handle, "rt_thread_new", (path, code, raw)))
+        return handle
+
+    def spawn_thunk(
+        self, fields: tuple[Ty, ...], target: str, where: str
+    ) -> str:
+        """Emit the ``i8* (i8*)`` entry point for one spawn site.
+
+        One per site rather than one per target: the record's field list is
+        the target's parameter list, so two sites with different argument types
+        cannot share a body, and a site's thunk is a small function the caller
+        takes the address of. Returns the thunk's address as an ``i8*``.
+        """
+        name = self.lowering.next_name("$spawn")
+        symbol = self.lowering.symbol(name)
+        fn = IrFn(
+            name,
+            [],
+            _VOID_PTR,
+            [IrBlock("entry")],
+            symbol=symbol,
+            internal=True,
+        )
+        builder = _Fn(
+            self.lowering,
+            fn,
+            path=self.path,
+            ret=_VOID_PTR,
+            is_main=False,
+            body=self.record,
+        )
+        # The runtime calls this through ``void *(*)(void *)``: one opaque
+        # argument, one opaque result. Appending the parameter directly keeps
+        # it out of the binding table, which has no slot for it.
+        fn.params.append(("env", _VOID_PTR))
+        if fields:
+            base = builder.temp()
+            builder.emit(("bitcastrec", base, fields, _VOID_PTR, "%env"))
+            loaded: list[str] = []
+            for index, field in enumerate(fields):
+                builder.lowering.use_type(field, where)
+                address = builder.temp()
+                builder.emit(("geprec", address, fields, base, index))
+                value = builder.temp()
+                builder.emit(("load", value, field, address))
+                loaded.append(value)
+            arguments = tuple(loaded)
+        else:
+            arguments = ()
+        builder.emit(("call", "", target, arguments))
+        builder.block.term = ("ret", _VOID_PTR, "null")
+        builder.finish()
+        self.lowering.ir.functions.append(fn)
+        code = self.temp()
+        self.emit(("faddr", code, symbol))
+        return code
+
+    def join_form(self, node: Node) -> str:
+        """``(join t)``: wait, then release the handle."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "join takes one thread")
+        handle = self.value(items[1], node.path)
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_JOIN)
+        self.emit(("call", "", "rt_join", (handle, path)))
+        return ""
+
+    def mutex_form(self, node: Node) -> str:
+        """``(mutex)``: a runtime lock, allocated for the process's life."""
+        if len(node.items) != 1:
+            raise diag(WRONG_ARITY, node.path, "mutex takes no arguments")
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_MUTEX_NEW)
+        handle = self.temp()
+        self.emit(("call", handle, "rt_mutex_new", (path,)))
+        return handle
+
+    def mutex_op(self, node: Node, callee: str) -> str:
+        """``(lock m)``/``(unlock m)``: one runtime call, the path for R0005."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(
+                WRONG_ARITY, node.path, f"{node.kind} takes one mutex"
+            )
+        handle = self.value(items[1], node.path)
+        path = self._c_argument(node.path)
+        self.lowering.declare(
+            _RT_MUTEX_LOCK if callee == "rt_mutex_lock" else _RT_MUTEX_UNLOCK
+        )
+        self.emit(("call", "", callee, (handle, path)))
+        return ""
+
+    def channel_of(self, item: Node | Token, where: str) -> Chan:
+        """The ``(chan T)`` a value names, through its ``(shared ...)`` marker."""
+        ty = self.type_of_item(item, where)
+        if isinstance(ty, Shared):
+            ty = ty.elem
+        if not isinstance(ty, Chan):
+            raise diag(TYPE_MISMATCH, where, f"expected a channel, found {ty}")
+        return ty
+
+    def chan_form(self, node: Node) -> str:
+        """``(chan T n)``: one runtime ring of ``n`` elements of T."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "chan takes an element type and a capacity"
+            )
+        ty = self.type_of(node)
+        elem = (
+            ty.elem.elem
+            if isinstance(ty, Shared) and isinstance(ty.elem, Chan)
+            else None
+        )
+        if elem is None:
+            raise diag(
+                UNKNOWN_NODE, node.path, f"'chan' did not produce a channel, found {ty}"
+            )
+        self.lowering.use_type(elem, node.path)
+        size = sizeof_of(elem, self.cm.structs, self.cm.enums)
+        capacity = self.index64(items[2], node.path, "channel capacity")
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_CHAN_NEW)
+        handle = self.temp()
+        self.emit(("call", handle, "rt_chan_new", (str(size), capacity, path)))
+        return handle
+
+    def send_form(self, node: Node) -> str:
+        """``(send c v)``: spill the element and hand its address to the ring."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "send takes a channel and a value")
+        chan = self.channel_of(items[1], node.path)
+        elem = chan.elem
+        self.lowering.use_type(elem, node.path)
+        slot = self.slot(elem, path=node.path)
+        self.emit(("store", elem, self.value(items[2], node.path), slot))
+        handle = self.value(items[1], node.path)
+        address = self.temp()
+        self.emit(("bitcast", address, Ptr(elem), _VOID_PTR, slot))
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_CHAN_SEND)
+        self.emit(("call", "", "rt_chan_send", (handle, address, path)))
+        return ""
+
+    def recv_form(self, node: Node) -> str:
+        """``(recv c)``: give the runtime a slot, then load what it filled."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "recv takes one channel")
+        chan = self.channel_of(items[1], node.path)
+        elem = chan.elem
+        self.lowering.use_type(elem, node.path)
+        slot = self.slot(elem, path=node.path)
+        handle = self.value(items[1], node.path)
+        address = self.temp()
+        self.emit(("bitcast", address, Ptr(elem), _VOID_PTR, slot))
+        path = self._c_argument(node.path)
+        self.lowering.declare(_RT_CHAN_RECV)
+        self.emit(("call", "", "rt_chan_recv", (handle, address, path)))
+        value = self.temp()
+        self.emit(("load", value, elem, slot))
+        return value
+
+    def atomic_of(self, item: Node | Token, where: str) -> Atomic:
+        """The ``(atomic T)`` a value names, through its ``(shared ...)`` marker."""
+        ty = self.type_of_item(item, where)
+        if isinstance(ty, Shared):
+            ty = ty.elem
+        if not isinstance(ty, Atomic):
+            raise diag(TYPE_MISMATCH, where, f"expected an atomic, found {ty}")
+        return ty
+
+    def atomic_form(self, node: Node) -> str:
+        """``(atomic T v)``: one heap word, initialised."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic takes a type and an initial value"
+            )
+        ty = self.type_of(node)
+        elem = (
+            ty.elem.elem
+            if isinstance(ty, Shared) and isinstance(ty.elem, Atomic)
+            else None
+        )
+        if elem is None:
+            raise diag(
+                UNKNOWN_NODE, node.path, f"'atomic' did not produce an atomic, found {ty}"
+            )
+        value = self.value(items[2], node.path)
+        self.lowering.declare(_RT_ATOMIC_NEW)
+        handle = self.temp()
+        self.emit(("call", handle, "rt_atomic_new", (value,)))
+        return handle
+
+    def atomic_add(self, node: Node) -> str:
+        """``(atomic-add a n)``: one fetch-add, the new value back."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic-add takes an atomic and a value"
+            )
+        self.atomic_of(items[1], node.path)
+        handle = self.value(items[1], node.path)
+        delta = self.value(items[2], node.path)
+        self.lowering.declare(_RT_ATOMIC_ADD)
+        value = self.temp()
+        self.emit(("call", value, "rt_atomic_add", (handle, delta)))
+        return value
+
+    def atomic_load(self, node: Node) -> str:
+        """``(atomic-load a)``: one acquire load."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "atomic-load takes one atomic")
+        self.atomic_of(items[1], node.path)
+        handle = self.value(items[1], node.path)
+        self.lowering.declare(_RT_ATOMIC_LOAD)
+        value = self.temp()
+        self.emit(("call", value, "rt_atomic_load", (handle,)))
+        return value
+
+    def atomic_store(self, node: Node) -> str:
+        """``(atomic-store a v)``: one release store."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic-store takes an atomic and a value"
+            )
+        self.atomic_of(items[1], node.path)
+        handle = self.value(items[1], node.path)
+        value = self.value(items[2], node.path)
+        self.lowering.declare(_RT_ATOMIC_STORE)
+        self.emit(("call", "", "rt_atomic_store", (handle, value)))
+        return ""
+
     def free_stmt(self, node: Node) -> None:
         """``(free p)``: hand the block back, through the C boundary's ``void *``."""
         items = node.items
@@ -2151,6 +2527,30 @@ class _Fn:
             return self.ptr_form(item)
         if kind == "ptr-add":
             return self.ptr_add(item)
+        if kind == "spawn":
+            return self.spawn(item)
+        if kind == "join":
+            return self.join_form(item)
+        if kind == "mutex":
+            return self.mutex_form(item)
+        if kind == "lock":
+            return self.mutex_op(item, "rt_mutex_lock")
+        if kind == "unlock":
+            return self.mutex_op(item, "rt_mutex_unlock")
+        if kind == "chan":
+            return self.chan_form(item)
+        if kind == "send":
+            return self.send_form(item)
+        if kind == "recv":
+            return self.recv_form(item)
+        if kind == "atomic":
+            return self.atomic_form(item)
+        if kind == "atomic-add":
+            return self.atomic_add(item)
+        if kind == "atomic-load":
+            return self.atomic_load(item)
+        if kind == "atomic-store":
+            return self.atomic_store(item)
         if kind == "fn":
             return self.closure(item)
         if kind in _STATEMENTS:
@@ -3005,6 +3405,8 @@ def _is_void(ty: Ty) -> bool:
 
 def _pointee(ty: Ty) -> Ty | None:
     """The type a pointer points at, or ``None`` when ``ty`` is not a pointer."""
+    if isinstance(ty, Shared):
+        ty = ty.elem
     if isinstance(ty, (Own, Ptr)):
         return ty.elem
     return None
@@ -3026,6 +3428,9 @@ _SIZES = {
     "u64": 8,
     "f64": 8,
     "str": 16,
+    # Runtime handles: one opaque pointer each.
+    "thread": 8,
+    "mutex": 8,
 }
 
 _FLOATS = ("f32", "f64")
@@ -3100,6 +3505,11 @@ def sizeof_of(
     enums = enums or {}
     if isinstance(ty, Prim):
         return _SIZES.get(ty.name, 1)
+    if isinstance(ty, Shared):
+        return sizeof_of(ty.elem, structs, enums, memo)
+    if isinstance(ty, (Chan, Atomic)):
+        # One opaque pointer to the runtime object.
+        return 8
     if isinstance(ty, (Ptr, Own)):
         return 8
     if isinstance(ty, FnTy):
@@ -3141,6 +3551,10 @@ def align_of(
             # largest field's, not the size.
             return 8
         return min(_SIZES.get(ty.name, 1), 16)
+    if isinstance(ty, Shared):
+        return align_of(ty.elem, structs, enums, memo)
+    if isinstance(ty, (Chan, Atomic)):
+        return 8
     if isinstance(ty, (Ptr, Own)):
         return 8
     if isinstance(ty, FnTy):

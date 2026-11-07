@@ -219,11 +219,38 @@ captures nothing is a plain pointer and may go anywhere.
 
 ### Concurrency
 
-`(spawn f args...)` starts a thread and returns a `thread` handle. `join`
-waits. `mutex`, `atomic`, and `chan` live in the runtime, backed by
-pthreads. Data races are not prevented by the compiler in v1; the type
-system marks shared mutable state explicitly with `(shared T)` so a reader
-can see it.
+`(spawn f args...)` starts a thread and returns a `:thread` handle. `f` is a
+module function returning `:void`; its arguments are copied into one heap
+record that the thread owns, so a value that owns memory (a vector, an owner)
+cannot cross — E0402. A raw pointer or a synchronization handle crosses only
+when its type is marked `(shared ...)` — E0700 — because two threads reaching
+one object is exactly what the marker exists to show. `(join t)` waits and
+releases the handle; joining one twice is R0005.
+
+`(mutex)` returns a `(shared :mutex)`; `lock`/`unlock` take it. The mutex is
+error-checking, so relocking it in the thread that holds it, or unlocking it
+from another thread, is R0005 rather than a hang.
+
+`(chan T n)` returns a `(shared (chan T))`, a ring of `n` copies of T.
+`(send c v)` blocks while it is full, `(recv c)` while it is empty. T must be
+a type with a copy: a vector or an owner is refused at the channel type.
+Capacity must be positive (R0003 at the channel).
+
+`(atomic :i64 v)` and `(atomic :u64 v)` return a `(shared (atomic T))`;
+`atomic-add` returns the new value, `atomic-load` reads it, `atomic-store`
+replaces it. Every operation is sequentially consistent.
+
+The marker is spelled wherever a mutex, channel or atomic is named, and on any
+pointer handed to a thread: `(shared (ptr T))` is the marked form of an
+address, and `deref`/`set-deref`/`ptr-add` accept it. Only a pointer, a mutex,
+a channel or an atomic may be shared; a scalar behind the marker is E0002.
+
+Data races are not prevented by the compiler in v1. Mutexes, channels and
+atomics are runtime objects the language cannot destroy, so they are
+process-lifetime and untracked by the leak report; a thread handle is tracked
+and released by `join`, so a thread nobody joins is reported at its `spawn`.
+The leak tracker itself is thread safe: one mutex guards its table, counters
+and report snapshot.
 
 ### Modules
 

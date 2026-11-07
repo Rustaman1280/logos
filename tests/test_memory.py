@@ -493,23 +493,36 @@ class PtrLayoutGapTest(unittest.TestCase):
     refusal is E0002 at the node that named the pointer.
     """
 
+    def lower_with_a_ghost_field(self, ty: Ty) -> LogosError:
+        """The diagnostic ``lowered_type`` gives for ``ty`` with a bad field.
+
+        ``bad`` is declared with a field naming a struct nothing declares. The
+        checker would refuse that source, so this calls the walk directly: it
+        is the one path left that still has a type with no layout, and it is
+        what proves a pointer does not hide one.
+        """
+        try:
+            lower.lowered_type(
+                ty,
+                "m/f/1/0",
+                {"bad": (("xs", StructRef("ghost")),)},
+                {},
+            )
+        except LogosError as error:
+            return error
+        raise AssertionError(f"expected a diagnostic, but {ty} lowered")
+
     def test_a_struct_behind_a_pointer_with_no_layout_is_e0002(self):
-        error = fail_on_emit(
-            "(mod m)(type bad (struct (xs (shared :i64))))"
-            "(fn f :void ((p (ptr bad))))"
-        )
+        error = self.lower_with_a_ghost_field(Ptr(StructRef("bad")))
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.path, "m/f/1/0")
-        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
+        self.assertEqual(error.message, "ghost is not lowered yet")
 
     def test_an_own_pointer_to_an_unlowered_type_is_e0002(self):
-        error = fail_on_emit(
-            "(mod m)(type bad (struct (xs (shared :i64))))"
-            "(fn f :void ((p (own bad))))"
-        )
+        error = self.lower_with_a_ghost_field(Own(StructRef("bad")))
         self.assertEqual(error.code, "E0002")
         self.assertEqual(error.path, "m/f/1/0")
-        self.assertEqual(error.message, "(shared :i64) is not lowered yet")
+        self.assertEqual(error.message, "ghost is not lowered yet")
 
     def test_a_struct_that_points_at_itself_is_still_finite(self):
         text = emitted(

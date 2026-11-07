@@ -1,0 +1,26 @@
+(mod sum)
+
+(fn worker :void ((total (shared (atomic :i64))))
+  (letmut i :i64 0)
+  (while (< i 100000)
+    (atomic-add total 1)
+    (set i (+ i 1))))
+
+(test eight-threads
+  (expect (out "800000\n")
+    (code 0)
+    (leaks 0))
+  (letmut total (atomic :i64 0))
+  (letmut ts
+    (vec :thread)
+    (make (vec :thread)))
+  (letmut i :i64 0)
+  (while (< i 8)
+    (vec-push ts (spawn worker total))
+    (set i (+ i 1)))
+  (letmut j :i64 0)
+  (while (< j (vec-len ts))
+    (join (vec-get ts j))
+    (set j (+ j 1)))
+  (println (atomic-load total))
+  (vec-free ts))

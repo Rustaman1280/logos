@@ -4,7 +4,10 @@ Every diagnostic code lives in ``CODES``. Passes import the code they report
 instead of spelling a literal, so ``E0001`` cannot mean two different things in
 two modules. ``E0001``-``E0006`` are the read-only passes (lexing, parsing,
 resolution); ``E01xx`` is the type checker, ``E02xx`` struct fields, ``E03xx``
-ownership, ``E04xx`` the string and vector operations and ``E05xx`` generics.
+ownership, ``E04xx`` the string and vector operations, ``E05xx`` generics,
+``E06xx`` results and ``E07xx`` concurrency. ``E0700`` is the one the thread
+boundary adds: shared mutable state that was not marked ``(shared ...)`` where
+it was handed to a thread.
 
 Runtime codes
 -------------
@@ -34,6 +37,12 @@ quote it.
   tracker when ``rt_free`` is handed an address this process never allocated.
   The location is ``<runtime>``: no ``alloc`` node made the block, so there is
   no node path to name.
+* ``R0005`` thread operation failed — a pthread call the runtime could not
+  complete: a thread that could not be started, a ``join`` of a handle that is
+  not a live thread (including a second join of one already joined), a mutex
+  that could not be created, locked or unlocked, or a condition variable that
+  failed while a channel was blocking. The location is the node that asked
+  (the ``spawn``, the ``join``, the ``lock``, the ``send`` or the ``recv``).
 
 R0002 and R0004 are runtime names only: nothing in the compiler emits them.
 A runtime check with no node behind it prints ``<runtime>`` in the location
@@ -72,6 +81,7 @@ CODES = {
     "E0600": "non-exhaustive match",
     "E0601": "try type mismatch",
     "E0602": "unhandled result",
+    "E0700": "shared state not marked",
 }
 
 UNBALANCED = "E0001"
@@ -128,6 +138,13 @@ TRY_MISMATCH = "E0601"
 #: handed to a callee. The whole point of the error slot is that a caller must
 #: look at it.
 UNHANDLED_RESULT = "E0602"
+
+#: State a thread can change that was not marked ``(shared ...)`` where it
+#: crosses to the thread: a raw pointer or a mutex/channel/atomic handle
+#: passed to ``spawn``, or an operation on a handle whose declared type is the
+#: bare one. The marker exists so a reader can see, at the declaration and at
+#: the call, which values two threads may both touch.
+SHARED_MARKER = "E0700"
 
 #: The runtime panic code the lowerer emits for a division by zero. ``R0002``
 #: double free stays a runtime-only name; the other code the lowerer emits is

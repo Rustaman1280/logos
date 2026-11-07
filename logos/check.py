@@ -6,11 +6,9 @@ This pass checks what the language has so far: primitives, arithmetic,
 comparisons, ``and``/``or``/``not``, ``let``/``letmut``/``set``, ``if``,
 ``while``, ``match``, ``break``/``continue``, ``ret``, calls, struct field
 access, fixed arrays, manual memory, strings, growable vectors, results,
-optionals and enums. A form from a later task (``spawn``) is not special yet,
-so it reaches the call path and is reported as an unknown function: the
-vocabulary grows one task at a time, and a name is only a built-in once this
-module has a rule for it. ``print`` and ``println`` are the built-in
-functions: each takes one value and writes it, formatted by the runtime. The
+optionals, enums, and threads with their synchronization. ``print`` and
+``println`` are the built-in functions: each takes one value and writes it,
+formatted by the runtime.
 value is any scalar with a formatter of its own — ``:i64``, ``:u64``,
 ``:f64``, ``:bool``, ``:str`` — and nothing is converted to reach one, so a
 ``:i32`` is a type mismatch and not an implicit widening.
@@ -111,6 +109,23 @@ and must name every variant (E0600). ``break`` and ``continue`` are statements
 with no operand and are only legal inside a loop, which this pass tracks as a
 depth on the enclosing environment: a helper ``fn`` starts at zero, because it
 is not inside the loop that lexically contains it.
+
+Concurrency
+-----------
+``(spawn f args...)`` starts ``f`` on a thread and returns ``:thread``; ``f``
+is a module function returning ``:void`` and its arguments are copied into the
+new thread, so a value that owns memory is E0402. A raw pointer or a handle
+crosses only under ``(shared ...)``, which is E0700 when it is missing.
+``(join t)`` waits and uses the handle up.
+
+``(mutex)`` gives a ``(shared :mutex)``, which ``lock``/``unlock`` take;
+``(chan T n)`` gives a ``(shared (chan T))``, which ``send``/``recv`` use;
+``(atomic T v)`` gives a ``(shared (atomic T))`` for ``:i64`` or ``:u64``. The
+three handles are only spellable behind the shared marker, and the marker wraps
+nothing but a pointer or one of them: ``(shared (ptr T))`` is the marked
+address a thread may be handed, and ``deref``/``set-deref``/``ptr-add`` accept
+it. A channel copies its elements, so a vector or an owner element is refused;
+``spawn`` likewise refuses a move-only argument.
 
 Purity
 ------
@@ -265,6 +280,7 @@ from logos.diag import (
     NOT_A_STR,
     NOT_FOUND,
     NOT_MUTABLE,
+    SHARED_MARKER,
     TRY_MISMATCH,
     TYPE_MISMATCH,
     UNBOUND_TYPE_VAR,
@@ -286,6 +302,8 @@ from logos.types import (
     INTEGERS,
     NUMBERS,
     Arr,
+    Atomic,
+    Chan,
     EnumRef,
     FnTy,
     Opt,
@@ -446,6 +464,10 @@ def mangle_type(ty: Ty, where: str = "") -> str:
         return f"opt({mangle_type(ty.elem, where)})"
     if isinstance(ty, Shared):
         return f"shared({mangle_type(ty.elem, where)})"
+    if isinstance(ty, Chan):
+        return f"chan({mangle_type(ty.elem, where)})"
+    if isinstance(ty, Atomic):
+        return f"atomic({mangle_type(ty.elem, where)})"
     if isinstance(ty, Res):
         return f"res({mangle_type(ty.ok, where)},{mangle_type(ty.err, where)})"
     if isinstance(ty, FnTy):
@@ -711,11 +733,22 @@ _CLOSURE_ESCAPE = "a closure that captures cannot leave its function"
 #: it twice.
 _OWNER_PLACE = "an owner cannot be read out of a place yet"
 
+#: The one sentence E0700 carries. State two threads can both reach is marked
+#: ``(shared T)`` where it is declared and where it is handed to a thread, so a
+#: reader sees it without tracing the calls.
+_SHARED_MARKER = "shared state must be marked '(shared ...)'"
+
 #: Variant names the compiler gives a meaning of its own: ``(ok v)``, ``(err
 #: e)``, ``(some v)``, ``(none)`` and ``(try e)`` are forms, and ``print`` and
 #: ``println`` are the builtins. An enum variant of one of these names could
 #: not be constructed unambiguously, so the declaration is refused instead.
-RESERVED_VARIANTS = ("ok", "err", "some", "none", "try", "print", "println")
+RESERVED_VARIANTS = (
+    "ok", "err", "some", "none", "try", "print", "println",
+    # The concurrency forms are grammar too: a variant called `spawn` could
+    # not be constructed, because `(spawn ...)` is a thread.
+    "spawn", "join", "mutex", "lock", "unlock", "chan", "send", "recv",
+    "atomic", "atomic-add", "atomic-load", "atomic-store",
+)
 
 
 def enum_shape(node: Node, types: dict[str, Ty]) -> tuple[tuple[str, Ty | None], ...]:
@@ -1202,7 +1235,8 @@ _INT_RANGE = {
     "u64": (0, 2**64 - 1),
 }
 
-_TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared")
+_TYPE_FORMS = ("arr", "vec", "ptr", "own", "fn", "fn*", "res", "opt", "shared",
+               "chan", "atomic")
 _LET_SHAPE = "takes a name, an optional type and a value"
 
 
@@ -1586,6 +1620,30 @@ class _Checker:
             return self._set_deref(node, env)
         if kind == "ptr-add":
             return self._ptr_add(node, env)
+        if kind == "spawn":
+            return self._spawn(node, env)
+        if kind == "join":
+            return self._join(node, env)
+        if kind == "mutex":
+            return self._mutex(node, env)
+        if kind == "lock":
+            return self._mutex_op(node, env, "lock")
+        if kind == "unlock":
+            return self._mutex_op(node, env, "unlock")
+        if kind == "chan":
+            return self._chan(node, env)
+        if kind == "send":
+            return self._send(node, env)
+        if kind == "recv":
+            return self._recv(node, env)
+        if kind == "atomic":
+            return self._atomic(node, env)
+        if kind == "atomic-add":
+            return self._atomic_add(node, env)
+        if kind == "atomic-load":
+            return self._atomic_load(node, env)
+        if kind == "atomic-store":
+            return self._atomic_store(node, env)
         head = node.items[0] if node.items else None
         if isinstance(head, Token) and head.kind == ATOM:
             return self._call(node, env, expected)
@@ -2857,6 +2915,276 @@ class _Checker:
             )
         return Ptr(elem)
 
+    # -- concurrency ------------------------------------------------------
+
+    def _spawn(self, node: Node, env: _Env) -> Ty:
+        """``(spawn f args...)``: start ``f`` on a new thread, return its handle.
+
+        The target is a module function, named rather than a value: the
+        lowering emits a thunk per call site, and a thunk can only be built for
+        a definition whose symbol and parameter list this module knows. Its
+        arguments are *copied* into a record the thread owns, so a type that
+        owns memory cannot cross — there would be two owners and one block. A
+        pointer or a synchronization handle crosses only when it is marked
+        ``(shared ...)``: that marker is the whole point of the form, because
+        two threads reaching one object is exactly what a reader must be able
+        to see.
+        """
+        items = node.items
+        if len(items) < 2:
+            raise diag(
+                WRONG_ARITY, node.path, "spawn takes a function and its arguments"
+            )
+        target = items[1]
+        if not (isinstance(target, Token) and target.kind == ATOM):
+            raise diag(
+                UNKNOWN_FUNCTION,
+                _at(target, node),
+                "spawn needs the name of a module function",
+            )
+        name = target.value
+        sig = env.fns.get(name)
+        if sig is None:
+            raise diag(
+                UNKNOWN_FUNCTION, _at(target, node), f"unknown function '{name}'"
+            )
+        if name == "main":
+            raise diag(
+                UNKNOWN_FUNCTION,
+                _at(target, node),
+                "main is the entry point and cannot be started as a thread",
+            )
+        if name not in self._bodies:
+            # A test-local helper is checked but not lowered: its symbol does
+            # not exist, so a thunk calling it could not link. Same rule as a
+            # function value (E0103).
+            raise diag(
+                UNKNOWN_FUNCTION,
+                _at(target, node),
+                f"cannot start '{name}' as a thread: only a module function "
+                "has a lowered definition",
+            )
+        if name in self._params:
+            raise diag(
+                UNBOUND_TYPE_VAR,
+                _at(target, node),
+                f"{name} is generic: a thread needs a signature with no type variables",
+            )
+        if not _is_void(sig.ret):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(target, node),
+                f"a thread's function must return :void, found {sig.ret}",
+            )
+        args = items[2:]
+        if len(args) != len(sig.params):
+            raise diag(
+                WRONG_ARITY,
+                node.path,
+                f"'{name}' takes {_count(len(sig.params), 'argument')}, "
+                f"got {len(args)}",
+            )
+        for index, (arg, param) in enumerate(zip(args, sig.params), start=1):
+            ty = self._value(arg, env, param, node.path)
+            if _escapes(ty):
+                raise diag(CLOSURE_ESCAPE, _at(arg, node), _CLOSURE_ESCAPE)
+            if self._move_only(ty):
+                raise diag(
+                    VEC_MOVE,
+                    _at(arg, node),
+                    "a thread argument is copied into the new thread; "
+                    "a value that owns memory cannot be copied across",
+                )
+            if isinstance(ty, Ptr) or _shared_state(ty):
+                raise diag(SHARED_MARKER, _at(arg, node), _SHARED_MARKER)
+            if not compatible(param, ty):
+                raise diag(
+                    TYPE_MISMATCH,
+                    _at(arg, node),
+                    f"argument {index} of '{name}' expects {param}, found {ty}",
+                )
+            if isinstance(param, Res):
+                # The thread's body is checked for the obligation, exactly as
+                # a callee's is; the caller's copy is discharged by the handoff.
+                self._handled(arg, env)
+        return Prim("thread")
+
+    def _join(self, node: Node, env: _Env) -> Ty:
+        """``(join t)``: wait for a thread to finish; the handle is used up."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "join takes one thread")
+        ty = self._value(items[1], env, None, node.path)
+        if not (isinstance(ty, Prim) and ty.name == "thread"):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[1], node),
+                f"join needs a :thread, found {ty}",
+            )
+        return Prim("void")
+
+    def _mutex(self, node: Node, env: _Env) -> Ty:
+        """``(mutex)``: a new lock, already marked shared."""
+        if len(node.items) != 1:
+            raise diag(WRONG_ARITY, node.path, "mutex takes no arguments")
+        return Shared(Prim("mutex"))
+
+    def _mutex_op(self, node: Node, env: _Env, kind: str) -> Ty:
+        """``(lock m)``/``(unlock m)``: the mutex-specific pair of checks."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, f"{kind} takes one mutex")
+        ty = self._value(items[1], env, None, node.path)
+        if isinstance(ty, Shared) and isinstance(ty.elem, Prim) and ty.elem.name == "mutex":
+            return Prim("void")
+        if _shared_state(ty):
+            raise diag(SHARED_MARKER, _at(items[1], node), _SHARED_MARKER)
+        raise diag(
+            TYPE_MISMATCH,
+            _at(items[1], node),
+            f"{kind} needs a (shared :mutex), found {ty}",
+        )
+
+    def _chan(self, node: Node, env: _Env) -> Ty:
+        """``(chan T n)``: a channel of T with room for n elements."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "chan takes an element type and a capacity"
+            )
+        elem, _ = _read_type_at(items, 1, self._types, node.path, env.tvars)
+        # The same element rules `resolve_type` applies to a spelled
+        # `(chan T)`: a channel copies its elements, so a value that owns
+        # memory cannot be one, and a result's obligation would be dropped in
+        # the ring.
+        _channel_element(elem, node.path)
+        capacity = self._value(items[2], env, None, node.path)
+        if not _integer(capacity):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"channel capacity must be an integer, found {capacity}",
+            )
+        return Shared(Chan(elem))
+
+    def _chan_operand(self, item: Node | Token, env: _Env, node: Node) -> Chan:
+        ty = self._value(item, env, None, node.path)
+        if isinstance(ty, Shared) and isinstance(ty.elem, Chan):
+            return ty.elem
+        if isinstance(ty, Chan):
+            raise diag(SHARED_MARKER, _at(item, node), _SHARED_MARKER)
+        raise diag(
+            TYPE_MISMATCH, _at(item, node), f"expected a channel, found {ty}"
+        )
+
+    def _send(self, node: Node, env: _Env) -> Ty:
+        """``(send c v)``: copy v into c, blocking while c is full."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(WRONG_ARITY, node.path, "send takes a channel and a value")
+        chan = self._chan_operand(items[1], env, node)
+        ty = self._value(items[2], env, chan.elem, node.path)
+        if _escapes(ty):
+            # The ring outlives this frame; a capturing closure's environment
+            # is a slot in it. Same rule as any other place a value can be
+            # kept (E0502).
+            raise diag(CLOSURE_ESCAPE, _at(items[2], node), _CLOSURE_ESCAPE)
+        if self._move_only(ty):
+            raise diag(
+                VEC_MOVE,
+                _at(items[2], node),
+                "a channel copies its element; a value that owns memory "
+                "cannot be sent",
+            )
+        if not compatible(chan.elem, ty):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"this channel carries {chan.elem}, found {ty}",
+            )
+        return Prim("void")
+
+    def _recv(self, node: Node, env: _Env) -> Ty:
+        """``(recv c)``: the next element, blocking while c is empty."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "recv takes one channel")
+        return self._chan_operand(items[1], env, node).elem
+
+    def _atomic(self, node: Node, env: _Env) -> Ty:
+        """``(atomic T v)``: a new atomic cell holding v."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic takes a type and an initial value"
+            )
+        elem, next_index = _read_type_at(items, 1, self._types, node.path, env.tvars)
+        if not (isinstance(elem, Prim) and elem.name in ("i64", "u64")):
+            raise diag(
+                TYPE_MISMATCH,
+                node.path,
+                f"an atomic needs :i64 or :u64, found {elem}",
+            )
+        value = self._value(items[next_index], env, elem, node.path)
+        if not compatible(elem, value):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[next_index], node),
+                f"this atomic holds {elem}, found {value}",
+            )
+        return Shared(Atomic(elem))
+
+    def _atomic_operand(self, item: Node | Token, env: _Env, node: Node) -> Atomic:
+        ty = self._value(item, env, None, node.path)
+        if isinstance(ty, Shared) and isinstance(ty.elem, Atomic):
+            return ty.elem
+        if isinstance(ty, Atomic):
+            raise diag(SHARED_MARKER, _at(item, node), _SHARED_MARKER)
+        raise diag(
+            TYPE_MISMATCH, _at(item, node), f"expected an atomic, found {ty}"
+        )
+
+    def _atomic_add(self, node: Node, env: _Env) -> Ty:
+        """``(atomic-add a n)``: add n, returning the new value."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic-add takes an atomic and a value"
+            )
+        atomic = self._atomic_operand(items[1], env, node)
+        value = self._value(items[2], env, atomic.elem, node.path)
+        if not compatible(atomic.elem, value):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"this atomic holds {atomic.elem}, found {value}",
+            )
+        return atomic.elem
+
+    def _atomic_load(self, node: Node, env: _Env) -> Ty:
+        """``(atomic-load a)``: the current value."""
+        items = node.items
+        if len(items) != 2:
+            raise diag(WRONG_ARITY, node.path, "atomic-load takes one atomic")
+        return self._atomic_operand(items[1], env, node).elem
+
+    def _atomic_store(self, node: Node, env: _Env) -> Ty:
+        """``(atomic-store a v)``: replace the value."""
+        items = node.items
+        if len(items) != 3:
+            raise diag(
+                WRONG_ARITY, node.path, "atomic-store takes an atomic and a value"
+            )
+        atomic = self._atomic_operand(items[1], env, node)
+        value = self._value(items[2], env, atomic.elem, node.path)
+        if not compatible(atomic.elem, value):
+            raise diag(
+                TYPE_MISMATCH,
+                _at(items[2], node),
+                f"this atomic holds {atomic.elem}, found {value}",
+            )
+        return Prim("void")
+
     def _origin_loop(self, item: Node | Token, env: _Env, ty: Ty) -> int:
         """How many loops enclosed the value ``item`` produced.
 
@@ -3682,6 +4010,8 @@ def resolve_type(
     types: dict[str, Ty],
     path: str,
     bindings: dict[str, Ty] | None = None,
+    *,
+    _shared: bool = False,
 ) -> Ty:
     """Resolve every named reference in ``ty`` against ``types``.
 
@@ -3711,6 +4041,12 @@ def resolve_type(
             )
         return bound
     if isinstance(ty, Prim):
+        if ty.name == "mutex" and not _shared:
+            # A mutex is shared mutable state: two threads lock it, and the
+            # type has to say so at every declaration that names it. Only the
+            # ``(shared ...)`` wrapper, which passes ``_shared`` down one
+            # level, may spell it.
+            raise diag(SHARED_MARKER, path, _SHARED_MARKER)
         return ty
     if isinstance(ty, (StructRef, EnumRef)):
         declared = types.get(ty.name)
@@ -3749,7 +4085,32 @@ def resolve_type(
             )
         return Opt(elem)
     if isinstance(ty, Shared):
-        return Shared(resolve_type(ty.elem, types, path, bindings))
+        elem = resolve_type(ty.elem, types, path, bindings, _shared=True)
+        # Shared state is something a thread can reach and change: a pointer
+        # into the heap, or one of the three synchronization handles. A
+        # ``(shared :i64)`` would name a copy, which no thread could change for
+        # anybody else, so it is refused rather than left as a marker with no
+        # meaning.
+        if not _shareable(elem):
+            raise diag(
+                UNKNOWN_NODE,
+                path,
+                "only a pointer, a mutex, a channel or an atomic can be shared",
+            )
+        return Shared(elem)
+    if isinstance(ty, (Chan, Atomic)):
+        if not _shared:
+            raise diag(SHARED_MARKER, path, _SHARED_MARKER)
+        elem = resolve_type(ty.elem, types, path, bindings)
+        if isinstance(ty, Chan):
+            return Chan(_channel_element(elem, path))
+        if not (isinstance(elem, Prim) and elem.name in ("i64", "u64")):
+            raise diag(
+                TYPE_MISMATCH,
+                path,
+                f"an atomic needs :i64 or :u64, found {elem}",
+            )
+        return Atomic(elem)
     if isinstance(ty, Vec):
         elem = resolve_type(ty.elem, types, path, bindings)
         if holds_owner(elem):
@@ -3957,10 +4318,65 @@ def _pointee(ty: Ty) -> Ty | None:
 
     An owning pointer and a raw pointer name the same element: which one you
     hold decides who may free the block, not what a read through it returns.
+    A ``(shared (ptr T))`` is the same address under the marker a thread
+    boundary requires, so a read through it is a pointee read too.
     """
+    if isinstance(ty, Shared):
+        ty = ty.elem
     if isinstance(ty, (Own, Ptr)):
         return ty.elem
     return None
+
+
+def _shareable(ty: Ty) -> bool:
+    """Whether ``(shared ty)`` names state two threads can reach and change.
+
+    A pointer is an address into memory somebody else owns; a mutex, a channel
+    and an atomic are runtime handles whose whole purpose is to be touched from
+    more than one thread. Anything else — a scalar, a vector descriptor, an
+    owner — is a copy when it crosses a thread boundary, so marking it shared
+    would promise a sharing that does not happen.
+    """
+    if isinstance(ty, Ptr):
+        return True
+    if isinstance(ty, (Chan, Atomic)):
+        return True
+    return isinstance(ty, Prim) and ty.name == "mutex"
+
+
+def _shared_state(ty: Ty) -> bool:
+    """Whether ``ty`` is a handle that only the ``(shared ...)`` marker allows."""
+    if isinstance(ty, (Chan, Atomic)):
+        return True
+    return isinstance(ty, Prim) and ty.name == "mutex"
+
+
+def _channel_element(elem: Ty, path: str) -> Ty:
+    """Refuse a channel element the ring cannot copy, at ``path``.
+
+    A channel stores copies of its elements and copies them again on ``recv``,
+    so the element must have a copy: not a vector or an owner (two owners of one
+    block), not a result (an obligation with no name to discharge it), not
+    ``:void`` (no value exists), and not a capturing closure (its environment
+    belongs to the frame that made it).
+    """
+    if _is_void(elem):
+        raise diag(TYPE_MISMATCH, path, "a channel cannot carry :void")
+    if holds_owner(elem):
+        raise diag(
+            UNKNOWN_NODE, path, "a channel cannot carry a value that owns memory"
+        )
+    if holds_vector(elem):
+        raise diag(
+            UNKNOWN_NODE,
+            path,
+            "a channel cannot carry a vector: its buffer has no copy",
+        )
+    if _stored_result(elem):
+        raise diag(UNKNOWN_NODE, path, "a channel cannot carry a result")
+    if _escapes(elem):
+        raise diag(CLOSURE_ESCAPE, path, _CLOSURE_ESCAPE)
+    return elem
 
 
 def _stored_result(ty: Ty) -> bool:
@@ -4004,6 +4420,12 @@ def _fits(expected: Ty, actual: Ty) -> bool:
             FnTy(expected.params, expected.ret),
             FnTy(actual.params, actual.ret),
         )
+    if isinstance(expected, Shared) and not isinstance(actual, Shared):
+        # A ``(shared (ptr T))`` annotation is how a bare address becomes the
+        # marked value a thread boundary requires. The representation is the
+        # same word, so the wrap is free and one-way: a marked value never
+        # silently becomes an unmarked one.
+        return _shareable(expected.elem) and compatible(expected.elem, actual)
     return compatible(expected, actual)
 
 
