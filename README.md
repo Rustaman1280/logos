@@ -11,7 +11,7 @@ call that can fail declares it. Release is manual through `free`.
 The compiler front end is Python, standard library only: lexer, parser,
 resolver and type checker lower a typed syntax tree to a small flat IR, which is
 printed as LLVM IR text. `clang` compiles that text and links it against the C
-runtime in `runtime/`.
+runtime in `logos/runtime/`.
 
 ## Learn it
 
@@ -191,8 +191,8 @@ their operator's account.
 | Path | Purpose |
 | --- | --- |
 | `logos/` | Python compiler front end and command line interface |
-| `runtime/rt.h` | Declarations of the C runtime reached through `extern` |
-| `runtime/rt.c` | C runtime implementation |
+| `logos/runtime/rt.h` | Declarations of the C runtime reached through `extern` |
+| `logos/runtime/rt.c` | C runtime implementation, shipped as package data |
 | `examples/` | Three real programs, their input fixture and the matrix reference |
 | `docs/LOGOS.md` | The generated manual: cheat sheet, executable chapters, reference tables |
 | `docs/manual/` | The numbered chapter sources the manual embeds |

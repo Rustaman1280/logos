@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "runtime"
+RUNTIME = ROOT / "logos" / "runtime"
 BUILD = ROOT / "build"
 
 PROBE = r"""

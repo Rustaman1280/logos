@@ -3,11 +3,12 @@
 #
 # The check is deliberately end to end: it installs into a throwaway target
 # directory (never a site-/dist-packages path, which differs by interpreter
-# version and by distribution), confirms the C runtime shipped as package
-# data, then builds and runs examples/hello.logos from a directory outside the
-# repository with the installed package on PYTHONPATH. Nothing from the source
-# tree is importable except the example it compiles, so a missing rt.c or a
-# driver that only finds the runtime at its source path fails here.
+# version and by distribution), confirms the C runtime shipped inside the
+# compiler package as package data, then builds and runs examples/hello.logos
+# from a directory outside the repository with the installed package on
+# PYTHONPATH. Nothing from the source tree is importable except the example it
+# compiles, so a missing logos/runtime/rt.c or a driver that only finds the
+# runtime at its source path fails here.
 #
 # `pip install --target` is used instead of `--prefix` because the latter puts
 # the package wherever the interpreter's install scheme says (lib/site-packages
@@ -45,8 +46,8 @@ mkdir -p "$PKG_DIR"
 "${PIP[@]}" install --target "$PKG_DIR" --no-deps --quiet "$ROOT"
 
 for asset in rt.c rt.h; do
-    if [[ ! -f "$PKG_DIR/runtime/$asset" ]]; then
-        echo "verify_install: installed package is missing runtime/$asset" >&2
+    if [[ ! -f "$PKG_DIR/logos/runtime/$asset" ]]; then
+        echo "verify_install: installed package is missing logos/runtime/$asset" >&2
         exit 1
     fi
 done

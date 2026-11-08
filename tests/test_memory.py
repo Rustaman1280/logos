@@ -817,9 +817,9 @@ int main(int argc, char **argv) {
                 # build, not the release fallback.
                 "-DLOGOS_DEBUG=1",
                 "-I",
-                str(ROOT / "runtime"),
+                str(ROOT / "logos" / "runtime"),
                 str(source),
-                str(ROOT / "runtime" / "rt.c"),
+                str(ROOT / "logos" / "runtime" / "rt.c"),
                 "-o",
                 binary,
             ],

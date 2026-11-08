@@ -50,3 +50,14 @@ jobs:
           fi
           python3 -m logos fmt tests docs/manual
           git diff --exit-code -- '*.logos'
+      - name: packaging diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
+          echo "--- rt.c anywhere the packaging test may have installed it ---"
+          find /tmp "$RUNNER_TEMP" -maxdepth 4 -name 'rt.c' 2>/dev/null || true
+          echo "--- installed logos package trees ---"
+          find /tmp "$RUNNER_TEMP" -maxdepth 6 -type d -path '*/logos/runtime' 2>/dev/null || true
+          echo "--- package metadata visible to this interpreter ---"
+          python3 -m pip show -f logos 2>/dev/null || true

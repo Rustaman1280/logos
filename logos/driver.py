@@ -7,11 +7,11 @@ works the same from the root of the tree, from a test, or from anywhere else:
 
 * the IR of a source file, ``build/<name>.ll``, kept on disk because it is the
   artefact a person reads when a program misbehaves;
-* the C runtime, ``runtime/rt.c``, linked into every binary.
+* the C runtime, ``logos/runtime/rt.c``, linked into every binary.
 
 The link is one clang invocation::
 
-    clang {opt} -target x86_64-unknown-linux-gnu build/<name>.ll runtime/rt.c
+    clang {opt} -target x86_64-unknown-linux-gnu build/<name>.ll logos/runtime/rt.c
           -o <out> -lpthread -lm
 
 clang compiles the IR text and ``rt.c``, then links both with libc. There are no
@@ -22,6 +22,7 @@ whole interface.
 from __future__ import annotations
 
 import subprocess
+from importlib import resources
 from pathlib import Path
 
 from logos import llvm, lower
@@ -42,17 +43,23 @@ BUILD_DIR = ROOT / "build"
 
 
 def _runtime_file(name: str) -> Path:
-    """The runtime source ``name``, from the install if one shipped it.
+    """The runtime source ``name``, from the installed package if it shipped.
 
-    An installed toolchain has ``logos`` and ``runtime`` as sibling packages, so
-    the runtime lands beside the compiler; a source tree has ``runtime/`` at the
-    same level as ``logos/``. Looking beside this file covers both, and the
-    repository path is the fallback for a tree that was never installed.
+    ``logos.runtime`` is a real package and ``rt.c``/``rt.h`` are its package
+    data, so a wheel always carries them. ``importlib.resources`` resolves the
+    file inside the installed package. A source checkout resolves to the same
+    directory; if the package is incomplete (an old install, or a zipped
+    distribution whose data is not a real file), fall back to ``logos/runtime``
+    beside this module so a checkout still builds.
     """
-    installed = Path(__file__).resolve().parent.parent / "runtime" / name
-    if installed.is_file():
-        return installed
-    return ROOT / "runtime" / name
+    try:
+        resource = resources.files("logos.runtime").joinpath(name)
+        path = Path(str(resource))
+    except (ImportError, ModuleNotFoundError):
+        path = None
+    if path is not None and path.is_file():
+        return path
+    return Path(__file__).resolve().parent / "runtime" / name
 
 
 #: The C runtime, linked into every Logos binary.
