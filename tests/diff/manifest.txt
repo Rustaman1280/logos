@@ -9,3 +9,12 @@
 arith
 strings
 arrays
+float_arithmetic
+float_f32_rounding
+struct_layout
+struct_nested
+vector_growth
+vector_growth_repeated
+shifts_signed
+shifts_unsigned
+threaded_sum

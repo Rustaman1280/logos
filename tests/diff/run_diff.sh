@@ -76,7 +76,7 @@ fi
 # The floor: the manifest names the cases this oracle must run.
 # ---------------------------------------------------------------------------
 MANIFEST="$DIR/manifest.txt"
-MIN_CASES=3
+MIN_CASES=12
 if [[ ! -f "$MANIFEST" ]]; then
     echo "run_diff: no manifest at tests/diff/manifest.txt" >&2
     exit 1
@@ -129,7 +129,7 @@ for source in "${sources[@]}"; do
         fail "$name" "no C twin at tests/diff/$name.c"
         continue
     fi
-    if ! "$CC" -std=c11 -O2 -Wall -Wextra -Werror "$twin" -o "$OUT/$name.c-bin" \
+    if ! "$CC" -std=c11 -O2 -Wall -Wextra -Werror -pthread "$twin" -o "$OUT/$name.c-bin" \
             > "$OUT/$name.c-build.log" 2>&1; then
         fail "$name" "the C twin did not build (see build/diff/$name.c-build.log)"
         continue

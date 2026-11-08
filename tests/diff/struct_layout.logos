@@ -1,0 +1,11 @@
+(mod struct_layout)
+
+(type record (struct (small :u8) (wide :i64) (medium :u16) (fraction :f64)))
+
+(fn main :i64 ()
+  (let item record (make record 250 4294967297 513 2.5))
+  (println (cast :u64 (get item small)))
+  (println (get item wide))
+  (println (cast :u64 (get item medium)))
+  (println (get item fraction))
+  (ret 0))

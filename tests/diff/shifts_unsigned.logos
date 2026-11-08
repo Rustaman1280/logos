@@ -1,0 +1,10 @@
+(mod shifts_unsigned)
+
+(fn main :i64 ()
+  (let high :u64 9223372036854775808)
+  (let all :u64 18446744073709551615)
+  (let one :u64 1)
+  (println (shr-u high 1))
+  (println (shl one 63))
+  (println (shr-u all 60))
+  (ret 0))

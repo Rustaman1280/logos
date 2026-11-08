@@ -1,0 +1,10 @@
+(mod shifts_signed)
+
+(fn main :i64 ()
+  (let one :i64 1)
+  (let wide (shl one 40))
+  (println wide)
+  (println (shr wide 8))
+  (println (shl 7 5))
+  (println (shr 768 3))
+  (ret 0))

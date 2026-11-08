@@ -1,0 +1,14 @@
+(mod struct_nested)
+
+(type point (struct (x :i16) (y :i16)))
+
+(type sample (struct (tag :u8) (position point) (weight :f64) (count :i32)))
+
+(fn main :i64 ()
+  (let item sample (make sample 7 (make point -3 12) 2.5 42))
+  (println (cast :u64 (get item tag)))
+  (println (cast :i64 (get (get item position) x)))
+  (println (cast :i64 (get (get item position) y)))
+  (println (get item weight))
+  (println (cast :i64 (get item count)))
+  (ret 0))

@@ -30,7 +30,7 @@ directive corpus under `tests/exec` and `tests/mem`, not here.
 
 The manifest is the corpus's floor: the script fails when a named case is
 missing either half, when a pair exists that the manifest does not name, or
-when the manifest lists fewer than three cases. Deleting a case therefore
+when the manifest lists fewer than twelve cases. Deleting a case therefore
 fails the run rather than shrinking it to a vacuously green one.
 
 The files carry no `(test ...)` node, so the directive harness under

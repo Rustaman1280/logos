@@ -1,0 +1,8 @@
+(mod float_f32_rounding)
+
+(fn main :i64 ()
+  (let base :f32 16777216.0)
+  (let step :f32 1.0)
+  (println (= (+ base step) base))
+  (println (= (- base step) base))
+  (ret 0))
