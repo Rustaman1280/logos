@@ -95,3 +95,7 @@ include unrelated reformatting.
 Bugs go through the issue form at `.github/ISSUE_TEMPLATE/bug.yml`; include the
 smallest program that reproduces the problem, the exact command, the expected
 output, the actual output or diagnostic code, and both `-O0` and `-O2`.
+
+## Licence
+
+MIT. By opening a pull request you agree to license your contribution under it.
