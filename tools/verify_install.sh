@@ -16,10 +16,17 @@
 # exactly where we tell it.
 #
 # Usage: tools/verify_install.sh [PREFIX]   (default /tmp/lg-install)
-# Environment: PYTHON overrides the interpreter used for pip, if it has pip.
+# Environment: PYTHON overrides the interpreter used to build and install.
 #
 # The script is rerunnable: the prefix is removed first and the build runs in a
 # temporary directory that is removed on exit.
+#
+# A wheel's metadata comes from the [project] table in pyproject.toml, which
+# only setuptools >= 61 reads. With an older backend the build does not fail:
+# it produces UNKNOWN-0.0.0-py3-none-any.whl containing dist-info and nothing
+# else, and the missing runtime surfaces later as two unrelated file errors.
+# So the backend is checked up front, upgraded once in this interpreter, and
+# the build is refused (exit 2) if it is still too old.
 
 set -euo pipefail
 
@@ -27,23 +34,81 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${1:-/tmp/lg-install}"
 PKG_DIR="$PREFIX/pkg"
 PYTHON="${PYTHON:-python3}"
+MIN_SETUPTOOLS="61"
 
+if ! command -v "$PYTHON" > /dev/null 2>&1; then
+    echo "verify_install: interpreter '$PYTHON' not found" >&2
+    exit 2
+fi
+
+setuptools_version() {
+    "$1" -c 'import setuptools; print(setuptools.__version__)' 2>/dev/null || true
+}
+
+version_ge() {  # version_ge FOUND REQUIRED
+    local found="$1" required="$2"
+    [[ -n "$found" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$required" "$found" | sort -V | head -n 1)" == "$required" ]]
+}
+
+backend_ready() {
+    local version
+    version="$(setuptools_version "$PYTHON")"
+    version_ge "$version" "$MIN_SETUPTOOLS" || return 1
+    # setuptools bundles bdist_wheel from 70.1; before that the wheel package
+    # must be importable for a --no-build-isolation build.
+    if ! version_ge "$version" "70.1"; then
+        "$PYTHON" -c 'import wheel' 2>/dev/null || return 1
+    fi
+}
+
+if ! "$PYTHON" -m pip --version > /dev/null 2>&1; then
+    # A venv created with --without-pip still ships ensurepip; use it so the
+    # interpreter, not some unrelated pip on PATH, owns the build.
+    "$PYTHON" -m ensurepip --upgrade > /dev/null 2>&1 || true
+fi
+
+PIP=()
 if "$PYTHON" -m pip --version > /dev/null 2>&1; then
     PIP=("$PYTHON" -m pip)
-else
-    PIP_BIN="$(command -v pip3 || command -v pip || true)"
-    if [[ -z "$PIP_BIN" ]]; then
-        echo "verify_install: no pip on '$PYTHON' and no pip on PATH" >&2
+fi
+
+FIX_COMMAND="$PYTHON -m pip install --upgrade \"pip>=23\" \"setuptools>=68\" wheel"
+
+if [[ ${#PIP[@]} -eq 0 ]]; then
+    NO_PIP_VERSION="$(setuptools_version "$PYTHON")"
+    echo "verify_install: '$PYTHON' has setuptools ${NO_PIP_VERSION:-<none>} and no pip, so it cannot be checked against setuptools>=$MIN_SETUPTOOLS." >&2
+    echo "verify_install: without that, the build produces UNKNOWN-0.0.0-py3-none-any.whl instead of logos." >&2
+    echo "verify_install: fix it with: $PYTHON -m ensurepip --upgrade && $FIX_COMMAND" >&2
+    exit 2
+fi
+
+if ! backend_ready; then
+    OLD_VERSION="$(setuptools_version "$PYTHON")"
+    echo "verify_install: '$PYTHON' has setuptools ${OLD_VERSION:-<none>}; PEP 621 [project] metadata needs setuptools>=$MIN_SETUPTOOLS." >&2
+    echo "verify_install: setuptools < $MIN_SETUPTOOLS ignores [project] and builds UNKNOWN-0.0.0-py3-none-any.whl, so this is refused." >&2
+    echo "verify_install: attempting one upgrade in that interpreter" >&2
+    if ! "${PIP[@]}" install --upgrade "setuptools>=68" wheel; then
+        echo "verify_install: the upgrade failed; fix the interpreter with:" >&2
+        echo "verify_install:   $FIX_COMMAND" >&2
+        echo "verify_install: refusing to build a wheel with setuptools $OLD_VERSION." >&2
         exit 2
     fi
-    PIP=("$PIP_BIN")
+    if ! backend_ready; then
+        echo "verify_install: after upgrading, '$PYTHON' has setuptools $(setuptools_version "$PYTHON"), still below $MIN_SETUPTOOLS; refusing to build." >&2
+        echo "verify_install: fix it with: $FIX_COMMAND" >&2
+        exit 2
+    fi
+    echo "verify_install: upgraded setuptools to $(setuptools_version "$PYTHON")" >&2
 fi
 
 rm -rf "$PREFIX"
 mkdir -p "$PKG_DIR"
 # --no-deps: this project has no runtime dependencies, and reinstalling any
 # that pip thought it saw would write outside the target.
-"${PIP[@]}" install --target "$PKG_DIR" --no-deps --quiet "$ROOT"
+# --no-build-isolation: the backend was verified above, so build with this
+# interpreter's setuptools rather than a copy fetched per run.
+"${PIP[@]}" install --target "$PKG_DIR" --no-deps --no-build-isolation --quiet "$ROOT"
 
 for asset in rt.c rt.h; do
     if [[ ! -f "$PKG_DIR/logos/runtime/$asset" ]]; then

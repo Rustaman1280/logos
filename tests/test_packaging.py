@@ -10,7 +10,9 @@ breaks packaging fails the suite.
 install script can only catch a missing runtime after pip has decided what to
 put on disk; the wheel is what pip installs, so asserting the two files are in
 it catches a packaging regression on the first run instead of after an
-unrelated install step hides it.
+unrelated install step hides it. The metadata name is asserted first: a
+setuptools older than PEP 621 builds ``UNKNOWN-0.0.0`` and no runtime files,
+and naming that cause is more useful than two missing-file failures.
 """
 
 import shutil
@@ -85,9 +87,9 @@ class PackagingTest(unittest.TestCase):
 
 
 class WheelContentsTest(unittest.TestCase):
-    """A wheel always carries the C runtime as ``logos.runtime`` package data."""
+    """A wheel is named ``logos`` and carries the C runtime as package data."""
 
-    def test_the_wheel_contains_the_runtime_sources(self):
+    def test_the_wheel_is_named_logos_and_contains_the_runtime_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
             command = _wheel_command(dest)
@@ -112,6 +114,41 @@ class WheelContentsTest(unittest.TestCase):
             self.assertEqual(len(wheels), 1, f"expected one wheel, found {wheels}")
             with zipfile.ZipFile(wheels[0]) as archive:
                 names = set(archive.namelist())
+                metadata_files = [
+                    name for name in names if name.endswith(".dist-info/METADATA")
+                ]
+                self.assertEqual(
+                    len(metadata_files),
+                    1,
+                    f"expected one dist-info/METADATA in {wheels[0].name}, "
+                    f"found {metadata_files}",
+                )
+                metadata = archive.read(metadata_files[0]).decode("utf-8")
+
+        # A setuptools that cannot read [project] names the wheel UNKNOWN-0.0.0
+        # and ships no package files at all. Name that here so the failure is
+        # one clear assertion, not two missing-file ones below.
+        metadata_name = ""
+        for line in metadata.splitlines():
+            if line.startswith("Name:"):
+                metadata_name = line.split(":", 1)[1].strip()
+                break
+        self.assertTrue(
+            wheels[0].name.startswith("logos-"),
+            f"wheel is named {wheels[0].name}; setuptools built UNKNOWN, "
+            "so it did not read the [project] table",
+        )
+        self.assertNotEqual(
+            metadata_name,
+            "UNKNOWN",
+            f"{wheels[0].name} has UNKNOWN metadata; setuptools did not read "
+            "the [project] table",
+        )
+        self.assertEqual(
+            metadata_name,
+            "logos",
+            f"{wheels[0].name} has metadata Name {metadata_name!r}, not 'logos'",
+        )
         for asset in ("logos/runtime/rt.c", "logos/runtime/rt.h"):
             with self.subTest(asset=asset):
                 self.assertIn(asset, names, f"{asset} is missing from {wheels[0].name}")

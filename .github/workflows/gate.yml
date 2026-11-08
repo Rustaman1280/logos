@@ -23,6 +23,24 @@ jobs:
         with:
           # The formatting gate diffs against main, which needs the merge base.
           fetch-depth: 0
+      # Before any gate: ubuntu-22.04 ships setuptools 59.6, which cannot read
+      # the [project] table. It does not fail; it builds
+      # UNKNOWN-0.0.0-py3-none-any.whl with nothing but dist-info, so the
+      # packaging gate then reports missing files instead of the real cause.
+      # Pin the build backend forward and print every version that matters, so
+      # a future failure is diagnosable from the log alone.
+      - name: build toolchain
+        run: |
+          if ! python3 -m pip --version > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-pip
+          fi
+          python3 -m pip install --upgrade "pip>=23" "setuptools>=68" wheel
+          python3 -m pip --version
+          python3 -c 'import setuptools; print("setuptools " + setuptools.__version__)'
+          python3 --version
+          python3 -c 'import setuptools, sys; sys.exit(0 if int(setuptools.__version__.split(".")[0]) >= 61 else 1)' \
+            || { echo "setuptools is still older than 61 after the upgrade; refusing to run the gates" >&2; exit 1; }
       - name: install toolchain
         run: |
           sudo apt-get update
