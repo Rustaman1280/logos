@@ -203,4 +203,7 @@ their operator's account.
 
 ## License
 
+MIT. See `LICENSE`. By opening a pull request you agree to license your
+contribution under these terms.
+
 Not chosen yet.
